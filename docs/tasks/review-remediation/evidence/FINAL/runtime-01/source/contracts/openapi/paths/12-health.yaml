@@ -1,0 +1,25 @@
+get:
+  summary: Health
+  operationId: getHealth
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+            title: Response Gethealth
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                status: ok
+  x-contract-test:
+    mode: generic
+    auth: anonymous
+    setup: none
+    owner: backend
+  security: []

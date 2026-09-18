@@ -1,0 +1,50 @@
+default_permissions = "rulesync"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+
+[mcp_servers.context7]
+type = "stdio"
+command = "./node_modules/.bin/context7-mcp"
+args = []
+
+[mcp_servers.playwright]
+type = "stdio"
+command = "./node_modules/.bin/playwright-mcp"
+args = []
+
+[permissions.rulesync]
+extends = ":workspace"
+
+[permissions.rulesync.filesystem]
+":minimal" = "read"
+glob_scan_max_depth = 8
+
+[permissions.rulesync.filesystem.":workspace_roots"]
+".env" = "deny"
+"**/.env" = "deny"
+".env.local" = "deny"
+"**/.env.local" = "deny"
+".env.development.local" = "deny"
+"**/.env.development.local" = "deny"
+".env.test.local" = "deny"
+"**/.env.test.local" = "deny"
+".env.production.local" = "deny"
+"**/.env.production.local" = "deny"
+"credentials/**" = "deny"
+"**/credentials/**" = "deny"
+".aws/**" = "deny"
+"**/.aws/**" = "deny"
+".ssh/**" = "deny"
+"**/.ssh/**" = "deny"
+".config/gcloud/**" = "deny"
+"**/.config/gcloud/**" = "deny"
+"**/*.key" = "deny"
+"**/*.pem" = "deny"
+"**/*.p12" = "deny"
+"**/*.pfx" = "deny"
+"**/*.crt" = "deny"
+"**/*.cer" = "deny"
+"**/*.tfstate" = "deny"
+"**/*.tfstate.*" = "deny"
+"**/*.tfvars" = "deny"
+".git/**" = "write"

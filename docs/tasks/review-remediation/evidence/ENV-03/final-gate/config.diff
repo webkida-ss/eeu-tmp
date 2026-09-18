@@ -1,0 +1,10 @@
+--- /private/tmp/untangle-remediation-20260914/final-gate-pyproject-base.toml	2026-09-15 00:10:59
++++ pyproject.toml	2026-09-15 00:10:59
+@@ -9,6 +9,7 @@
+   "backend/generated",
+   "build",
+   "dist",
++  "docs/tasks/review-remediation/evidence",
+   "extension/generated",
+   "node_modules",
+   "output",

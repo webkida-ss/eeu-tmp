@@ -1,0 +1,638 @@
+--- /private/tmp/untangle-remediation-20260914/rm12a-base/backend/services/entitlements.py	2026-09-14 23:25:05
++++ source/backend/services/entitlements.py	2026-09-14 23:33:17
+@@ -35,6 +35,15 @@
+         self.status_code = status_code
+ 
+ 
++@dataclass(frozen=True)
++class EffectiveProcessingAllowance:
++    """The account-scoped processing caps for one accounting month."""
++
++    month: str
++    sentences_per_article: int
++    source_tokens_per_article: int
++
++
+ def current_month(now: datetime | None = None) -> str:
+     moment = normalize_utc(now or datetime.now(UTC))
+     return moment.strftime("%Y-%m")
+@@ -130,11 +139,36 @@
+     )
+ 
+ 
++def resolve_effective_processing_allowance(
++    guard: EntitlementGuard,
++) -> EffectiveProcessingAllowance:
++    """Keep same-month retained processing caps without changing entitlement."""
++    usage = guard.usage_repository.get_month(guard.user_id, guard.month)
++    retained_plan_id = usage.get("plan_id")
++    retained_plan = get_plan_limits(str(retained_plan_id)) if retained_plan_id else guard.plan
++    return EffectiveProcessingAllowance(
++        month=guard.month,
++        sentences_per_article=max(
++            guard.plan.sentences_per_article,
++            _retained_processing_cap(
++                usage.get("sentences_per_article"), retained_plan.sentences_per_article
++            ),
++        ),
++        source_tokens_per_article=max(
++            guard.plan.source_tokens_per_article,
++            _retained_processing_cap(
++                usage.get("source_tokens_per_article"),
++                retained_plan.source_tokens_per_article,
++            ),
++        ),
++    )
++
++
+ def usage_summary(guard: EntitlementGuard) -> dict[str, Any]:
+     usage = guard.usage_repository.get_month(guard.user_id, guard.month)
++    allowance = resolve_effective_processing_allowance(guard)
+     has_snapshot = bool(usage.get("plan_id"))
+     quota_plan_id = str(usage.get("plan_id") or guard.plan.plan_id)
+-    quota_plan = get_plan_limits(quota_plan_id)
+     articles_used = int(
+         usage.get("committed_articles") if has_snapshot else usage.get("articles") or 0
+     )
+@@ -178,17 +212,19 @@
+         "chats_limit": chats_limit,
+         "chats_remaining": max(0, chats_limit - chats_used - chats_pending),
+         "reset_at": _reset_at(guard.month),
+-        "sentences_per_article": int(
+-            usage.get("sentences_per_article") or quota_plan.sentences_per_article
+-        ),
+-        "source_tokens_per_article": int(
+-            usage.get("source_tokens_per_article") or quota_plan.source_tokens_per_article
+-        ),
++        "sentences_per_article": allowance.sentences_per_article,
++        "source_tokens_per_article": allowance.source_tokens_per_article,
+         "plan_ends_at": plan_ends_at,
+         "warning_codes": warnings,
+     }
+ 
+ 
++def _retained_processing_cap(value: Any, fallback: int) -> int:
++    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
++        return value
++    return fallback
++
++
+ def _at_warning_threshold(used_and_pending: int, limit: int) -> bool:
+     return limit > 0 and used_and_pending * 100 >= limit * 80
+ 
+--- /private/tmp/untangle-remediation-20260914/rm12a-base/backend/services/usage_meter.py	2026-09-14 23:25:05
++++ source/backend/services/usage_meter.py	2026-09-14 23:29:19
+@@ -28,9 +28,12 @@
+ )
+ 
+ from services.entitlements import (
++    EffectiveProcessingAllowance,
+     EntitlementError,
++    EntitlementGuard,
+     current_month,
+     normalize_utc,
++    resolve_effective_processing_allowance,
+     resolve_plan_id,
+ )
+ 
+@@ -107,15 +110,28 @@
+         meter: Meter,
+         estimated_cost_micro_usd: int,
+         now: datetime | None = None,
++        *,
++        allowance: EffectiveProcessingAllowance | None = None,
+     ) -> UsageOperation:
+         if meter not in ("article", "chat", "cost"):
+             raise ValueError(f"Unknown usage meter: {meter}")
+         moment = normalize_utc(now or self.now or datetime.now(UTC))
+         plan = self._current_plan(moment)
++        existing = self.get_operation(operation_id)
++        if existing is not None:
++            allowance = EffectiveProcessingAllowance(
++                month=existing.month,
++                sentences_per_article=existing.sentences_per_article,
++                source_tokens_per_article=existing.source_tokens_per_article,
++            )
++        elif allowance is None:
++            allowance = self.processing_allowance(now=moment)
++        elif allowance.month != current_month(moment):
++            raise ValueError("New operation allowance must use the current accounting month")
+         request = UsageReservationRequest(
+             operation_id=operation_id,
+             user_id=self.user_id,
+-            month=current_month(moment),
++            month=allowance.month,
+             meter=meter,
+             payload_hash=payload_hash,
+             plan_id=plan.plan_id,
+@@ -128,8 +144,8 @@
+             article_limit=plan.articles_per_month,
+             chat_limit=plan.chats_per_month,
+             cost_micro_usd_limit=plan.cost_micro_usd_per_month,
+-            sentences_per_article=plan.sentences_per_article,
+-            source_tokens_per_article=plan.source_tokens_per_article,
++            sentences_per_article=allowance.sentences_per_article,
++            source_tokens_per_article=allowance.source_tokens_per_article,
+             model=self.rate.model,
+             input_micro_usd_per_million=self.rate.input_micro_usd_per_million,
+             output_micro_usd_per_million=self.rate.output_micro_usd_per_million,
+@@ -321,6 +337,28 @@
+     def current_plan(self, now: datetime | None = None) -> PlanLimits:
+         moment = normalize_utc(now or self.now or datetime.now(UTC))
+         return self._current_plan(moment)
++
++    def processing_allowance(
++        self,
++        operation_id: str | None = None,
++        now: datetime | None = None,
++    ) -> EffectiveProcessingAllowance:
++        if operation_id:
++            operation = self.get_operation(operation_id)
++            if operation is not None:
++                return EffectiveProcessingAllowance(
++                    month=operation.month,
++                    sentences_per_article=operation.sentences_per_article,
++                    source_tokens_per_article=operation.source_tokens_per_article,
++                )
++        moment = normalize_utc(now or self.now or datetime.now(UTC))
++        guard = EntitlementGuard(
++            plan=self._current_plan(moment),
++            usage_repository=self.usage_repository,
++            user_id=self.user_id,
++            month=current_month(moment),
++        )
++        return resolve_effective_processing_allowance(guard)
+ 
+     def observe_shadow(
+         self,
+--- /private/tmp/untangle-remediation-20260914/rm12a-base/backend/services/preloading.py	2026-09-14 23:25:05
++++ source/backend/services/preloading.py	2026-09-14 23:27:44
+@@ -49,7 +49,13 @@
+ from storage.preload_content_store import PreloadContentStore
+ 
+ from services.admin_activity import TerminalActivityOutcome, record_terminal_activity
+-from services.entitlements import EntitlementError, EntitlementGuard, build_guard
++from services.entitlements import (
++    EffectiveProcessingAllowance,
++    EntitlementError,
++    EntitlementGuard,
++    build_guard,
++    resolve_effective_processing_allowance,
++)
+ from services.reading_queries import (
+     record_status as _record_status,
+ )
+@@ -418,9 +424,21 @@
+         page_title=request.page_title,
+     )
+     target, native = _resolve_language_pair(request.target_language, request.native_language)
+-    plan = usage_meter.current_plan() if usage_meter else (guard.plan if guard else None)
+-    sentence_limit = plan.sentences_per_article if plan else None
+-    source_token_limit = plan.source_tokens_per_article if plan else None
++    if usage_meter:
++        allowance = usage_meter.processing_allowance(request.operation_id)
++    elif isinstance(guard, EntitlementGuard):
++        allowance = resolve_effective_processing_allowance(guard)
++    elif guard:
++        # Plan-only guards retain their declared processing caps.
++        allowance = EffectiveProcessingAllowance(
++            month="",
++            sentences_per_article=guard.plan.sentences_per_article,
++            source_tokens_per_article=guard.plan.source_tokens_per_article,
++        )
++    else:
++        allowance = None
++    sentence_limit = allowance.sentences_per_article if allowance else None
++    source_token_limit = allowance.source_tokens_per_article if allowance else None
+     prepared = _prepare_article_content(
+         content,
+         sentence_limit=sentence_limit,
+@@ -462,6 +480,7 @@
+                 payload_hash,
+                 "article",
+                 estimated_cost,
++                allowance=allowance,
+             )
+         except EntitlementError as exc:
+             record_terminal_activity(
+--- /private/tmp/untangle-remediation-20260914/rm12a-base/backend/test_usage_meter.py	2026-09-14 23:25:05
++++ source/backend/test_usage_meter.py	2026-09-14 23:28:33
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import json
+ import tempfile
+ import unittest
+ from datetime import UTC, datetime, timedelta, timezone
+@@ -7,7 +8,7 @@
+ from unittest.mock import patch
+ 
+ from accounts.storage import JsonSubscriptionRepository
+-from core.plans import PlanLimits
++from core.plans import PlanLimits, get_plan_limits
+ from core.usage_costs import ModelRate
+ from repositories.usage_repository import (
+     JsonUsageRepository,
+@@ -16,6 +17,7 @@
+ )
+ from services.entitlements import EntitlementError, build_guard, usage_summary
+ from services.usage_meter import UsageMeter
++from storage.json_list_store import write_json_list
+ 
+ NOW = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
+ USER_ID = "0190f4c0-0000-7000-8000-000000000001"
+@@ -57,7 +59,8 @@
+     def setUp(self) -> None:
+         self._tmpdir = tempfile.TemporaryDirectory()
+         root = Path(self._tmpdir.name)
+-        self.usage = JsonUsageRepository(root / "usage.json")
++        self.usage_path = root / "usage.json"
++        self.usage = JsonUsageRepository(self.usage_path)
+         self.subscriptions = JsonSubscriptionRepository(root / "subscriptions.json")
+ 
+     def tearDown(self) -> None:
+@@ -526,6 +529,28 @@
+         self.assertEqual(month["sentences_per_article"], 200)
+         self.assertEqual(month["source_tokens_per_article"], 48_000)
+ 
++    def test_processing_allowance_keeps_month_snapshot_and_operation_retry_pinned(self) -> None:
++        pro_meter = self.meter(plan=PRO)
++        original = pro_meter.reserve("pinned-processing", "payload", "article", 1)
++        downgraded = self.meter(plan=BASIC)
++
++        current = downgraded.processing_allowance()
++        pinned = downgraded.processing_allowance("pinned-processing")
++        replay = downgraded.reserve("pinned-processing", "payload", "article", 1)
++
++        self.assertEqual(
++            (current.month, current.sentences_per_article, current.source_tokens_per_article),
++            ("2026-07", PRO.sentences_per_article, PRO.source_tokens_per_article),
++        )
++        self.assertEqual(
++            (pinned.month, pinned.sentences_per_article, pinned.source_tokens_per_article),
++            (original.month, original.sentences_per_article, original.source_tokens_per_article),
++        )
++        self.assertEqual(
++            (replay.month, replay.sentences_per_article, replay.source_tokens_per_article),
++            (original.month, original.sentences_per_article, original.source_tokens_per_article),
++        )
++
+     def test_legacy_article_usage_is_enforced_by_first_reservation(self) -> None:
+         self.usage.add(USER_ID, "2026-07", articles=BASIC.articles_per_month)
+         meter = self.meter()
+@@ -542,7 +567,8 @@
+     def setUp(self) -> None:
+         self._tmpdir = tempfile.TemporaryDirectory()
+         root = Path(self._tmpdir.name)
+-        self.usage = JsonUsageRepository(root / "usage.json")
++        self.usage_path = root / "usage.json"
++        self.usage = JsonUsageRepository(self.usage_path)
+         self.subscriptions = JsonSubscriptionRepository(root / "subscriptions.json")
+ 
+     def tearDown(self) -> None:
+@@ -634,6 +660,29 @@
+         self.assertEqual(summary["sentences_per_article"], pinned.sentences_per_article)
+         self.assertEqual(summary["source_tokens_per_article"], pinned.source_tokens_per_article)
+ 
++    def test_summary_uses_legacy_snapshot_plan_when_processing_caps_are_missing(self) -> None:
++        self.usage.add(USER_ID, "2026-07", articles=1)
++        records = json.loads(self.usage_path.read_text(encoding="utf-8"))
++        for record in records:
++            if record.get("record_type") == "usage_month":
++                record.update(
++                    {
++                        "plan_id": "pro",
++                        "sentences_per_article": 0,
++                        "source_tokens_per_article": 0,
++                    }
++                )
++        write_json_list(self.usage_path, records)
++
++        summary = usage_summary(self.guard(BASIC))
++        retained = get_plan_limits("pro")
++
++        self.assertEqual(self.usage.get_month(USER_ID, "2026-07")["plan_id"], "pro")
++        self.assertEqual(
++            (summary["sentences_per_article"], summary["source_tokens_per_article"]),
++            (retained.sentences_per_article, retained.source_tokens_per_article),
++        )
++
+     def test_legacy_or_missing_month_is_safe(self) -> None:
+         summary = usage_summary(self.guard(BASIC))
+ 
+--- /dev/null	2026-09-14 23:33:54
++++ source/backend/test_processing_allowance.py	2026-09-14 23:33:17
+@@ -0,0 +1,313 @@
++"""Public regressions for one effective monthly processing allowance."""
++
++from __future__ import annotations
++
++import tempfile
++import types
++import unittest
++from datetime import UTC, datetime
++from pathlib import Path
++from unittest import mock
++
++import core.pipeline as pipeline
++from accounts.storage import JsonSubscriptionRepository
++from core.plans import get_plan_limits
++from core.usage_costs import ModelRate
++from repositories.page_preload_repository import JsonPagePreloadRepository
++from repositories.usage_repository import JsonUsageRepository
++from schemas import PagePreloadRequest
++from services import preloading
++from services.entitlements import (
++    EffectiveProcessingAllowance,
++    build_guard,
++    usage_summary,
++)
++from services.usage_meter import UsageMeter
++from storage.preload_content_store import FilesystemPreloadContentStore
++
++_JULY = datetime(2026, 7, 31, 23, 50, tzinfo=UTC)
++_AUGUST = datetime(2026, 8, 1, 0, 10, tzinfo=UTC)
++_USER_ID = "processing-allowance-user"
++_SECOND_USER_ID = "processing-allowance-other-user"
++_PRO_OPERATION_ID = "019b63f8-f600-7000-8000-000000000701"
++_CURRENT_OPERATION_ID = "019b63f8-f600-7000-8000-000000000702"
++_SOURCE_OPERATION_ID = "019b63f8-f600-7000-8000-000000000703"
++_UPGRADE_OPERATION_ID = "019b63f8-f600-7000-8000-000000000704"
++
++
++class _RecordingRunner:
++    def __init__(self) -> None:
++        self.calls: list[tuple] = []
++
++    def enqueue(
++        self,
++        user_id: str,
++        page_url: str,
++        preload_id: str,
++        learner_profile_fingerprint: str,
++        usage_context: dict | None = None,
++    ) -> None:
++        self.calls.append(
++            (user_id, page_url, preload_id, learner_profile_fingerprint, usage_context)
++        )
++
++
++class ProcessingAllowanceTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++        directory = Path(self._temporary_directory.name)
++        self.preloads = JsonPagePreloadRepository(directory / "preloads.json")
++        self.usage = JsonUsageRepository(directory / "usage.json")
++        self.subscriptions = JsonSubscriptionRepository(directory / "subscriptions.json")
++        self.content = FilesystemPreloadContentStore(directory / "content")
++        self.runner = _RecordingRunner()
++        self.basic = get_plan_limits("basic")
++        self.pro = get_plan_limits("pro")
++        self.rate = ModelRate("allowance-test", 1, 1, "allowance-test")
++
++    def tearDown(self) -> None:
++        self._temporary_directory.cleanup()
++
++    @staticmethod
++    def _html(sentence_count: int, *, words_per_sentence: int = 8) -> str:
++        sentence = " ".join(["reading"] * words_per_sentence)
++        paragraphs = [f"<p>Sentence {index} {sentence}.</p>" for index in range(sentence_count)]
++        return "<article>" + "".join(paragraphs) + "</article>"
++
++    @staticmethod
++    def _subscription(plan: str) -> dict:
++        return {
++            "plan": plan,
++            "status": "active",
++            "current_period_end": int(datetime(2026, 12, 1, tzinfo=UTC).timestamp()),
++            "entitlement_provider": "mock",
++        }
++
++    def _meter(self, user_id: str, now: datetime) -> UsageMeter:
++        return UsageMeter(
++            self.subscriptions,
++            self.usage,
++            user_id,
++            rate=self.rate,
++            now=now,
++            provider_mode="mock",
++        )
++
++    def _guard(self, user_id: str, now: datetime):
++        return build_guard(
++            self.subscriptions,
++            self.usage,
++            user_id,
++            now,
++            provider_mode="mock",
++        )
++
++    def _request(self, operation_id: str, *, page_url: str, html: str) -> PagePreloadRequest:
++        return PagePreloadRequest(
++            operation_id=operation_id,
++            page_url=page_url,
++            page_title="Allowance article",
++            html=html,
++        )
++
++    def _submit(
++        self,
++        user_id: str,
++        request: PagePreloadRequest,
++        meter: UsageMeter,
++    ):
++        return preloading.submit_preload(
++            self.preloads,
++            self.runner,
++            self.content,
++            user_id,
++            request,
++            self._guard(user_id, meter.now),
++            usage_meter=meter,
++        )
++
++    def _run_worker(self, call: tuple) -> None:
++        def analyze(sentences, **kwargs):
++            tally = kwargs["tally"]
++            tally.mark_dispatch_attempt()
++            tally.add_response(
++                types.SimpleNamespace(
++                    model="allowance-test",
++                    usage=types.SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
++                )
++            )
++            return (
++                "summary",
++                [],
++                [
++                    {
++                        "id": f"analysis-{index}",
++                        "index": index,
++                        "text": sentence,
++                        "analysis": {},
++                    }
++                    for index, sentence in enumerate(sentences)
++                ],
++            )
++
++        with (
++            mock.patch.object(
++                pipeline,
++                "_split_sentences_with_ai",
++                side_effect=RuntimeError("provider splitter unavailable"),
++            ),
++            mock.patch.object(preloading, "_analyze_sentences", side_effect=analyze),
++            mock.patch.object(preloading, "_extract_study_items", return_value=([], {})),
++        ):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *call[:4],
++                billing_provider_mode="mock",
++            )
++
++    def test_same_month_pro_allowance_survives_downgrade_across_submit_estimate_worker_and_summary(
++        self,
++    ) -> None:
++        self.subscriptions.upsert(_USER_ID, self._subscription("pro"))
++        pro_request = self._request(
++            _PRO_OPERATION_ID,
++            page_url="https://example.com/pro-seed",
++            html=self._html(self.basic.sentences_per_article + 30, words_per_sentence=180),
++        )
++        self._submit(_USER_ID, pro_request, self._meter(_USER_ID, _JULY))
++
++        self.subscriptions.upsert(_USER_ID, {"plan": "basic", "status": "canceled"})
++        current_meter = self._meter(_USER_ID, _JULY)
++        allowance = current_meter.processing_allowance()
++        self.assertIsInstance(allowance, EffectiveProcessingAllowance)
++        self.assertEqual(allowance.month, "2026-07")
++        self.assertEqual(allowance.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(allowance.source_tokens_per_article, self.pro.source_tokens_per_article)
++
++        estimates: list[tuple[int | None, int | None]] = []
++        original_estimate = preloading.estimate_article_cost_micro_usd
++
++        def estimate(prepared, **kwargs):
++            estimates.append((prepared.sentence_limit, prepared.source_token_limit))
++            return original_estimate(prepared, **kwargs)
++
++        current_request = self._request(
++            _CURRENT_OPERATION_ID,
++            page_url="https://example.com/current-month",
++            html=self._html(self.basic.sentences_per_article + 30, words_per_sentence=180),
++        )
++        with mock.patch.object(preloading, "estimate_article_cost_micro_usd", side_effect=estimate):
++            response = self._submit(_USER_ID, current_request, current_meter)
++
++        record = self.preloads.get_by_id(_USER_ID, _CURRENT_OPERATION_ID)
++        operation = self.usage.get_operation(_USER_ID, _CURRENT_OPERATION_ID)
++        context = self.runner.calls[1][4]
++        summary = usage_summary(self._guard(_USER_ID, _JULY))
++        self.assertEqual(response.preload.sentence_limit, self.pro.sentences_per_article)
++        self.assertEqual(response.preload.source_token_limit, self.pro.source_tokens_per_article)
++        self.assertEqual(
++            estimates, [(self.pro.sentences_per_article, self.pro.source_tokens_per_article)]
++        )
++        self.assertEqual(record["sentence_limit"], self.pro.sentences_per_article)
++        self.assertEqual(record["source_token_limit"], self.pro.source_tokens_per_article)
++        self.assertEqual(operation.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(operation.source_tokens_per_article, self.pro.source_tokens_per_article)
++        self.assertEqual(context["sentence_limit"], self.pro.sentences_per_article)
++        self.assertEqual(context["source_token_limit"], self.pro.source_tokens_per_article)
++        self.assertEqual(summary["sentences_per_article"], self.pro.sentences_per_article)
++        self.assertEqual(summary["source_tokens_per_article"], self.pro.source_tokens_per_article)
++
++        self._run_worker(self.runner.calls[1])
++        ready = self.preloads.get_by_id(_USER_ID, _CURRENT_OPERATION_ID)
++        self.assertEqual(ready["status"], "ready")
++        self.assertEqual(len(ready["sentences"]), self.basic.sentences_per_article + 30)
++        self.assertGreater(ready["source_tokens_analyzed"], self.basic.source_tokens_per_article)
++        self.assertLessEqual(ready["source_tokens_analyzed"], self.pro.source_tokens_per_article)
++
++    def test_source_token_boundary_uses_the_same_retained_pro_allowance(self) -> None:
++        self.subscriptions.upsert(_USER_ID, self._subscription("pro"))
++        self._submit(
++            _USER_ID,
++            self._request(
++                _PRO_OPERATION_ID,
++                page_url="https://example.com/pro-source-seed",
++                html=self._html(1),
++            ),
++            self._meter(_USER_ID, _JULY),
++        )
++        self.subscriptions.upsert(_USER_ID, {"plan": "basic", "status": "canceled"})
++        source_request = self._request(
++            _SOURCE_OPERATION_ID,
++            page_url="https://example.com/source-boundary",
++            html=self._html(60, words_per_sentence=260),
++        )
++        self._submit(_USER_ID, source_request, self._meter(_USER_ID, _JULY))
++
++        record = self.preloads.get_by_id(_USER_ID, _SOURCE_OPERATION_ID)
++        operation = self.usage.get_operation(_USER_ID, _SOURCE_OPERATION_ID)
++        context = self.runner.calls[1][4]
++        self.assertEqual(record["source_token_limit"], self.pro.source_tokens_per_article)
++        self.assertGreater(record["source_tokens_analyzed"], self.basic.source_tokens_per_article)
++        self.assertLessEqual(record["source_tokens_analyzed"], self.pro.source_tokens_per_article)
++        self.assertEqual(operation.source_tokens_per_article, self.pro.source_tokens_per_article)
++        self.assertEqual(context["source_token_limit"], self.pro.source_tokens_per_article)
++
++    def test_rollover_account_isolation_upgrade_and_existing_retry_keep_correct_allowances(
++        self,
++    ) -> None:
++        self.subscriptions.upsert(_USER_ID, self._subscription("pro"))
++        pro_request = self._request(
++            _PRO_OPERATION_ID,
++            page_url="https://example.com/pinned-operation",
++            html=self._html(self.basic.sentences_per_article + 10),
++        )
++        self._submit(_USER_ID, pro_request, self._meter(_USER_ID, _JULY))
++        self.subscriptions.upsert(_USER_ID, {"plan": "basic", "status": "canceled"})
++
++        august_meter = self._meter(_USER_ID, _AUGUST)
++        self.assertEqual(
++            august_meter.processing_allowance().sentences_per_article,
++            self.basic.sentences_per_article,
++        )
++        pinned = august_meter.processing_allowance(_PRO_OPERATION_ID)
++        self.assertEqual(pinned.month, "2026-07")
++        self.assertEqual(pinned.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(pinned.source_tokens_per_article, self.pro.source_tokens_per_article)
++
++        calls_before_retry = len(self.runner.calls)
++        retry = self._submit(_USER_ID, pro_request, august_meter)
++        retried_record = self.preloads.get_by_id(_USER_ID, _PRO_OPERATION_ID)
++        self.assertEqual(retry.preload.id, _PRO_OPERATION_ID)
++        self.assertEqual(len(self.runner.calls), calls_before_retry)
++        self.assertEqual(retried_record["usage_month"], "2026-07")
++        self.assertEqual(retried_record["sentence_limit"], self.pro.sentences_per_article)
++        self.assertEqual(retried_record["source_token_limit"], self.pro.source_tokens_per_article)
++
++        other_meter = self._meter(_SECOND_USER_ID, _JULY)
++        other_allowance = other_meter.processing_allowance()
++        self.assertEqual(other_allowance.month, "2026-07")
++        self.assertEqual(other_allowance.sentences_per_article, self.basic.sentences_per_article)
++        self.assertEqual(
++            other_allowance.source_tokens_per_article, self.basic.source_tokens_per_article
++        )
++
++        self._submit(
++            _SECOND_USER_ID,
++            self._request(
++                _UPGRADE_OPERATION_ID,
++                page_url="https://example.com/upgrade-basic",
++                html=self._html(1),
++            ),
++            other_meter,
++        )
++        self.subscriptions.upsert(_SECOND_USER_ID, self._subscription("pro"))
++        upgraded = self._meter(_SECOND_USER_ID, _JULY).processing_allowance()
++        self.assertEqual(upgraded.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(upgraded.source_tokens_per_article, self.pro.source_tokens_per_article)
++
++
++if __name__ == "__main__":
++    unittest.main()

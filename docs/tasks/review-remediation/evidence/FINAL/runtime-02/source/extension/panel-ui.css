@@ -1,0 +1,1082 @@
+:root {
+  color-scheme: light;
+
+  --era-font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --era-radius-sm: 8px;
+  --era-radius-md: 12px;
+  --era-radius-lg: 16px;
+  --era-radius-pill: 999px;
+  --era-shadow-sm: 0 1px 2px rgba(28, 25, 23, 0.05);
+  --era-shadow-md: 0 4px 16px rgba(28, 25, 23, 0.07);
+  --era-duration: 160ms;
+  --era-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --era-ring: 0 0 0 3px rgba(3, 105, 161, 0.28);
+
+  --shell-bg: #fafaf9;
+  --shell-surface: #ffffff;
+  --shell-surface-muted: #f5f5f4;
+  --shell-text: #1c1917;
+  --shell-text-muted: #78716c;
+  --shell-text-subtle: #57534e;
+  --shell-border: #e7e5e4;
+  --shell-border-strong: #d6d3d1;
+  --shell-accent: #0369a1;
+  --shell-accent-strong: #0c4a6e;
+  --shell-accent-soft: #e0f2fe;
+  --shell-accent-border: #7dd3fc;
+  --shell-success: #15803d;
+  --shell-danger: #dc2626;
+  --shell-text-inverse: #ffffff;
+  --shell-inverse-hover: #292524;
+}
+
+/* Dark theme for the side panel shell (settings, word book, empty states).
+   Activated by data-theme on the document root (panel-ui.js and
+   reading-panel.js applyPanelTheme); light stays the default above. The
+   palette mirrors the reading panel's dark era tokens in reading-panel.css. */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --era-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --era-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.45);
+  --era-ring: 0 0 0 3px rgba(56, 189, 248, 0.35);
+
+  --shell-bg: #0c0a09;
+  --shell-surface: #1c1917;
+  --shell-surface-muted: #292524;
+  --shell-text: #e7e5e4;
+  --shell-text-muted: #a8a29e;
+  --shell-text-subtle: #d6d3d1;
+  --shell-border: #292524;
+  --shell-border-strong: #44403c;
+  --shell-accent: #7dd3fc;
+  --shell-accent-strong: #bae6fd;
+  --shell-accent-soft: rgba(12, 74, 110, 0.45);
+  --shell-accent-border: #0284c7;
+  --shell-success: #4ade80;
+  --shell-danger: #f87171;
+  --shell-text-inverse: #1c1917;
+  --shell-inverse-hover: #d6d3d1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  background: var(--shell-bg);
+  color: var(--shell-text);
+  font-family: var(--era-font);
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0;
+  min-height: 100%;
+  height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+.panel-ui {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  max-width: none;
+  min-height: 100%;
+  padding: 16px;
+  width: 100%;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.panel-header-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.panel-ui > header {
+  background: var(--shell-bg);
+  border-bottom: 1px solid var(--shell-border);
+  margin: -16px -16px 16px;
+  padding: 16px 16px 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.panel-ui.view-reading {
+  min-height: 100vh;
+}
+
+.panel-ui.view-reading header {
+  flex-shrink: 0;
+}
+
+.side-panel-view-switch {
+  background: var(--shell-surface-muted);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--era-radius-pill);
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 2px;
+  padding: 3px;
+}
+
+.side-panel-view-button {
+  background: transparent;
+  border: 0;
+  border-radius: var(--era-radius-pill);
+  color: var(--shell-text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  min-height: 32px;
+  padding: 8px 14px;
+  transition:
+    background var(--era-duration) var(--era-ease),
+    box-shadow var(--era-duration) var(--era-ease),
+    color var(--era-duration) var(--era-ease);
+  white-space: nowrap;
+}
+
+.side-panel-view-button:hover:not(:disabled) {
+  color: var(--shell-text);
+}
+
+.side-panel-view-button:focus-visible {
+  box-shadow: var(--era-ring);
+  outline: none;
+}
+
+.side-panel-view-button.side-panel-view-active {
+  background: var(--shell-surface);
+  box-shadow: var(--era-shadow-sm);
+  color: var(--shell-text);
+}
+
+.side-panel-view-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.panel-ui.view-settings #readingView {
+  display: none;
+}
+
+.panel-ui.view-reading #settingsView {
+  display: none;
+}
+
+.reading-empty {
+  background: var(--shell-surface);
+  border: 1px dashed var(--shell-border-strong);
+  border-radius: var(--era-radius-lg);
+  color: var(--shell-text-muted);
+  font-size: 13px;
+  line-height: 1.6;
+  margin-top: 12px;
+  padding: 24px 16px;
+  text-align: center;
+}
+
+.reading-empty p {
+  margin: 0 0 12px;
+}
+
+.reading-empty[hidden] {
+  display: none;
+}
+
+.panel-ui.view-reading #readingView {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.panel-ui.view-reading #readingPanelRoot:not([hidden]) {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  margin-top: 0;
+  min-height: 0;
+}
+
+.panel-ui.view-reading .reading-empty {
+  flex: 1;
+}
+
+/* Vocabulary book view: third top-level tab. */
+.panel-ui.view-settings #vocabBookView,
+.panel-ui.view-reading #vocabBookView {
+  display: none;
+}
+
+.panel-ui.view-vocab #settingsView,
+.panel-ui.view-vocab #readingView {
+  display: none;
+}
+
+.vocab-book-status {
+  color: var(--shell-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 12px;
+  min-height: 1.2em;
+}
+
+.vocab-book-group {
+  margin-bottom: 20px;
+}
+
+.vocab-book-group-title {
+  align-items: baseline;
+  display: flex;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+.vocab-book-group-title a {
+  color: inherit;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+.vocab-book-group-title a:hover {
+  text-decoration: underline;
+}
+
+.vocab-book-group-count {
+  background: var(--shell-border, #e7e5e4);
+  border-radius: 999px;
+  color: var(--shell-text-muted);
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+}
+
+/* Book rows expand in place to show the example, jump-to-text, and chat. */
+.vocab-book-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.vocab-book-item-open .era-vocab-meaning {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
+.vocab-book-detail {
+  border-left: 2px solid var(--shell-border, #e7e5e4);
+  margin: 8px 0 4px 10px;
+  padding-left: 12px;
+  transition:
+    height 220ms ease,
+    opacity 220ms ease,
+    transform 220ms ease;
+  transform: translateY(0);
+}
+
+.vocab-book-detail[hidden] {
+  display: none;
+}
+
+.vocab-book-item.era-accordion-animating .vocab-book-detail {
+  overflow: hidden;
+  will-change: height, opacity, transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vocab-book-item.era-accordion-animating .vocab-book-detail {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.vocab-book-detail .era-section {
+  background: var(--shell-surface, #ffffff);
+  border: 1px solid var(--shell-border, #e7e5e4);
+  border-radius: 12px;
+  margin-bottom: 10px;
+  padding: 12px 14px;
+}
+
+.vocab-book-detail .era-section h3 {
+  color: var(--shell-accent, #0369a1);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin: 0 0 6px;
+  text-transform: uppercase;
+}
+
+.vocab-book-detail .era-section p {
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+}
+
+.vocab-book-detail .era-vocab-example p {
+  font-style: italic;
+}
+
+.authenticated-features {
+  display: flex;
+  flex-direction: column;
+}
+
+.login-required-banner {
+  background: var(--shell-accent-soft);
+  border: 1px solid var(--shell-accent-border);
+  border-radius: var(--era-radius-md);
+  color: var(--shell-accent-strong);
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.authenticated-features:not(.features-locked) .login-required-banner {
+  display: none;
+}
+
+.authenticated-features.features-locked .toggle-row,
+.authenticated-features.features-locked .learner-panel,
+.authenticated-features.features-locked .preload-panel {
+  opacity: 0.55;
+}
+
+.authenticated-features.features-locked .toggle-row {
+  cursor: not-allowed;
+}
+
+.auth-panel,
+.preload-panel,
+.learner-panel {
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--era-radius-lg);
+  box-shadow: var(--era-shadow-sm);
+  margin-top: 12px;
+  padding: 16px;
+}
+
+.auth-copy strong,
+.preload-copy strong,
+.learner-copy strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.auth-copy small,
+.preload-copy small,
+.learner-copy small {
+  color: var(--shell-text-muted);
+  display: block;
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 4px;
+}
+
+.auth-field {
+  margin-top: 10px;
+}
+
+.auth-summary {
+  color: var(--shell-text);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+}
+
+.auth-status {
+  color: var(--shell-text-muted);
+  font-size: 12px;
+  margin: 10px 0 0;
+  min-height: 1.2em;
+}
+
+/* Sign-in methods build their own UI into #signInRoot; these styles are
+   shared by whichever one the server selects. */
+.signin-chooser {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.signin-chooser-title {
+  color: var(--shell-text);
+  font-size: 13px;
+}
+
+.signin-account-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.signin-account {
+  align-items: center;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  padding: 8px;
+  text-align: left;
+  width: 100%;
+}
+
+.signin-account:hover:not(:disabled) {
+  background: var(--shell-surface-hover, rgba(127, 127, 127, 0.12));
+}
+
+.signin-account:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.signin-avatar {
+  align-items: center;
+  border-radius: 50%;
+  color: #fff;
+  display: flex;
+  flex: 0 0 auto;
+  font-size: 13px;
+  font-weight: 600;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.signin-account-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.signin-account-name {
+  color: var(--shell-text);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.signin-account-email {
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.signin-badge {
+  background: var(--shell-surface-hover, rgba(127, 127, 127, 0.16));
+  border-radius: 999px;
+  color: var(--shell-text-muted);
+  font-size: 10px;
+  font-weight: 400;
+  margin-left: 6px;
+  padding: 1px 6px;
+}
+
+.signin-notice {
+  color: var(--shell-text-muted);
+  display: block;
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
+.signin-notice-error {
+  color: var(--shell-danger, #ef4444);
+}
+
+.toggle-row:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+.toggle-row {
+  align-items: center;
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--era-radius-lg);
+  box-shadow: var(--era-shadow-sm);
+  cursor: pointer;
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding: 16px;
+  transition: border-color var(--era-duration) var(--era-ease);
+}
+
+.toggle-row:hover:not(:has(input:disabled)) {
+  border-color: var(--shell-border-strong);
+}
+
+.toggle-row strong,
+.field span {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.toggle-row small {
+  color: var(--shell-text-muted);
+  display: block;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  margin-top: 4px;
+}
+
+input[type='checkbox'] {
+  accent-color: var(--shell-accent);
+  flex: 0 0 auto;
+  height: 20px;
+  width: 20px;
+}
+
+.field {
+  display: block;
+  margin-top: 12px;
+}
+
+.field span {
+  color: var(--shell-text-subtle);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.field input,
+.field textarea {
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border-strong);
+  border-radius: var(--era-radius-md);
+  display: block;
+  font: inherit;
+  max-width: 100%;
+  padding: 10px 12px;
+  transition:
+    border-color var(--era-duration) var(--era-ease),
+    box-shadow var(--era-duration) var(--era-ease);
+  width: 100%;
+}
+
+.field input:focus-visible,
+.field textarea:focus-visible {
+  border-color: var(--shell-accent);
+  box-shadow: var(--era-ring);
+  outline: none;
+}
+
+/* Before select-ui.js upgrades an enhanced select, retain only the sizing
+   needed for the form layout; the custom trigger owns its visual treatment. */
+.field select.era-select:not(.era-select-source) {
+  display: block;
+  font: inherit;
+  max-width: 100%;
+  width: 100%;
+}
+
+.field textarea {
+  line-height: 1.5;
+  min-height: 72px;
+  resize: vertical;
+}
+
+/* Enhanced selects keep the native element as the data source, but expose
+   Untangle's button and listbox once select-ui.js has upgraded it. */
+select.era-select-source {
+  height: 1px !important;
+  margin: -1px !important;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0 !important;
+  pointer-events: none;
+  position: absolute !important;
+  width: 1px !important;
+}
+
+.era-select-control {
+  margin-top: 6px;
+  position: relative;
+}
+
+.era-select-trigger {
+  align-items: center;
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border-strong);
+  border-radius: var(--era-radius-md);
+  color: var(--shell-text);
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  justify-content: space-between;
+  min-height: 42px;
+  padding: 10px 12px;
+  text-align: left;
+  transition:
+    background-color var(--era-duration) var(--era-ease),
+    border-color var(--era-duration) var(--era-ease),
+    box-shadow var(--era-duration) var(--era-ease);
+  width: 100%;
+}
+
+.era-select-trigger:hover:not(:disabled) {
+  border-color: var(--shell-accent-border);
+}
+
+.era-select-trigger[aria-expanded='true'] {
+  border-color: var(--shell-accent);
+  box-shadow: var(--era-ring);
+}
+
+.era-select-trigger-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.era-select-trigger-icon {
+  border-bottom: 2px solid currentColor;
+  border-right: 2px solid currentColor;
+  flex: 0 0 auto;
+  height: 8px;
+  margin-left: 12px;
+  transform: rotate(45deg) translateY(-2px);
+  transition: transform var(--era-duration) var(--era-ease);
+  width: 8px;
+}
+
+.era-select-trigger[aria-expanded='true'] .era-select-trigger-icon {
+  transform: rotate(225deg) translateY(-2px);
+}
+
+.era-select-trigger:disabled {
+  background: var(--shell-surface-muted);
+  color: var(--shell-text-muted);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.era-select-popover {
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border-strong);
+  border-radius: var(--era-radius-md);
+  box-shadow: var(--era-shadow-md);
+  display: grid;
+  gap: 2px;
+  left: 0;
+  margin-top: 6px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 4px;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  z-index: 30;
+}
+
+.era-select-popover[hidden] {
+  display: none;
+}
+
+.era-select-option {
+  background: transparent;
+  border: 0;
+  border-radius: var(--era-radius-sm);
+  color: var(--shell-text);
+  cursor: pointer;
+  font: inherit;
+  padding: 9px 10px;
+  text-align: left;
+  transition:
+    background-color var(--era-duration) var(--era-ease),
+    color var(--era-duration) var(--era-ease);
+}
+
+.era-select-option:hover:not(:disabled),
+.era-select-option:focus-visible {
+  background: var(--shell-accent-soft);
+  color: var(--shell-accent-strong);
+  outline: none;
+}
+
+.era-select-option-selected::after {
+  color: var(--shell-accent);
+  content: '✓';
+  float: right;
+  font-weight: 700;
+}
+
+.era-select-option:disabled {
+  color: var(--shell-text-muted);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+@media (forced-colors: active) {
+  .era-select-trigger:focus-visible,
+  .era-select-option:focus-visible {
+    box-shadow: none;
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+}
+
+.status {
+  color: var(--shell-accent);
+  font-size: 12px;
+  min-height: 18px;
+}
+
+.preload-button {
+  background: var(--shell-text);
+  border: 0;
+  border-radius: var(--era-radius-pill);
+  color: var(--shell-text-inverse);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 12px;
+  min-height: 40px;
+  padding: 10px 16px;
+  transition:
+    background var(--era-duration) var(--era-ease),
+    opacity var(--era-duration) var(--era-ease),
+    transform var(--era-duration) var(--era-ease);
+  width: 100%;
+}
+
+.preload-button:hover:not(:disabled) {
+  background: var(--shell-inverse-hover);
+}
+
+.preload-button:active:not(:disabled) {
+  transform: scale(0.99);
+}
+
+.preload-button:focus-visible {
+  box-shadow: var(--era-ring);
+  outline: none;
+}
+
+.preload-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.preload-button-secondary {
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border-strong);
+  color: var(--shell-text);
+}
+
+.preload-button-secondary:hover:not(:disabled) {
+  background: var(--shell-surface-muted);
+}
+
+.preload-button-secondary:disabled {
+  opacity: 0.5;
+}
+
+.preload-confirm {
+  background: var(--shell-accent-soft);
+  border: 1px solid var(--shell-accent-border);
+  border-radius: var(--era-radius-md);
+  color: var(--shell-accent-strong);
+  margin-top: 10px;
+  padding: 12px;
+}
+
+.preload-confirm[hidden] {
+  display: none !important;
+}
+
+.preload-confirm p {
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.preload-confirm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.preload-confirm-actions .preload-button {
+  flex: 1 1 0;
+  margin-top: 0;
+  min-height: 36px;
+  padding: 8px 12px;
+}
+
+.preload-status {
+  color: var(--shell-text-subtle);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+  min-height: 36px;
+}
+
+.preload-status[data-state='ready'] {
+  color: var(--shell-success);
+}
+
+.preload-status[data-state='loading'] {
+  color: var(--shell-accent);
+}
+
+.domain-label {
+  color: var(--shell-accent);
+  font-weight: 600;
+}
+
+.learner-field {
+  margin-top: 10px;
+}
+
+.learner-field:first-of-type {
+  margin-top: 12px;
+}
+
+.learner-summary {
+  color: var(--shell-text-subtle);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+  min-height: 18px;
+}
+
+.reading-panel-section {
+  margin-top: 12px;
+}
+
+.panel-ui.view-reading .reading-panel-section {
+  margin-top: 0;
+}
+
+.billing-panel {
+  border-top: 1px solid var(--shell-border, #e2e8f0);
+  display: grid;
+  gap: 10px;
+  padding-top: 16px;
+}
+
+.billing-summary {
+  color: var(--shell-text-subtle, #475569);
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0;
+  min-height: 1em;
+  white-space: pre-line;
+}
+
+.billing-warning {
+  background: color-mix(in srgb, #f59e0b 12%, var(--shell-bg, #ffffff));
+  border: 1px solid color-mix(in srgb, #f59e0b 45%, var(--shell-border, #e2e8f0));
+  border-radius: 8px;
+  color: var(--shell-text, #292524);
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0;
+  padding: 8px 10px;
+}
+
+.billing-warning[data-state='limit'] {
+  background: color-mix(in srgb, #dc2626 10%, var(--shell-bg, #ffffff));
+  border-color: color-mix(in srgb, #dc2626 45%, var(--shell-border, #e2e8f0));
+}
+
+.billing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.theme-toggle-button {
+  align-items: center;
+  margin-left: auto;
+  background: var(--shell-bg-muted, #f5f5f4);
+  border: 1px solid var(--shell-border, #e7e5e4);
+  border-radius: 999px;
+  color: var(--shell-text-subtle, #57534e);
+  cursor: pointer;
+  display: inline-flex;
+  flex: none;
+  height: 32px;
+  justify-content: center;
+  padding: 0;
+  width: 32px;
+}
+
+.theme-toggle-button:hover {
+  color: var(--shell-text, #292524);
+}
+
+.theme-toggle-button .era-theme-icon {
+  display: block;
+  height: 16px;
+  width: 16px;
+}
+
+.custom-prompts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.custom-prompts-empty {
+  color: var(--shell-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.custom-prompts-item {
+  align-items: flex-start;
+  background: var(--shell-surface-muted);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--era-radius-md);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 10px 12px;
+  position: relative;
+}
+
+.custom-prompts-item[data-prompt-message]:hover::after {
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border-strong);
+  border-radius: var(--era-radius-sm);
+  box-shadow: var(--era-shadow-md);
+  color: var(--shell-text-subtle);
+  content: attr(data-prompt-message);
+  font-size: 12px;
+  font-weight: 400;
+  left: 12px;
+  line-height: 1.45;
+  max-width: min(320px, calc(100% - 24px));
+  padding: 8px 10px;
+  pointer-events: none;
+  position: absolute;
+  right: 12px;
+  top: calc(100% + 4px);
+  white-space: normal;
+  z-index: 5;
+}
+
+.custom-prompts-item-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.custom-prompts-item-text strong {
+  color: var(--shell-text);
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.custom-prompts-item-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.custom-prompt-move,
+.custom-prompt-edit,
+.custom-prompt-delete,
+.custom-prompt-toggle {
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border-strong);
+  border-radius: var(--era-radius-sm);
+  color: var(--shell-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  transition: background var(--era-duration) var(--era-ease);
+}
+
+.custom-prompt-move:hover:not(:disabled),
+.custom-prompt-edit:hover,
+.custom-prompt-delete:hover,
+.custom-prompt-toggle:hover {
+  background: var(--shell-surface-muted);
+}
+
+.custom-prompt-move:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.custom-prompt-delete {
+  color: var(--shell-danger);
+}
+
+.custom-prompts-group {
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  margin-top: 8px;
+  text-transform: uppercase;
+}
+
+.custom-prompts-group:first-child {
+  margin-top: 0;
+}
+
+.custom-prompts-item.is-hidden {
+  opacity: 0.5;
+}
+
+.custom-prompts-form-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.custom-prompts-form-actions .preload-button {
+  flex: 1 1 0;
+  margin-top: 0;
+}

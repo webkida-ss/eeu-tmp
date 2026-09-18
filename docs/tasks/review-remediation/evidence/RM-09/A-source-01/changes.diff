@@ -1,0 +1,1419 @@
+diff --git a/backend/accounts/billing/mock_billing.py b/backend/accounts/billing/mock_billing.py
+index b52b3f7..ded3943 100644
+--- a/backend/accounts/billing/mock_billing.py
++++ b/backend/accounts/billing/mock_billing.py
+@@ -9,7 +9,7 @@ from __future__ import annotations
+ 
+ from accounts.models import User
+ from accounts.plans import PlanCatalog
+-from accounts.ports import BillingError, CheckoutSession, SubscriptionEvent
++from accounts.ports import BillingError, CheckoutDiscovery, CheckoutSession, SubscriptionEvent
+ 
+ 
+ class MockBillingProvider:
+@@ -24,6 +24,8 @@ class MockBillingProvider:
+         success_url: str,
+         cancel_url: str,
+         stripe_customer_id: str | None = None,
++        idempotency_key: str,
++        operation_id: str,
+     ) -> CheckoutSession:
+         if not self._plans.is_paid(plan_id):
+             raise BillingError(f"Unknown paid plan: {plan_id}")
+@@ -31,8 +33,20 @@ class MockBillingProvider:
+             url=success_url,
+             activated_plan=plan_id,
+             stripe_customer_id=stripe_customer_id or f"mock_customer_{user.id}",
++            stripe_checkout_session_id=f"mock_checkout_{operation_id}",
+         )
+ 
++    def checkout_price_id(self, plan_id: str) -> str:
++        if not self._plans.is_paid(plan_id):
++            raise BillingError(f"Unknown paid plan: {plan_id}")
++        return f"mock_price_{plan_id}"
++
++    def discover_checkout_sessions(
++        self, user: User, *, stripe_customer_id: str | None
++    ) -> CheckoutDiscovery:
++        # Mock checkout activates locally and has no provider-side history.
++        return CheckoutDiscovery(sessions=(), complete=True)
++
+     def create_portal_session(self, stripe_customer_id: str, *, return_url: str) -> str:
+         return return_url
+ 
+diff --git a/backend/accounts/billing/stripe_billing.py b/backend/accounts/billing/stripe_billing.py
+index e1238bf..16e24fd 100644
+--- a/backend/accounts/billing/stripe_billing.py
++++ b/backend/accounts/billing/stripe_billing.py
+@@ -13,7 +13,13 @@ import logging
+ from typing import Any
+ 
+ from accounts.models import User
+-from accounts.ports import BillingError, CheckoutSession, SubscriptionEvent
++from accounts.ports import (
++    BillingError,
++    CheckoutDiscovery,
++    CheckoutSession,
++    HistoricalCheckout,
++    SubscriptionEvent,
++)
+ 
+ logger = logging.getLogger("accounts.billing")
+ 
+@@ -62,6 +68,15 @@ class StripeBillingProvider:
+         stripe.api_key = self._secret_key
+         return stripe
+ 
++    def checkout_price_id(self, plan_id: str) -> str:
++        price_id = self._price_ids.get(plan_id)
++        if not price_id:
++            raise BillingError(
++                f"No Stripe price is configured for plan '{plan_id}'. "
++                f"Set STRIPE_PRICE_ID_{plan_id.upper()}."
++            )
++        return price_id
++
+     def create_checkout_session(
+         self,
+         user: User,
+@@ -70,13 +85,10 @@ class StripeBillingProvider:
+         success_url: str,
+         cancel_url: str,
+         stripe_customer_id: str | None = None,
++        idempotency_key: str,
++        operation_id: str,
+     ) -> CheckoutSession:
+-        price_id = self._price_ids.get(plan_id)
+-        if not price_id:
+-            raise BillingError(
+-                f"No Stripe price is configured for plan '{plan_id}'. "
+-                f"Set STRIPE_PRICE_ID_{plan_id.upper()}."
+-            )
++        price_id = self.checkout_price_id(plan_id)
+ 
+         stripe = self._client()
+         try:
+@@ -86,20 +98,103 @@ class StripeBillingProvider:
+                 "success_url": success_url,
+                 "cancel_url": cancel_url,
+                 "client_reference_id": user.id,
+-                "subscription_data": {"metadata": {"user_id": user.id, "plan": plan_id}},
+-                "metadata": {"user_id": user.id, "plan": plan_id},
++                "subscription_data": {
++                    "metadata": {
++                        "user_id": user.id,
++                        "plan": plan_id,
++                        "checkout_operation_id": operation_id,
++                    }
++                },
++                "metadata": {
++                    "user_id": user.id,
++                    "plan": plan_id,
++                    "checkout_operation_id": operation_id,
++                },
+             }
+             if _is_stripe_customer_id(stripe_customer_id):
+                 params["customer"] = stripe_customer_id
+             else:
+                 params["customer_email"] = user.email
+-            session = stripe.checkout.Session.create(**params)
++            session = stripe.checkout.Session.create(**params, idempotency_key=idempotency_key)
+         except BillingError:
+             raise
+         except Exception as exc:
+             raise BillingError(f"Stripe checkout failed: {exc}", status_code=502) from exc
+ 
+-        return CheckoutSession(url=session.url)
++        return CheckoutSession(
++            url=session.url,
++            stripe_checkout_session_id=getattr(session, "id", None),
++            expires_at=getattr(session, "expires_at", None),
++        )
++
++    def discover_checkout_sessions(
++        self, user: User, *, stripe_customer_id: str | None
++    ) -> CheckoutDiscovery:
++        """Read bounded paginated history without treating a missing page as empty."""
++        stripe = self._client()
++        sessions: list[HistoricalCheckout] = []
++        starting_after: str | None = None
++        max_pages = 20
++        try:
++            for _page in range(max_pages):
++                params: dict[str, Any] = {
++                    "limit": 100,
++                    "expand": ["data.line_items"],
++                }
++                if starting_after:
++                    params["starting_after"] = starting_after
++                page = stripe.checkout.Session.list(**params)
++                data = list(self._value(page, "data") or [])
++                for session in data:
++                    sessions.append(self._historical_checkout(stripe, session))
++                if not self._value(page, "has_more"):
++                    return CheckoutDiscovery(sessions=tuple(sessions), complete=True)
++                if not data:
++                    return CheckoutDiscovery(sessions=tuple(sessions), complete=False)
++                starting_after = self._value(data[-1], "id")
++                if not starting_after:
++                    return CheckoutDiscovery(sessions=tuple(sessions), complete=False)
++        except BillingError:
++            raise
++        except Exception as exc:
++            raise BillingError("Stripe checkout history lookup failed.", status_code=502) from exc
++        return CheckoutDiscovery(sessions=tuple(sessions), complete=False)
++
++    def _historical_checkout(self, stripe: Any, session: Any) -> HistoricalCheckout:
++        metadata = self._value(session, "metadata") or {}
++        customer_details = self._value(session, "customer_details") or {}
++        line_items = self._value(session, "line_items") or {}
++        items = self._value(line_items, "data") or []
++        first_item = items[0] if items else {}
++        price = self._value(first_item, "price") or {}
++        subscription_id = self._value(session, "subscription")
++        subscription_status = None
++        if self._value(session, "status") == "complete" and subscription_id:
++            subscription = stripe.Subscription.retrieve(subscription_id)
++            subscription_status = self._value(subscription, "status")
++        return HistoricalCheckout(
++            stripe_checkout_session_id=str(self._value(session, "id") or ""),
++            url=self._value(session, "url"),
++            state=str(self._value(session, "status") or "unknown"),
++            user_id=(
++                self._value(metadata, "user_id") or self._value(session, "client_reference_id")
++            ),
++            email=self._value(customer_details, "email") or self._value(session, "customer_email"),
++            stripe_customer_id=self._value(session, "customer"),
++            requested_plan=self._value(metadata, "plan"),
++            price_id=self._value(price, "id"),
++            success_url=self._value(session, "success_url"),
++            cancel_url=self._value(session, "cancel_url"),
++            stripe_subscription_id=subscription_id,
++            subscription_status=subscription_status,
++            expires_at=self._value(session, "expires_at"),
++        )
++
++    @staticmethod
++    def _value(value: Any, field: str) -> Any:
++        if isinstance(value, dict):
++            return value.get(field)
++        return getattr(value, field, None)
+ 
+     def create_portal_session(self, stripe_customer_id: str, *, return_url: str) -> str:
+         if not _is_stripe_customer_id(stripe_customer_id):
+diff --git a/backend/accounts/ports.py b/backend/accounts/ports.py
+index e02ae54..481b8c1 100644
+--- a/backend/accounts/ports.py
++++ b/backend/accounts/ports.py
+@@ -67,6 +67,44 @@ class CheckoutSession:
+     # Stripe activates through the webhook after payment.
+     activated_plan: str | None = None
+     stripe_customer_id: str | None = None
++    # Provider identifiers must remain explicitly named so a future provider
++    # cannot accidentally reuse Stripe checkout state.
++    stripe_checkout_session_id: str | None = None
++    expires_at: int | None = None
++
++
++@dataclass(frozen=True)
++class HistoricalCheckout:
++    """A provider-normalized hosted checkout found during recovery.
++
++    The provider fills trusted identity fields only from its own metadata or
++    client reference. An email match is deliberately separate because it is
++    never enough to establish checkout ownership.
++    """
++
++    stripe_checkout_session_id: str
++    url: str | None
++    state: str
++    user_id: str | None = None
++    email: str | None = None
++    stripe_customer_id: str | None = None
++    requested_plan: str | None = None
++    price_id: str | None = None
++    success_url: str | None = None
++    cancel_url: str | None = None
++    stripe_subscription_id: str | None = None
++    subscription_status: str | None = None
++    expires_at: int | None = None
++
++
++@dataclass(frozen=True)
++class CheckoutDiscovery:
++    """Bounded, paginated, read-only provider history for one checkout start."""
++
++    sessions: tuple[HistoricalCheckout, ...]
++    # False means a page or retrieval failed before the provider proved that
++    # discovery was exhaustive; callers must fail closed.
++    complete: bool
+ 
+ 
+ @dataclass(frozen=True)
+@@ -88,8 +126,16 @@ class BillingProvider(Protocol):
+         success_url: str,
+         cancel_url: str,
+         stripe_customer_id: str | None = None,
++        idempotency_key: str,
++        operation_id: str,
+     ) -> CheckoutSession: ...
+ 
++    def checkout_price_id(self, plan_id: str) -> str: ...
++
++    def discover_checkout_sessions(
++        self, user: User, *, stripe_customer_id: str | None
++    ) -> CheckoutDiscovery: ...
++
+     def create_portal_session(self, stripe_customer_id: str, *, return_url: str) -> str: ...
+ 
+     def parse_webhook_event(self, payload: bytes, signature: str | None) -> SubscriptionEvent: ...
+@@ -108,4 +154,12 @@ class SubscriptionRepository(Protocol):
+ 
+     def upsert(self, user_id: str, record: dict[str, Any]) -> dict[str, Any]: ...
+ 
++    def compare_and_swap(
++        self,
++        user_id: str,
++        record: dict[str, Any],
++        *,
++        expected_revision: int,
++    ) -> dict[str, Any] | None: ...
++
+     def find_user_by_customer(self, stripe_customer_id: str) -> str | None: ...
+diff --git a/backend/accounts/services/billing_flow.py b/backend/accounts/services/billing_flow.py
+index 1a3b956..bff680e 100644
+--- a/backend/accounts/services/billing_flow.py
++++ b/backend/accounts/services/billing_flow.py
+@@ -7,19 +7,152 @@ owns the subscription records that the host's entitlement layer reads.
+ from __future__ import annotations
+ 
+ import logging
++from datetime import UTC, datetime
+ from typing import Any
+ 
++from core.ids import generate_uuid7
++
+ from accounts.models import SubscriptionState, User
+ from accounts.plans import PlanCatalog, resolve_plan_id
+ from accounts.ports import (
+     BillingError,
+     BillingProvider,
++    CheckoutDiscovery,
+     CheckoutSession,
++    HistoricalCheckout,
+     SubscriptionRepository,
+ )
+ 
+ logger = logging.getLogger("accounts.billing")
+ 
++_CHECKOUT_KEY_RETENTION_SECONDS = 23 * 60 * 60
++_TERMINAL_SUBSCRIPTION_STATUSES = frozenset({"canceled", "incomplete_expired"})
++
++
++def _record_revision(record: dict[str, Any] | None) -> int:
++    value = (record or {}).get("revision", 0)
++    return value if isinstance(value, int) and value >= 0 else 0
++
++
++def _now_epoch() -> int:
++    return int(datetime.now(UTC).timestamp())
++
++
++def _pending_matches(pending: dict[str, Any], requested: dict[str, Any]) -> bool:
++    return all(pending.get(field) == value for field, value in requested.items())
++
++
++def _session_from_pending(pending: dict[str, Any]) -> CheckoutSession | None:
++    url = pending.get("url")
++    if not isinstance(url, str) or not url:
++        return None
++    return CheckoutSession(
++        url=url,
++        stripe_checkout_session_id=pending.get("stripe_checkout_session_id"),
++        expires_at=pending.get("expires_at"),
++    )
++
++
++def _safe_checkout_conflict(message: str) -> BillingError:
++    return BillingError(message, status_code=409)
++
++
++def _historical_checkout_is_compatible(
++    checkout: HistoricalCheckout, parameters: dict[str, Any]
++) -> bool:
++    return (
++        checkout.user_id == parameters["user_id"]
++        and checkout.requested_plan == parameters["requested_plan"]
++        and checkout.price_id == parameters["price_id"]
++        and checkout.success_url == parameters["success_url"]
++        and checkout.cancel_url == parameters["cancel_url"]
++        and bool(checkout.url)
++    )
++
++
++def _recover_historical_checkout(
++    discovery: CheckoutDiscovery,
++    user: User,
++    parameters: dict[str, Any],
++) -> HistoricalCheckout | None:
++    """Return one reusable trusted session, otherwise fail closed.
++
++    Discovery is provider read-only. A partial page, an email-only candidate,
++    an unknown state, or more than one nonterminal purchase is ambiguity, not
++    evidence that a new sale is safe.
++    """
++    if not discovery.complete:
++        raise _safe_checkout_conflict("Checkout history is incomplete; reconciliation is required.")
++
++    relevant: list[HistoricalCheckout] = []
++    normalized_email = user.email.strip().lower()
++    for checkout in discovery.sessions:
++        if checkout.user_id == user.id:
++            relevant.append(checkout)
++        elif checkout.email and checkout.email.strip().lower() == normalized_email:
++            raise _safe_checkout_conflict(
++                "Checkout history has an email-only ownership match; reconciliation is required."
++            )
++
++    reusable: list[HistoricalCheckout] = []
++    for checkout in relevant:
++        if checkout.state == "open":
++            reusable.append(checkout)
++            continue
++        if checkout.state == "expired":
++            if checkout.subscription_status not in (None, *_TERMINAL_SUBSCRIPTION_STATUSES):
++                raise _safe_checkout_conflict(
++                    "Historical checkout requires subscription reconciliation."
++                )
++            continue
++        if checkout.state == "complete":
++            if checkout.subscription_status not in _TERMINAL_SUBSCRIPTION_STATUSES:
++                raise _safe_checkout_conflict(
++                    "Completed checkout requires subscription reconciliation."
++                )
++            continue
++        raise _safe_checkout_conflict(
++            "Historical checkout has an unknown state; reconciliation is required."
++        )
++
++    if len(reusable) != 1:
++        if len(reusable) > 1:
++            raise _safe_checkout_conflict("Multiple open checkouts require reconciliation.")
++        return None
++    if not _historical_checkout_is_compatible(reusable[0], parameters):
++        raise _safe_checkout_conflict("An incompatible open checkout requires reconciliation.")
++    return reusable[0]
++
++
++def _discover_or_conflict(
++    provider: BillingProvider,
++    user: User,
++    stripe_customer_id: str | None,
++    parameters: dict[str, Any],
++) -> HistoricalCheckout | None:
++    try:
++        discovery = provider.discover_checkout_sessions(user, stripe_customer_id=stripe_customer_id)
++    except Exception as exc:
++        logger.warning("checkout history lookup failed user=%s", user.id)
++        raise _safe_checkout_conflict(
++            "Checkout history is unavailable; reconciliation is required."
++        ) from exc
++    return _recover_historical_checkout(discovery, user, parameters)
++
++
++def _persist_pending(
++    subscription_repository: SubscriptionRepository,
++    user_id: str,
++    current: dict[str, Any],
++    pending: dict[str, Any],
++) -> dict[str, Any] | None:
++    candidate = {**current, "pending_checkout": pending}
++    return subscription_repository.compare_and_swap(
++        user_id,
++        candidate,
++        expected_revision=_record_revision(current),
++    )
++
+ 
+ def start_checkout(
+     subscription_repository: SubscriptionRepository,
+@@ -34,39 +167,164 @@ def start_checkout(
+     if not plans.is_paid(plan_id):
+         raise BillingError(f"Unknown paid plan: {plan_id}")
+ 
+-    existing = subscription_repository.get(user.id) or {}
++    for _attempt in range(4):
++        existing = subscription_repository.get(user.id) or {}
+ 
+-    # Stripe Checkout always creates a NEW subscription; running it for a
+-    # user who already has an active paid plan would double-bill. Plan
+-    # changes for subscribers go through the customer portal instead.
+-    if resolve_plan_id(existing, plans) != plans.basic_plan_id:
+-        raise BillingError(
+-            "An active subscription already exists. Use the billing portal to change plans.",
+-            status_code=409,
+-        )
++        # Stripe Checkout always creates a NEW subscription; running it for a
++        # user who already has an active paid plan would double-bill. Plan
++        # changes for subscribers go through the customer portal instead.
++        if resolve_plan_id(existing, plans) != plans.basic_plan_id:
++            raise _safe_checkout_conflict(
++                "An active subscription already exists. Use the billing portal to change plans."
++            )
+ 
+-    session = provider.create_checkout_session(
+-        user,
+-        plan_id,
+-        success_url=success_url,
+-        cancel_url=cancel_url,
+-        stripe_customer_id=existing.get("stripe_customer_id"),
+-    )
++        customer_id = existing.get("stripe_customer_id")
++        price_id = provider.checkout_price_id(plan_id)
++        immutable_parameters = {
++            "user_id": user.id,
++            "requested_plan": plan_id,
++            "price_id": price_id,
++            "success_url": success_url,
++            "cancel_url": cancel_url,
++            "stripe_customer_id": customer_id,
++            "customer_choice": "customer" if customer_id else "email",
++        }
++        pending = existing.get("pending_checkout")
++        if isinstance(pending, dict):
++            if not _pending_matches(pending, immutable_parameters):
++                raise _safe_checkout_conflict("A different checkout operation is already pending.")
++            stored_session = _session_from_pending(pending)
++            if stored_session is not None:
++                return stored_session
++            attempted_at = pending.get("creation_attempted_at")
++            if (
++                isinstance(attempted_at, int)
++                and _now_epoch() - attempted_at >= _CHECKOUT_KEY_RETENTION_SECONDS
++            ):
++                adopted = _discover_or_conflict(provider, user, customer_id, immutable_parameters)
++                if adopted is None:
++                    raise _safe_checkout_conflict(
++                        "The earlier checkout attempt is ambiguous; reconciliation is required."
++                    )
++                updated_pending = {
++                    **pending,
++                    "state": "adopted",
++                    "stripe_checkout_session_id": adopted.stripe_checkout_session_id,
++                    "url": adopted.url,
++                    "expires_at": adopted.expires_at,
++                }
++                persisted = _persist_pending(
++                    subscription_repository, user.id, existing, updated_pending
++                )
++                if persisted is None:
++                    continue
++                return _session_from_pending(updated_pending)  # type: ignore[return-value]
++        else:
++            adopted = _discover_or_conflict(provider, user, customer_id, immutable_parameters)
++            operation_id = generate_uuid7()
++            pending = {
++                **immutable_parameters,
++                "operation_id": operation_id,
++                "operation_metadata": {
++                    "operation_id": operation_id,
++                    "user_id": user.id,
++                    "plan": plan_id,
++                },
++                "idempotency_key": generate_uuid7(),
++                "created_at": _now_epoch(),
++                "state": "reserved",
++            }
++            if adopted is not None:
++                pending.update(
++                    {
++                        "state": "adopted",
++                        "stripe_checkout_session_id": adopted.stripe_checkout_session_id,
++                        "url": adopted.url,
++                        "expires_at": adopted.expires_at,
++                    }
++                )
++            persisted = _persist_pending(subscription_repository, user.id, existing, pending)
++            if persisted is None:
++                continue
++            if adopted is not None:
++                return _session_from_pending(pending)  # type: ignore[return-value]
+ 
+-    # The mock provider has no external checkout: the plan activates now.
+-    if session.activated_plan:
+-        subscription_repository.upsert(
+-            user.id,
+-            {
+-                **existing,
+-                "plan": session.activated_plan,
+-                "status": "active",
+-                "stripe_customer_id": session.stripe_customer_id
+-                or existing.get("stripe_customer_id"),
+-                "current_period_end": None,
+-            },
++        # Persist the marker before external I/O. It intentionally remains
++        # after timeout/error so local failure cannot be misread as absence.
++        current = subscription_repository.get(user.id) or {}
++        current_pending = current.get("pending_checkout")
++        if not isinstance(current_pending, dict):
++            continue
++        if not _pending_matches(current_pending, immutable_parameters):
++            raise _safe_checkout_conflict("A different checkout operation is already pending.")
++        stored_session = _session_from_pending(current_pending)
++        if stored_session is not None:
++            return stored_session
++        attempted_pending = {
++            **current_pending,
++            "state": "attempted",
++            "creation_attempted_at": current_pending.get("creation_attempted_at") or _now_epoch(),
++        }
++        persisted = _persist_pending(subscription_repository, user.id, current, attempted_pending)
++        if persisted is None:
++            continue
++
++        # Provider I/O is deliberately outside repository locks. Every retry
++        # carries the durable operation identity and identical parameters.
++        session = provider.create_checkout_session(
++            user,
++            plan_id,
++            success_url=success_url,
++            cancel_url=cancel_url,
++            stripe_customer_id=customer_id,
++            idempotency_key=attempted_pending["idempotency_key"],
++            operation_id=attempted_pending["operation_id"],
+         )
+-    return session
++        latest = subscription_repository.get(user.id) or {}
++        latest_pending = latest.get("pending_checkout")
++        if not isinstance(latest_pending, dict) or latest_pending.get(
++            "operation_id"
++        ) != attempted_pending.get("operation_id"):
++            replacement = (
++                _session_from_pending(latest_pending) if isinstance(latest_pending, dict) else None
++            )
++            if replacement is not None:
++                return replacement
++            raise _safe_checkout_conflict("Checkout ownership changed; reconciliation is required.")
++        completed_pending = {
++            **latest_pending,
++            "state": "created",
++            "stripe_checkout_session_id": session.stripe_checkout_session_id,
++            "url": session.url,
++            "expires_at": session.expires_at,
++        }
++        persisted = _persist_pending(subscription_repository, user.id, latest, completed_pending)
++        if persisted is None:
++            continue
++
++        # The mock provider has no external checkout: the plan activates now.
++        if session.activated_plan:
++            activated = subscription_repository.get(user.id) or {}
++            activated_pending = activated.get("pending_checkout")
++            if isinstance(activated_pending, dict) and activated_pending.get(
++                "operation_id"
++            ) == completed_pending.get("operation_id"):
++                activated_pending = {**activated_pending, "state": "activated"}
++            subscription_repository.upsert(
++                user.id,
++                {
++                    **activated,
++                    "pending_checkout": activated_pending,
++                    "plan": session.activated_plan,
++                    "status": "active",
++                    "stripe_customer_id": session.stripe_customer_id
++                    or activated.get("stripe_customer_id"),
++                    "current_period_end": None,
++                },
++            )
++        return session
++
++    raise _safe_checkout_conflict("Checkout ownership changed repeatedly; retry later.")
+ 
+ 
+ def open_portal(
+diff --git a/backend/accounts/storage/json_subscriptions.py b/backend/accounts/storage/json_subscriptions.py
+index 1ccb741..78acdbd 100644
+--- a/backend/accounts/storage/json_subscriptions.py
++++ b/backend/accounts/storage/json_subscriptions.py
+@@ -2,34 +2,111 @@
+ 
+ from __future__ import annotations
+ 
++import copy
++import threading
+ from pathlib import Path
+ from typing import Any
+ 
+-from accounts.storage.json_store import read_json_list, write_json_list
++from accounts.storage.json_store import json_list_lock, read_json_list, write_json_list
+ 
+ 
+ class JsonSubscriptionRepository:
++    """Cross-process safe subscription records with revision-based writes."""
++
++    _locks_guard = threading.Lock()
++    _locks: dict[Path, threading.RLock] = {}
++
+     def __init__(self, path: Path) -> None:
+-        self._path = path
++        self._path = path.resolve()
++        with self._locks_guard:
++            self._lock = self._locks.setdefault(self._path, threading.RLock())
+ 
+     def get(self, user_id: str) -> dict[str, Any] | None:
+-        for item in read_json_list(self._path):
+-            if item.get("user_id") == user_id:
+-                return item
+-        return None
++        with self._lock, json_list_lock(self._path):
++            record = self._find(read_json_list(self._path), user_id)
++            return copy.deepcopy(record) if record is not None else None
+ 
+     def upsert(self, user_id: str, record: dict[str, Any]) -> dict[str, Any]:
+-        stored = dict(record)
+-        stored["user_id"] = user_id
+-        items = [item for item in read_json_list(self._path) if item.get("user_id") != user_id]
+-        items.append(stored)
+-        write_json_list(self._path, items)
+-        return stored
++        """Write a legacy update without erasing a pending checkout owner."""
++        with self._lock, json_list_lock(self._path):
++            items = read_json_list(self._path)
++            current = self._find(items, user_id)
++            stored = self._next_record(user_id, record, current)
++            self._assert_customer_ownership(items, user_id, stored.get("stripe_customer_id"))
++            self._replace(items, user_id, stored)
++            write_json_list(self._path, items)
++            return copy.deepcopy(stored)
++
++    def compare_and_swap(
++        self,
++        user_id: str,
++        record: dict[str, Any],
++        *,
++        expected_revision: int,
++    ) -> dict[str, Any] | None:
++        """Atomically advance one record only from its expected revision."""
++        with self._lock, json_list_lock(self._path):
++            items = read_json_list(self._path)
++            current = self._find(items, user_id)
++            if self._revision(current) != expected_revision:
++                return None
++            stored = self._next_record(user_id, record, current)
++            self._assert_customer_ownership(items, user_id, stored.get("stripe_customer_id"))
++            self._replace(items, user_id, stored)
++            write_json_list(self._path, items)
++            return copy.deepcopy(stored)
+ 
+     def find_user_by_customer(self, stripe_customer_id: str) -> str | None:
+         if not stripe_customer_id:
+             return None
+-        for item in read_json_list(self._path):
+-            if item.get("stripe_customer_id") == stripe_customer_id:
+-                return item.get("user_id")
+-        return None
++        with self._lock, json_list_lock(self._path):
++            owners = {
++                item.get("user_id")
++                for item in read_json_list(self._path)
++                if item.get("stripe_customer_id") == stripe_customer_id and item.get("user_id")
++            }
++        if len(owners) > 1:
++            raise ValueError("Ambiguous Stripe customer ownership requires reconciliation.")
++        return next(iter(owners), None)
++
++    @staticmethod
++    def _find(items: list[dict[str, Any]], user_id: str) -> dict[str, Any] | None:
++        return next((item for item in items if item.get("user_id") == user_id), None)
++
++    @staticmethod
++    def _revision(record: dict[str, Any] | None) -> int:
++        raw = (record or {}).get("revision", 0)
++        return raw if isinstance(raw, int) and raw >= 0 else 0
++
++    def _next_record(
++        self,
++        user_id: str,
++        record: dict[str, Any],
++        current: dict[str, Any] | None,
++    ) -> dict[str, Any]:
++        stored = copy.deepcopy(record)
++        current_pending = (current or {}).get("pending_checkout")
++        requested_pending = stored.get("pending_checkout")
++        if current_pending and not requested_pending:
++            stored["pending_checkout"] = copy.deepcopy(current_pending)
++        elif current_pending and requested_pending:
++            if requested_pending.get("operation_id") != current_pending.get("operation_id"):
++                raise ValueError("A pending checkout operation cannot be replaced.")
++        stored["user_id"] = user_id
++        stored["revision"] = self._revision(current) + 1
++        return stored
++
++    @staticmethod
++    def _assert_customer_ownership(
++        items: list[dict[str, Any]], user_id: str, customer_id: object
++    ) -> None:
++        if not isinstance(customer_id, str) or not customer_id:
++            return
++        for item in items:
++            if item.get("user_id") != user_id and item.get("stripe_customer_id") == customer_id:
++                raise ValueError("Stripe customer is already owned by another account.")
++
++    @staticmethod
++    def _replace(items: list[dict[str, Any]], user_id: str, record: dict[str, Any]) -> None:
++        items[:] = [item for item in items if item.get("user_id") != user_id]
++        items.append(record)
+diff --git a/backend/accounts/storage/memory.py b/backend/accounts/storage/memory.py
+index 242e67d..c16a9c5 100644
+--- a/backend/accounts/storage/memory.py
++++ b/backend/accounts/storage/memory.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ import secrets
+ import threading
+ import uuid
++from copy import deepcopy
+ from datetime import UTC, datetime, timedelta
+ from typing import Any
+ 
+@@ -73,28 +74,88 @@ class InMemoryAuthService:
+             self._sessions.pop(token, None)
+ 
+ 
+-class InMemorySubscriptionRepository:
++class _InMemorySubscriptionState:
+     def __init__(self) -> None:
+-        self._lock = threading.Lock()
+-        self._records: dict[str, dict[str, Any]] = {}
++        self.lock = threading.RLock()
++        self.records: dict[str, dict[str, Any]] = {}
++
++
++class InMemorySubscriptionRepository:
++    def __init__(self, state: _InMemorySubscriptionState | None = None) -> None:
++        self._state = state or _InMemorySubscriptionState()
++
++    @staticmethod
++    def shared_state() -> _InMemorySubscriptionState:
++        """Create state explicitly shareable by independent repository adapters."""
++        return _InMemorySubscriptionState()
+ 
+     def get(self, user_id: str) -> dict[str, Any] | None:
+-        with self._lock:
+-            record = self._records.get(user_id)
+-            return dict(record) if record else None
++        with self._state.lock:
++            record = self._state.records.get(user_id)
++            return deepcopy(record) if record else None
+ 
+     def upsert(self, user_id: str, record: dict[str, Any]) -> dict[str, Any]:
+-        stored = dict(record)
+-        stored["user_id"] = user_id
+-        with self._lock:
+-            self._records[user_id] = stored
+-        return dict(stored)
++        with self._state.lock:
++            stored = self._next_record(user_id, record, self._state.records.get(user_id))
++            self._assert_customer_ownership(user_id, stored.get("stripe_customer_id"))
++            self._state.records[user_id] = stored
++            return deepcopy(stored)
++
++    def compare_and_swap(
++        self,
++        user_id: str,
++        record: dict[str, Any],
++        *,
++        expected_revision: int,
++    ) -> dict[str, Any] | None:
++        with self._state.lock:
++            current = self._state.records.get(user_id)
++            if self._revision(current) != expected_revision:
++                return None
++            stored = self._next_record(user_id, record, current)
++            self._assert_customer_ownership(user_id, stored.get("stripe_customer_id"))
++            self._state.records[user_id] = stored
++            return deepcopy(stored)
+ 
+     def find_user_by_customer(self, stripe_customer_id: str) -> str | None:
+         if not stripe_customer_id:
+             return None
+-        with self._lock:
+-            for user_id, record in self._records.items():
+-                if record.get("stripe_customer_id") == stripe_customer_id:
+-                    return user_id
+-        return None
++        with self._state.lock:
++            owners = {
++                user_id
++                for user_id, record in self._state.records.items()
++                if record.get("stripe_customer_id") == stripe_customer_id
++            }
++        if len(owners) > 1:
++            raise ValueError("Ambiguous Stripe customer ownership requires reconciliation.")
++        return next(iter(owners), None)
++
++    @staticmethod
++    def _revision(record: dict[str, Any] | None) -> int:
++        raw = (record or {}).get("revision", 0)
++        return raw if isinstance(raw, int) and raw >= 0 else 0
++
++    def _next_record(
++        self,
++        user_id: str,
++        record: dict[str, Any],
++        current: dict[str, Any] | None,
++    ) -> dict[str, Any]:
++        stored = deepcopy(record)
++        current_pending = (current or {}).get("pending_checkout")
++        requested_pending = stored.get("pending_checkout")
++        if current_pending and not requested_pending:
++            stored["pending_checkout"] = deepcopy(current_pending)
++        elif current_pending and requested_pending:
++            if requested_pending.get("operation_id") != current_pending.get("operation_id"):
++                raise ValueError("A pending checkout operation cannot be replaced.")
++        stored["user_id"] = user_id
++        stored["revision"] = self._revision(current) + 1
++        return stored
++
++    def _assert_customer_ownership(self, user_id: str, customer_id: object) -> None:
++        if not isinstance(customer_id, str) or not customer_id:
++            return
++        for owner_id, record in self._state.records.items():
++            if owner_id != user_id and record.get("stripe_customer_id") == customer_id:
++                raise ValueError("Stripe customer is already owned by another account.")
+diff --git a/backend/repositories/dynamodb_billing_repositories.py b/backend/repositories/dynamodb_billing_repositories.py
+index d265500..541df66 100644
+--- a/backend/repositories/dynamodb_billing_repositories.py
++++ b/backend/repositories/dynamodb_billing_repositories.py
+@@ -610,26 +610,147 @@ class DynamoSubscriptionRepository:
+         self._store = store
+ 
+     def get(self, user_id: str) -> dict[str, Any] | None:
+-        return self._store.get_document(user_pk(user_id), SK_SUBSCRIPTION)
++        return self._store.get_document(user_pk(user_id), SK_SUBSCRIPTION, consistent_read=True)
+ 
+     def upsert(self, user_id: str, record: dict[str, Any]) -> dict[str, Any]:
+-        stored = dict(record)
+-        stored["user_id"] = user_id
+-        self._store.put_document(user_pk(user_id), SK_SUBSCRIPTION, stored)
++        for _attempt in range(4):
++            current = self.get(user_id)
++            stored = self._next_record(user_id, record, current)
++            if self._write(user_id, stored, current):
++                return stored
++        raise ValueError("Subscription update conflicted; retry after reconciliation.")
+ 
+-        # Reverse index so webhooks can resolve the user from a Stripe
+-        # customer id without scanning.
+-        customer_id = stored.get("stripe_customer_id")
+-        if customer_id:
+-            self._store.put_document(
+-                stripe_customer_pk(customer_id),
+-                SK_SUBSCRIPTION,
+-                {"user_id": user_id, "stripe_customer_id": customer_id},
+-            )
+-        return stored
++    def compare_and_swap(
++        self,
++        user_id: str,
++        record: dict[str, Any],
++        *,
++        expected_revision: int,
++    ) -> dict[str, Any] | None:
++        current = self.get(user_id)
++        if self._revision(current) != expected_revision:
++            return None
++        stored = self._next_record(user_id, record, current)
++        return stored if self._write(user_id, stored, current) else None
+ 
+     def find_user_by_customer(self, stripe_customer_id: str) -> str | None:
+         if not stripe_customer_id:
+             return None
+-        record = self._store.get_document(stripe_customer_pk(stripe_customer_id), SK_SUBSCRIPTION)
++        record = self._store.get_document(
++            stripe_customer_pk(stripe_customer_id), SK_SUBSCRIPTION, consistent_read=True
++        )
+         return record.get("user_id") if record else None
++
++    @staticmethod
++    def _revision(record: dict[str, Any] | None) -> int:
++        value = (record or {}).get("revision", 0)
++        return value if isinstance(value, int) and value >= 0 else 0
++
++    def _next_record(
++        self,
++        user_id: str,
++        record: dict[str, Any],
++        current: dict[str, Any] | None,
++    ) -> dict[str, Any]:
++        stored = dict(record)
++        current_pending = (current or {}).get("pending_checkout")
++        requested_pending = stored.get("pending_checkout")
++        if current_pending and not requested_pending:
++            stored["pending_checkout"] = current_pending
++        elif current_pending and requested_pending:
++            if requested_pending.get("operation_id") != current_pending.get("operation_id"):
++                raise ValueError("A pending checkout operation cannot be replaced.")
++        stored["user_id"] = user_id
++        stored["revision"] = self._revision(current) + 1
++        return stored
++
++    def _write(
++        self,
++        user_id: str,
++        stored: dict[str, Any],
++        current: dict[str, Any] | None,
++    ) -> bool:
++        current_customer_id = (current or {}).get("stripe_customer_id")
++        customer_id = stored.get("stripe_customer_id")
++        if customer_id and not isinstance(customer_id, str):
++            raise ValueError("Stripe customer id must be a string.")
++        if customer_id:
++            owner = self.find_user_by_customer(customer_id)
++            if owner and owner != user_id:
++                raise ValueError("Stripe customer is already owned by another account.")
++
++        transaction = [self._subscription_put(user_id, stored, self._revision(current))]
++        if customer_id:
++            transaction.append(self._customer_index_put(user_id, customer_id))
++        if (
++            isinstance(current_customer_id, str)
++            and current_customer_id
++            and current_customer_id != customer_id
++        ):
++            transaction.append(self._customer_index_delete(user_id, current_customer_id))
++        try:
++            self._store.transact_write(transaction)
++        except ClientError as exc:
++            if _is_transaction_failure(exc):
++                return False
++            raise
++        return True
++
++    def _subscription_put(
++        self, user_id: str, document: dict[str, Any], expected_revision: int
++    ) -> dict[str, Any]:
++        item = {
++            "pk": user_pk(user_id),
++            "sk": SK_SUBSCRIPTION,
++            DOCUMENT_ATTRIBUTE: json.dumps(document, ensure_ascii=False, separators=(",", ":")),
++            "revision": document["revision"],
++        }
++        condition = (
++            "attribute_not_exists(#revision)" if expected_revision == 0 else "#revision = :revision"
++        )
++        values = (
++            {}
++            if expected_revision == 0
++            else {":revision": _SERIALIZER.serialize(expected_revision)}
++        )
++        return {
++            "Put": {
++                "TableName": self._store.table_name,
++                "Item": {key: _SERIALIZER.serialize(value) for key, value in item.items()},
++                "ConditionExpression": condition,
++                "ExpressionAttributeNames": {"#revision": "revision"},
++                **({"ExpressionAttributeValues": values} if values else {}),
++            }
++        }
++
++    def _customer_index_put(self, user_id: str, customer_id: str) -> dict[str, Any]:
++        document = {"user_id": user_id, "stripe_customer_id": customer_id}
++        item = {
++            "pk": stripe_customer_pk(customer_id),
++            "sk": SK_SUBSCRIPTION,
++            DOCUMENT_ATTRIBUTE: json.dumps(document, ensure_ascii=False, separators=(",", ":")),
++            "owner_user_id": user_id,
++        }
++        return {
++            "Put": {
++                "TableName": self._store.table_name,
++                "Item": {key: _SERIALIZER.serialize(value) for key, value in item.items()},
++                "ConditionExpression": "attribute_not_exists(pk) OR #owner = :owner",
++                "ExpressionAttributeNames": {"#owner": "owner_user_id"},
++                "ExpressionAttributeValues": {":owner": _SERIALIZER.serialize(user_id)},
++            }
++        }
++
++    def _customer_index_delete(self, user_id: str, customer_id: str) -> dict[str, Any]:
++        return {
++            "Delete": {
++                "TableName": self._store.table_name,
++                "Key": {
++                    "pk": _SERIALIZER.serialize(stripe_customer_pk(customer_id)),
++                    "sk": _SERIALIZER.serialize(SK_SUBSCRIPTION),
++                },
++                "ConditionExpression": "#owner = :owner",
++                "ExpressionAttributeNames": {"#owner": "owner_user_id"},
++                "ExpressionAttributeValues": {":owner": _SERIALIZER.serialize(user_id)},
++            }
++        }
+diff --git a/backend/test_billing.py b/backend/test_billing.py
+index 5e9566c..78ec876 100644
+--- a/backend/test_billing.py
++++ b/backend/test_billing.py
+@@ -1,11 +1,15 @@
+ import tempfile
++import threading
+ import unittest
++from concurrent.futures import ThreadPoolExecutor
+ from datetime import UTC, datetime, timedelta, timezone
+ from pathlib import Path
+-from unittest.mock import patch
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
+ 
+-from accounts import BillingError, SubscriptionEvent
++from accounts import BillingError, SubscriptionEvent, User
+ from accounts.billing import MockBillingProvider
++from accounts.ports import CheckoutDiscovery, CheckoutSession, HistoricalCheckout
+ from accounts.services import billing_flow
+ from accounts.storage import JsonEmailAuthService, JsonSubscriptionRepository
+ from accounts.testing import build_test_accounts
+@@ -419,11 +423,8 @@ class StripeProviderCustomerIdTests(unittest.TestCase):
+     that still carry mock customer ids."""
+ 
+     def _provider(self):
+-        try:
+-            import stripe  # noqa: F401
+-            from accounts.billing import StripeBillingProvider
+-        except ImportError:
+-            self.skipTest("stripe package not installed")
++        from accounts.billing import StripeBillingProvider
++
+         return StripeBillingProvider(
+             secret_key="sk_test_dummy",
+             webhook_secret="whsec_dummy",
+@@ -437,22 +438,326 @@ class StripeProviderCustomerIdTests(unittest.TestCase):
+         self.assertEqual(ctx.exception.status_code, 404)
+ 
+     def test_checkout_ignores_mock_customer_id(self):
+-        # The mock id must not be forwarded to Stripe; with a dummy key the
+-        # call still fails, but as an upstream 502 (email fallback path),
+-        # never as "No such customer".
++        create_session = Mock(return_value=SimpleNamespace(url="https://checkout.example/session"))
++        stripe = SimpleNamespace(
++            checkout=SimpleNamespace(Session=SimpleNamespace(create=create_session))
++        )
+         provider = self._provider()
+         from accounts import User
+ 
+-        with self.assertRaises(BillingError) as ctx:
+-            provider.create_checkout_session(
++        with patch("accounts.billing.stripe_billing._import_stripe", return_value=stripe):
++            session = provider.create_checkout_session(
+                 User(id="u1", email="u1@example.com", display_name="U"),
+                 "pro",
+                 success_url="http://s",
+                 cancel_url="http://c",
+                 stripe_customer_id="mock_customer_u1",
++                idempotency_key="checkout-key",
++                operation_id="019c0000-0000-7000-8000-000000000001",
++            )
++
++        self.assertEqual(session.url, "https://checkout.example/session")
++        self.assertEqual(stripe.api_key, "sk_test_dummy")
++        create_session.assert_called_once_with(
++            mode="subscription",
++            line_items=[{"price": "price_pro", "quantity": 1}],
++            success_url="http://s",
++            cancel_url="http://c",
++            client_reference_id="u1",
++            customer_email="u1@example.com",
++            subscription_data={
++                "metadata": {
++                    "user_id": "u1",
++                    "plan": "pro",
++                    "checkout_operation_id": "019c0000-0000-7000-8000-000000000001",
++                }
++            },
++            metadata={
++                "user_id": "u1",
++                "plan": "pro",
++                "checkout_operation_id": "019c0000-0000-7000-8000-000000000001",
++            },
++            idempotency_key="checkout-key",
++        )
++
++
++class _PendingCheckoutProvider:
++    """Deterministic provider double for checkout-ownership regressions."""
++
++    def __init__(self, *, discovery: CheckoutDiscovery | None = None) -> None:
++        self._discovery = discovery or CheckoutDiscovery(sessions=(), complete=True)
++        self._lock = threading.Lock()
++        self.calls: list[dict[str, object]] = []
++        self._sessions_by_key: dict[str, CheckoutSession] = {}
++        self.fail_next_create = False
++        self.on_create = None
++
++    def checkout_price_id(self, plan_id: str) -> str:
++        return f"price_{plan_id}"
++
++    def discover_checkout_sessions(
++        self, user: User, *, stripe_customer_id: str | None
++    ) -> CheckoutDiscovery:
++        return self._discovery
++
++    def create_checkout_session(
++        self,
++        user: User,
++        plan_id: str,
++        *,
++        success_url: str,
++        cancel_url: str,
++        stripe_customer_id: str | None = None,
++        idempotency_key: str,
++        operation_id: str,
++    ) -> CheckoutSession:
++        with self._lock:
++            self.calls.append(
++                {
++                    "user_id": user.id,
++                    "plan_id": plan_id,
++                    "success_url": success_url,
++                    "cancel_url": cancel_url,
++                    "stripe_customer_id": stripe_customer_id,
++                    "idempotency_key": idempotency_key,
++                    "operation_id": operation_id,
++                }
++            )
++            if self.fail_next_create:
++                self.fail_next_create = False
++                raise BillingError("provider timeout", status_code=502)
++            session = self._sessions_by_key.setdefault(
++                idempotency_key,
++                CheckoutSession(
++                    url=f"https://checkout.example/{operation_id}",
++                    stripe_checkout_session_id=f"cs_{operation_id}",
++                ),
++            )
++            if self.on_create:
++                self.on_create()
++            return session
++
++    def create_portal_session(self, stripe_customer_id: str, *, return_url: str) -> str:
++        return return_url
++
++    def parse_webhook_event(self, payload: bytes, signature: str | None) -> SubscriptionEvent:
++        raise AssertionError("not used by checkout tests")
++
++
++class PendingCheckoutOwnershipTests(unittest.TestCase):
++    def setUp(self):
++        self._tmpdir = tempfile.TemporaryDirectory()
++        self.path = Path(self._tmpdir.name) / "subscriptions.json"
++        self.user = User(id="user-1", email="reader@example.test", display_name="Reader")
++
++    def tearDown(self):
++        self._tmpdir.cleanup()
++
++    def _start(self, repository, provider, plan_id="pro"):
++        return billing_flow.start_checkout(
++            repository,
++            provider,
++            PLAN_CATALOG,
++            self.user,
++            plan_id,
++            success_url="https://app.example/billing/done?state=success",
++            cancel_url="https://app.example/billing/done?state=cancel",
++        )
++
++    def test_reuses_a_durable_pending_operation_and_its_provider_parameters(self):
++        repository = JsonSubscriptionRepository(self.path)
++        provider = _PendingCheckoutProvider()
++
++        first = self._start(repository, provider)
++        second = self._start(repository, provider)
++
++        self.assertEqual(first, second)
++        self.assertEqual(len(provider.calls), 1)
++        pending = repository.get(self.user.id)["pending_checkout"]
++        self.assertEqual(pending["state"], "created")
++        self.assertEqual(pending["requested_plan"], "pro")
++        self.assertEqual(pending["price_id"], "price_pro")
++        self.assertEqual(pending["stripe_checkout_session_id"], first.stripe_checkout_session_id)
++        self.assertEqual(pending["idempotency_key"], provider.calls[0]["idempotency_key"])
++
++    def test_conflicting_plan_cannot_replace_an_unresolved_operation(self):
++        repository = JsonSubscriptionRepository(self.path)
++        provider = _PendingCheckoutProvider()
++        self._start(repository, provider)
++
++        with self.assertRaises(BillingError) as context:
++            self._start(repository, provider, "max")
++
++        self.assertEqual(context.exception.status_code, 409)
++        self.assertEqual(len(provider.calls), 1)
++        self.assertEqual(repository.get(self.user.id)["pending_checkout"]["requested_plan"], "pro")
++
++    def test_retry_after_provider_timeout_keeps_the_creation_marker_and_idempotency_key(self):
++        repository = JsonSubscriptionRepository(self.path)
++        provider = _PendingCheckoutProvider()
++        provider.fail_next_create = True
++
++        with self.assertRaises(BillingError):
++            self._start(repository, provider)
++
++        attempted = repository.get(self.user.id)["pending_checkout"]
++        self.assertEqual(attempted["state"], "attempted")
++        recovered = self._start(repository, provider)
++
++        self.assertEqual(len(provider.calls), 2)
++        self.assertEqual(provider.calls[0]["idempotency_key"], provider.calls[1]["idempotency_key"])
++        self.assertEqual(
++            recovered.stripe_checkout_session_id,
++            attempted.get("stripe_checkout_session_id") or recovered.stripe_checkout_session_id,
++        )
++
++    def test_concurrent_adapters_share_one_operation_and_provider_idempotency_key(self):
++        provider = _PendingCheckoutProvider()
++        first_repository = JsonSubscriptionRepository(self.path)
++        second_repository = JsonSubscriptionRepository(self.path)
++
++        with ThreadPoolExecutor(max_workers=2) as executor:
++            sessions = list(
++                executor.map(
++                    lambda repository: self._start(repository, provider),
++                    (first_repository, second_repository),
++                )
++            )
++
++        self.assertEqual(sessions[0], sessions[1])
++        self.assertEqual(
++            {call["idempotency_key"] for call in provider.calls},
++            {first_repository.get(self.user.id)["pending_checkout"]["idempotency_key"]},
++        )
++
++    def test_compatible_historical_open_checkout_is_adopted_without_creation(self):
++        historical = HistoricalCheckout(
++            stripe_checkout_session_id="cs_historical",
++            url="https://checkout.example/historical",
++            state="open",
++            user_id="user-1",
++            requested_plan="pro",
++            price_id="price_pro",
++            success_url="https://app.example/billing/done?state=success",
++            cancel_url="https://app.example/billing/done?state=cancel",
++        )
++        provider = _PendingCheckoutProvider(
++            discovery=CheckoutDiscovery(sessions=(historical,), complete=True)
++        )
++
++        session = self._start(JsonSubscriptionRepository(self.path), provider)
++
++        self.assertEqual(session.stripe_checkout_session_id, "cs_historical")
++        self.assertEqual(provider.calls, [])
++
++    def test_partial_or_email_only_history_fails_closed_before_creation(self):
++        historical = HistoricalCheckout(
++            stripe_checkout_session_id="cs_email_only",
++            url="https://checkout.example/email-only",
++            state="open",
++            email=self.user.email,
++            requested_plan="pro",
++            price_id="price_pro",
++            success_url="https://app.example/billing/done?state=success",
++            cancel_url="https://app.example/billing/done?state=cancel",
++        )
++        provider = _PendingCheckoutProvider(
++            discovery=CheckoutDiscovery(sessions=(historical,), complete=False)
++        )
++
++        with self.assertRaises(BillingError) as context:
++            self._start(JsonSubscriptionRepository(self.path), provider)
++
++        self.assertEqual(context.exception.status_code, 409)
++        self.assertEqual(provider.calls, [])
++
++    def test_email_only_or_multiple_open_history_fails_closed_before_creation(self):
++        email_only = HistoricalCheckout(
++            stripe_checkout_session_id="cs_email_only",
++            url="https://checkout.example/email-only",
++            state="open",
++            email=self.user.email,
++        )
++        provider = _PendingCheckoutProvider(
++            discovery=CheckoutDiscovery(sessions=(email_only,), complete=True)
++        )
++        with self.assertRaises(BillingError) as context:
++            self._start(JsonSubscriptionRepository(self.path), provider)
++        self.assertEqual(context.exception.status_code, 409)
++        self.assertEqual(provider.calls, [])
++
++        self.path.unlink(missing_ok=True)
++        first_open = HistoricalCheckout(
++            stripe_checkout_session_id="cs_first",
++            url="https://checkout.example/first",
++            state="open",
++            user_id=self.user.id,
++        )
++        second_open = HistoricalCheckout(
++            stripe_checkout_session_id="cs_second",
++            url="https://checkout.example/second",
++            state="open",
++            user_id=self.user.id,
++        )
++        provider = _PendingCheckoutProvider(
++            discovery=CheckoutDiscovery(sessions=(first_open, second_open), complete=True)
++        )
++        with self.assertRaises(BillingError) as context:
++            self._start(JsonSubscriptionRepository(self.path), provider)
++        self.assertEqual(context.exception.status_code, 409)
++        self.assertEqual(provider.calls, [])
++
++    def test_expired_ambiguous_attempt_never_creates_again_when_history_is_empty(self):
++        repository = JsonSubscriptionRepository(self.path)
++        provider = _PendingCheckoutProvider()
++        provider.fail_next_create = True
++        with self.assertRaises(BillingError):
++            self._start(repository, provider)
++        record = repository.get(self.user.id)
++        record["pending_checkout"]["creation_attempted_at"] = 0
++        repository.upsert(self.user.id, record)
++
++        with self.assertRaises(BillingError) as context:
++            self._start(repository, provider)
++
++        self.assertEqual(context.exception.status_code, 409)
++        self.assertEqual(len(provider.calls), 1)
++
++    def test_webhook_interleaving_keeps_its_entitlement_when_checkout_completion_persists(self):
++        repository = JsonSubscriptionRepository(self.path)
++        provider = _PendingCheckoutProvider()
++
++        def apply_webhook_snapshot():
++            repository.upsert(
++                self.user.id,
++                {
++                    "plan": "max",
++                    "status": "active",
++                    "stripe_customer_id": "cus_webhook",
++                    "stripe_subscription_id": "sub_webhook",
++                    "current_period_end": 1_900_000_000,
++                },
+             )
+-        self.assertEqual(ctx.exception.status_code, 502)
+-        self.assertNotIn("No such customer", str(ctx.exception))
++
++        provider.on_create = apply_webhook_snapshot
++        self._start(repository, provider)
++
++        record = repository.get(self.user.id)
++        self.assertEqual(record["plan"], "max")
++        self.assertEqual(record["stripe_subscription_id"], "sub_webhook")
++        self.assertIn("pending_checkout", record)
++
++    def test_customer_ownership_cannot_be_stolen_or_left_in_an_old_index(self):
++        first_repository = JsonSubscriptionRepository(self.path)
++        second_repository = JsonSubscriptionRepository(self.path)
++        first_repository.upsert("user-1", {"stripe_customer_id": "cus_first"})
++
++        with self.assertRaises(ValueError):
++            second_repository.upsert("user-2", {"stripe_customer_id": "cus_first"})
++
++        first_repository.upsert("user-1", {"stripe_customer_id": "cus_second"})
++        self.assertIsNone(second_repository.find_user_by_customer("cus_first"))
++        self.assertEqual(second_repository.find_user_by_customer("cus_second"), "user-1")
+ 
+ 
+ class CancelScheduleTests(unittest.TestCase):

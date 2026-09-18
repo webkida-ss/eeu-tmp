@@ -1,0 +1,737 @@
+diff --git a/.github/workflows/agent-intake.yml b/.github/workflows/agent-intake.yml
+index 4903172..9481da1 100644
+--- a/.github/workflows/agent-intake.yml
++++ b/.github/workflows/agent-intake.yml
+@@ -42,20 +42,29 @@ jobs:
+         env:
+           GITHUB_TOKEN: ${{ github.token }}
+           TRUSTED_AGENT_ACTOR_IDS: ${{ vars.TRUSTED_AGENT_ACTOR_IDS }}
++          POLICY_ACTOR_ID: ${{ github.actor_id }}
++          POLICY_REPOSITORY: ${{ github.repository }}
++          POLICY_GIT_REF: ${{ github.ref }}
++          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
++          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
++          POLICY_RUN_ID: ${{ github.run_id }}
++          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
++          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
++          ISSUE_NUMBER: ${{ inputs.issue_number }}
+         run: |
+           python scripts/online_agent_policy.py intake \
+             --output _agent-intake/raw.json \
+             --trusted-actor-ids "${TRUSTED_AGENT_ACTOR_IDS}" \
+-            --actor-id "${{ github.actor_id }}" \
+-            --repository "${{ github.repository }}" \
+-            --issue-number "${{ inputs.issue_number }}" \
+-            --git-ref "${{ github.ref }}" \
+-            --workflow-ref "${{ github.workflow_ref }}" \
++            --actor-id "${POLICY_ACTOR_ID}" \
++            --repository "${POLICY_REPOSITORY}" \
++            --issue-number "${ISSUE_NUMBER}" \
++            --git-ref "${POLICY_GIT_REF}" \
++            --workflow-ref "${POLICY_WORKFLOW_REF}" \
+             --workflow-path ".github/workflows/agent-intake.yml" \
+-            --checked-out-sha "${{ steps.checkout.outputs.sha }}" \
+-            --run-id "${{ github.run_id }}" \
+-            --run-attempt "${{ github.run_attempt }}" \
+-            --ref-protected "${{ github.ref_protected }}"
++            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
++            --run-id "${POLICY_RUN_ID}" \
++            --run-attempt "${POLICY_RUN_ATTEMPT}" \
++            --ref-protected "${POLICY_REF_PROTECTED}"
+ 
+       - name: Sanitize selected untrusted issue fields
+         run: |
+diff --git a/backend/auth/dynamodb_email_auth.py b/backend/auth/dynamodb_email_auth.py
+index 8972ce0..603de26 100644
+--- a/backend/auth/dynamodb_email_auth.py
++++ b/backend/auth/dynamodb_email_auth.py
+@@ -9,6 +9,7 @@ composition root.
+ from __future__ import annotations
+ 
+ import secrets
++from collections.abc import Callable
+ from datetime import UTC, datetime, timedelta
+ from typing import Any
+ 
+@@ -23,9 +24,15 @@ def _normalize_email(email: str) -> str:
+ 
+ 
+ class DynamoEmailAuthService:
+-    def __init__(self, store: DynamoDbStore, session_ttl_days: int = 30) -> None:
++    def __init__(
++        self,
++        store: DynamoDbStore,
++        session_ttl_days: int = 30,
++        clock: Callable[[], datetime] | None = None,
++    ) -> None:
+         self._store = store
+         self._session_ttl = timedelta(days=session_ttl_days)
++        self._clock = clock or (lambda: datetime.now(UTC))
+ 
+     def login(self, *, email: str, display_name: str | None = None) -> tuple[str, User]:
+         normalized_email = _normalize_email(email)
+@@ -39,7 +46,7 @@ class DynamoEmailAuthService:
+                 "email": normalized_email,
+                 "display_name": (display_name or normalized_email.split("@")[0]).strip()
+                 or normalized_email,
+-                "created_at": datetime.now(UTC).isoformat(),
++                "created_at": self._clock().isoformat(),
+             }
+             self._store.put_document(
+                 email_pk(normalized_email), SK_USER, {"user_id": user_record["id"]}
+@@ -75,7 +82,7 @@ class DynamoEmailAuthService:
+                 return None
+             if expires_at.tzinfo is None:
+                 expires_at = expires_at.replace(tzinfo=UTC)
+-            if expires_at < datetime.now(UTC):
++            if expires_at <= self._clock():
+                 self._store.delete(session_pk(token), SK_SESSION)
+                 return None
+ 
+@@ -117,7 +124,7 @@ class DynamoEmailAuthService:
+ 
+     def _create_session(self, user_id: str) -> str:
+         token = secrets.token_urlsafe(32)
+-        now = datetime.now(UTC)
++        now = self._clock()
+         self._store.put_document(
+             session_pk(token),
+             SK_SESSION,
+diff --git a/backend/conftest.py b/backend/conftest.py
+index a702b18..632dd10 100644
+--- a/backend/conftest.py
++++ b/backend/conftest.py
+@@ -1,15 +1,23 @@
+ from __future__ import annotations
+ 
+ import os
++import sys
+ import time
+ import uuid
+ from collections.abc import Iterator
++from pathlib import Path
+ 
+ import boto3
+ import pytest
+ from botocore.config import Config
+ from storage.dynamodb_store import DynamoDbStore
+ 
++PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
++if PROJECT_ROOT not in sys.path:
++    # `test:backend:unit` runs pytest from backend/, while policy tests import
++    # root-level scripts as a namespace package.
++    sys.path.insert(0, PROJECT_ROOT)
++
+ 
+ @pytest.fixture(scope="module")
+ def dynamodb_store() -> Iterator[DynamoDbStore]:
+diff --git a/backend/deps.py b/backend/deps.py
+index 806b725..8790243 100644
+--- a/backend/deps.py
++++ b/backend/deps.py
+@@ -1,5 +1,8 @@
+ from __future__ import annotations
+ 
++from collections.abc import Callable
++from datetime import datetime
++
+ from accounts import (
+     AccountsContainer,
+     AuthService,
+@@ -68,11 +71,19 @@ def _get_dynamodb_store() -> DynamoDbStore:
+     return _dynamodb_store
+ 
+ 
+-def _create_auth_service() -> AuthService | None:
++def _create_auth_service(
++    *,
++    store: DynamoDbStore | None = None,
++    clock: Callable[[], datetime] | None = None,
++) -> AuthService | None:
+     # None means "let accounts use its bundled JSON store", so the shared
+     # package keeps owning its own local-development default.
+     if STORAGE_BACKEND == "dynamodb":
+-        return DynamoEmailAuthService(_get_dynamodb_store())
++        return DynamoEmailAuthService(
++            store if store is not None else _get_dynamodb_store(),
++            session_ttl_days=ACCOUNTS_SETTINGS.session_ttl_days,
++            clock=clock,
++        )
+     return None
+ 
+ 
+diff --git a/backend/lambda_handler.py b/backend/lambda_handler.py
+index 798b987..90198a0 100644
+--- a/backend/lambda_handler.py
++++ b/backend/lambda_handler.py
+@@ -3,31 +3,14 @@
+ Deployed behind an API Gateway HTTP API (payload format 2.0), which Mangum
+ handles natively. Built into the deployment zip by scripts/build_lambda.sh.
+ 
+-Before importing the app, this module replaces the DynamoDB resource
+-factory: config.py passes an explicit access key / secret key pair to boto3
+-(a convenience for local development), but Lambda issues temporary role
+-credentials that also require a session token, so boto3's default
+-credential chain must be used instead. deps.py builds its repositories at
+-import time, so the override must happen before ``main`` is imported.
++The DynamoDB store factory applies the SDK default credential chain outside
++DynamoDB Local, so this entrypoint imports the application without rewriting
++storage factories.
+ """
+ 
+ from __future__ import annotations
+ 
+-import os
+-
+-import boto3
+-import storage.dynamodb_store as dynamodb_store
+-
+-
+-def _lambda_dynamodb_resource():
+-    # Default credential chain picks up the execution role's temporary
+-    # credentials, including AWS_SESSION_TOKEN.
+-    return boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
+-
+-
+-dynamodb_store.create_dynamodb_resource = _lambda_dynamodb_resource
+-
+-from main import app  # noqa: E402  (must come after the override above)
+-from mangum import Mangum  # noqa: E402
++from main import app
++from mangum import Mangum
+ 
+ handler = Mangum(app)
+diff --git a/backend/storage/dynamodb_store.py b/backend/storage/dynamodb_store.py
+index fcc6b78..3d76f67 100644
+--- a/backend/storage/dynamodb_store.py
++++ b/backend/storage/dynamodb_store.py
+@@ -8,9 +8,7 @@ from boto3.dynamodb.types import TypeSerializer
+ from boto3.resources.base import ServiceResource
+ from botocore.exceptions import ClientError
+ from config import (
+-    AWS_ACCESS_KEY_ID,
+     AWS_REGION,
+-    AWS_SECRET_ACCESS_KEY,
+     DYNAMODB_ENDPOINT,
+     READING_ASSISTANT_DYNAMODB_TABLE_NAME,
+ )
+@@ -28,9 +26,6 @@ def _dynamodb_client_kwargs() -> dict[str, Any]:
+         # DynamoDB Local accepts any credentials; ignore real AWS profiles here.
+         kwargs["aws_access_key_id"] = "dummy"
+         kwargs["aws_secret_access_key"] = "dummy"
+-    else:
+-        kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+-        kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+     return kwargs
+ 
+ 
+diff --git a/backend/test_billing.py b/backend/test_billing.py
+index 5e9566c..53a479b 100644
+--- a/backend/test_billing.py
++++ b/backend/test_billing.py
+@@ -2,7 +2,8 @@ import tempfile
+ import unittest
+ from datetime import UTC, datetime, timedelta, timezone
+ from pathlib import Path
+-from unittest.mock import patch
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
+ 
+ from accounts import BillingError, SubscriptionEvent
+ from accounts.billing import MockBillingProvider
+@@ -419,11 +420,8 @@ class StripeProviderCustomerIdTests(unittest.TestCase):
+     that still carry mock customer ids."""
+ 
+     def _provider(self):
+-        try:
+-            import stripe  # noqa: F401
+-            from accounts.billing import StripeBillingProvider
+-        except ImportError:
+-            self.skipTest("stripe package not installed")
++        from accounts.billing import StripeBillingProvider
++
+         return StripeBillingProvider(
+             secret_key="sk_test_dummy",
+             webhook_secret="whsec_dummy",
+@@ -437,22 +435,34 @@ class StripeProviderCustomerIdTests(unittest.TestCase):
+         self.assertEqual(ctx.exception.status_code, 404)
+ 
+     def test_checkout_ignores_mock_customer_id(self):
+-        # The mock id must not be forwarded to Stripe; with a dummy key the
+-        # call still fails, but as an upstream 502 (email fallback path),
+-        # never as "No such customer".
++        create_session = Mock(return_value=SimpleNamespace(url="https://checkout.example/session"))
++        stripe = SimpleNamespace(
++            checkout=SimpleNamespace(Session=SimpleNamespace(create=create_session))
++        )
+         provider = self._provider()
+         from accounts import User
+ 
+-        with self.assertRaises(BillingError) as ctx:
+-            provider.create_checkout_session(
++        with patch("accounts.billing.stripe_billing._import_stripe", return_value=stripe):
++            session = provider.create_checkout_session(
+                 User(id="u1", email="u1@example.com", display_name="U"),
+                 "pro",
+                 success_url="http://s",
+                 cancel_url="http://c",
+                 stripe_customer_id="mock_customer_u1",
+             )
+-        self.assertEqual(ctx.exception.status_code, 502)
+-        self.assertNotIn("No such customer", str(ctx.exception))
++
++        self.assertEqual(session.url, "https://checkout.example/session")
++        self.assertEqual(stripe.api_key, "sk_test_dummy")
++        create_session.assert_called_once_with(
++            mode="subscription",
++            line_items=[{"price": "price_pro", "quantity": 1}],
++            success_url="http://s",
++            cancel_url="http://c",
++            client_reference_id="u1",
++            customer_email="u1@example.com",
++            subscription_data={"metadata": {"user_id": "u1", "plan": "pro"}},
++            metadata={"user_id": "u1", "plan": "pro"},
++        )
+ 
+ 
+ class CancelScheduleTests(unittest.TestCase):
+diff --git a/backend/test_bootstrap_security.py b/backend/test_bootstrap_security.py
+index 167ae86..10e8169 100644
+--- a/backend/test_bootstrap_security.py
++++ b/backend/test_bootstrap_security.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import os
+ import subprocess
++import tempfile
+ from pathlib import Path
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+@@ -41,5 +42,65 @@ def test_bootstrap_rejects_tools_directory_outside_repository(tmp_path):
+     assert "must remain inside the repository" in result.stderr
+ 
+ 
++def test_bootstrap_env_activates_configured_data_directory_shims_with_clean_path():
++    with tempfile.TemporaryDirectory(dir=ROOT, prefix=".bootstrap-tools-") as tools_root:
++        data_directory = Path(tools_root) / "mise" / "data"
++        bin_directory = Path(tools_root) / "mise" / "bin"
++        shims_directory = data_directory / "shims"
++        shims_directory.mkdir(parents=True)
++        expected_versions = {
++            "python": "Python 3.12.7",
++            "node": "v22.23.1",
++            "terraform": "Terraform v1.15.5",
++            "task": "Task version: v3.40.0",
++        }
++        for tool, version in expected_versions.items():
++            shim = shims_directory / tool
++            shim.write_text(
++                f"#!/usr/bin/env bash\nprintf '%s\n' '{version}'\n",
++                encoding="utf-8",
++            )
++            shim.chmod(0o755)
++
++        environment = {
++            "BOOTSTRAP_TOOLS_DIR": tools_root,
++            "PATH": "/usr/bin:/bin",
++        }
++        result = subprocess.run(
++            [str(BOOTSTRAP), "--env"],
++            cwd=ROOT,
++            env=environment,
++            check=False,
++            text=True,
++            capture_output=True,
++        )
++
++        assert result.returncode == 0, result.stderr
++        assert f"export MISE_DATA_DIR={data_directory}" in result.stdout
++        assert f"export PATH={bin_directory}:{shims_directory}:$PATH" in result.stdout
++
++        activated = subprocess.run(
++            [
++                "/bin/bash",
++                "-ceu",
++                'eval "$1"\nfor tool in python node terraform task; do command -v "$tool"; done\n'
++                "python --version\nnode --version\nterraform version\ntask --version",
++                "bootstrap-env",
++                result.stdout,
++            ],
++            cwd=ROOT,
++            env=environment,
++            check=False,
++            text=True,
++            capture_output=True,
++        )
++
++        assert activated.returncode == 0, activated.stderr
++        assert activated.stdout.splitlines() == [
++            *(str(shims_directory / tool) for tool in expected_versions),
++            *expected_versions.values(),
++        ]
++
++
+ def test_bootstrap_verifies_current_pinned_toolchain():
+     subprocess.run([str(BOOTSTRAP), "--verify"], cwd=ROOT, check=True)
+diff --git a/backend/test_github_automation.py b/backend/test_github_automation.py
+index 6ba74d1..098feac 100644
+--- a/backend/test_github_automation.py
++++ b/backend/test_github_automation.py
+@@ -13,6 +13,8 @@ CI = WORKFLOW_DIR / "reading-assistant-ci.yml"
+ NIGHTLY = WORKFLOW_DIR / "nightly-automation.yml"
+ OPTIONAL = WORKFLOW_DIR / "optional-pr-browser-smoke.yml"
+ CODEQL = WORKFLOW_DIR / "codeql.yml"
++INTAKE = WORKFLOW_DIR / "agent-intake.yml"
++DEPLOY = WORKFLOW_DIR / "deploy-reading-assistant.yml"
+ DYNAMODB_DIGEST = (
+     "amazon/dynamodb-local@sha256:d89f8fcc6b1a39cb35976c248ed42a28c66ae00dc043099210f5571e42648ab4"
+ )
+@@ -120,6 +122,34 @@ def test_every_checkout_disables_persisted_credentials() -> None:
+             assert "persist-credentials: false" in block, workflow.name
+ 
+ 
++def test_dispatch_inputs_enter_actor_gates_through_quoted_environment_variables() -> None:
++    intake = workflow_text(INTAKE)
++    deploy = workflow_text(DEPLOY)
++
++    assert "ISSUE_NUMBER: ${{ inputs.issue_number }}" in intake
++    assert '--issue-number "${ISSUE_NUMBER}"' in intake
++
++    for input_name, environment_name, option_name in (
++        ("environment", "DEPLOY_ENVIRONMENT", "environment"),
++        ("operation", "DEPLOY_OPERATION", "operation"),
++        (
++            "production_confirmation",
++            "PRODUCTION_CONFIRMATION",
++            "production-confirmation",
++        ),
++    ):
++        assert f"{environment_name}: ${{{{ inputs.{input_name} }}}}" in deploy
++        assert f'--{option_name} "${{{environment_name}}}"' in deploy
++
++    for workflow in (intake, deploy):
++        gate_scripts = re.findall(
++            r"(?ms)^      - name: Gate .*?^        run: \|\n(.*?)(?=^      - |\Z)",
++            workflow,
++        )
++        assert gate_scripts
++        assert all("${{" not in script for script in gate_scripts)
++
++
+ def test_required_ci_uses_tasks_and_retains_lambda_artifact() -> None:
+     text = workflow_text(CI)
+     for task in (
+diff --git a/backend/test_handler_independence.py b/backend/test_handler_independence.py
+index 792445a..1931c7a 100644
+--- a/backend/test_handler_independence.py
++++ b/backend/test_handler_independence.py
+@@ -2,11 +2,15 @@
+ work without FastAPI, so the handler layer (FastAPI today, e.g. an AWS
+ Lambda handler tomorrow) can be swapped without touching them."""
+ 
++import importlib
+ import subprocess
+ import sys
+ import tempfile
+ import unittest
++from collections.abc import Iterator
++from contextlib import contextmanager
+ from pathlib import Path
++from types import ModuleType
+ 
+ from accounts.storage import JsonEmailAuthService
+ from accounts.testing import build_test_accounts
+@@ -15,9 +19,57 @@ from deps import get_accounts, get_page_preload_repository
+ from fastapi.testclient import TestClient
+ from main import app
+ from repositories.page_preload_repository import JsonPagePreloadRepository
++from storage import dynamodb_store
++
++_dynamodb_resource_factory = dynamodb_store.create_dynamodb_resource
++_dynamodb_client_factory = dynamodb_store.create_dynamodb_client
++
++
++class FakeMangum:
++    """Test adapter that records the application composed by the entrypoint."""
++
++    def __init__(self, application: object) -> None:
++        self.application = application
++
++
++_MISSING_MODULE = object()
++
++
++@contextmanager
++def import_lambda_handler_with_fake_mangum() -> Iterator[ModuleType]:
++    """Import the real entrypoint with a scoped adapter dependency.
++
++    The service-free unit suite intentionally does not install the Lambda
++    runtime dependencies. `test_lambda_package.py` separately validates the
++    real package and its Mangum dependency.
++    """
++
++    previous_mangum = sys.modules.get("mangum", _MISSING_MODULE)
++    previous_lambda_handler = sys.modules.get("lambda_handler", _MISSING_MODULE)
++    fake_mangum = ModuleType("mangum")
++    fake_mangum.Mangum = FakeMangum
++    sys.modules["mangum"] = fake_mangum
++    sys.modules.pop("lambda_handler", None)
++
++    try:
++        yield importlib.import_module("lambda_handler")
++    finally:
++        sys.modules.pop("mangum", None)
++        sys.modules.pop("lambda_handler", None)
++        if previous_mangum is not _MISSING_MODULE:
++            sys.modules["mangum"] = previous_mangum
++        if previous_lambda_handler is not _MISSING_MODULE:
++            sys.modules["lambda_handler"] = previous_lambda_handler
+ 
+ 
+ class FrameworkIndependenceTests(unittest.TestCase):
++    def test_api_lambda_entrypoint_keeps_both_dynamodb_factories(self):
++        with import_lambda_handler_with_fake_mangum() as lambda_handler:
++            self.assertIs(dynamodb_store.create_dynamodb_resource, _dynamodb_resource_factory)
++            self.assertIs(dynamodb_store.create_dynamodb_client, _dynamodb_client_factory)
++            self.assertIsInstance(lambda_handler.handler, FakeMangum)
++            self.assertIs(lambda_handler.handler.application, app)
++
+     def test_core_and_services_import_without_fastapi(self):
+         # A fresh interpreter proves the import graph is clean; in-process
+         # checks would be polluted by other tests importing main.
+diff --git a/backend/test_online_agent_operations.py b/backend/test_online_agent_operations.py
+index 13d6540..1eaab17 100644
+--- a/backend/test_online_agent_operations.py
++++ b/backend/test_online_agent_operations.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import re
++import subprocess
+ from pathlib import Path
+ 
+ import yaml
+@@ -30,6 +32,101 @@ def workflow_text(path: Path) -> str:
+     return path.read_text(encoding="utf-8")
+ 
+ 
++def workflow_step(workflow: Path, step_name: str) -> dict:
++    parsed = yaml.safe_load(workflow_text(workflow))
++    for job in parsed["jobs"].values():
++        for step in job.get("steps", []):
++            if step.get("name") == step_name:
++                return {
++                    **step,
++                    "env": {
++                        **job.get("env", {}),
++                        **step.get("env", {}),
++                    },
++                }
++    raise AssertionError(f"Missing workflow step: {step_name}")
++
++
++def assert_rejected_actor_cannot_execute_dispatch_input(
++    workflow: Path,
++    step_name: str,
++    input_environment_name: str,
++    temp_path: Path,
++) -> None:
++    step = workflow_step(workflow, step_name)
++    environment = step["env"]
++    sentinel = temp_path / f"{workflow.stem}-{input_environment_name}-sentinel"
++    network_blocker = temp_path / f"network-blocker-{sentinel.name}-{step_name.split()[1]}"
++    network_blocker.mkdir()
++    (network_blocker / "sitecustomize.py").write_text(
++        """
++import socket
++
++_original_socket = socket.socket
++
++
++def deny_network(*args, **kwargs):
++    raise RuntimeError("network access disabled by regression harness")
++
++
++class NetworkDisabledSocket(_original_socket):
++    def connect(self, address):
++        deny_network(address)
++
++    def connect_ex(self, address):
++        deny_network(address)
++
++
++socket.socket = NetworkDisabledSocket
++socket.create_connection = deny_network
++socket.getaddrinfo = deny_network
++""".lstrip(),
++        encoding="utf-8",
++    )
++    hostile_input = (
++        f'$(touch "{sentinel}") "quoted"\n; touch "{sentinel}"; `touch "{sentinel}"` && :'
++    )
++    command_environment = {
++        **os.environ,
++        **environment,
++        "GITHUB_TOKEN": "synthetic-test-token",
++        "GITHUB_OUTPUT": str(temp_path / "github-output"),
++        "PLAN_PREFIX": "terraform-plans",
++        "PYTHONPATH": f"{network_blocker}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
++        "TRUSTED_AGENT_ACTOR_IDS": "456",
++        "TRUSTED_DEPLOY_ACTOR_IDS": "456",
++        "POLICY_ACTOR_ID": "999",
++        "POLICY_REPOSITORY": "owner/repository",
++        "POLICY_GIT_REF": "refs/heads/main",
++        "POLICY_WORKFLOW_REF": (
++            f"owner/repository/.github/workflows/{workflow.name}@refs/heads/main"
++        ),
++        "POLICY_CHECKED_OUT_SHA": "a" * 40,
++        "POLICY_RUN_ID": "100",
++        "POLICY_RUN_ATTEMPT": "1",
++        "POLICY_REF_PROTECTED": "true",
++        "DEPLOY_ENVIRONMENT": "dev",
++        "DEPLOY_OPERATION": "plan",
++        input_environment_name: hostile_input,
++    }
++
++    result = subprocess.run(
++        ["bash", "-euo", "pipefail", "-c", step["run"]],
++        cwd=ROOT,
++        env=command_environment,
++        capture_output=True,
++        text=True,
++        check=False,
++        timeout=10,
++    )
++
++    assert result.returncode != 0
++    assert not sentinel.exists()
++    failure = f"{result.stdout}\n{result.stderr}".lower()
++    assert "request actor id is not trusted" in failure, failure
++    assert "network access disabled by regression harness" not in failure
++
++
+ def test_shared_roles_have_least_authority_and_separation_contracts() -> None:
+     source_dir = ROOT / ".rulesync" / "subagents"
+     assert {path.stem for path in source_dir.glob("*.md")} == ROLE_NAMES
+@@ -135,6 +232,30 @@ def test_manual_intake_workflow_is_read_only_pinned_and_never_checks_out_issue_r
+         assert comment and re.search(r"\bv\d", comment)
+ 
+ 
++def test_rejected_actor_keeps_all_dispatch_inputs_literal(tmp_path: Path) -> None:
++    assert_rejected_actor_cannot_execute_dispatch_input(
++        INTAKE_WORKFLOW,
++        "Gate identity and fetch minimal issue metadata",
++        "ISSUE_NUMBER",
++        tmp_path,
++    )
++    for input_environment_name in (
++        "DEPLOY_ENVIRONMENT",
++        "DEPLOY_OPERATION",
++        "PRODUCTION_CONFIRMATION",
++    ):
++        for step_name in (
++            "Gate dev actor, branch, roles, storage, and operation",
++            "Gate prod actor, branch, roles, storage, and operation",
++        ):
++            assert_rejected_actor_cannot_execute_dispatch_input(
++                DEPLOY_WORKFLOW,
++                step_name,
++                input_environment_name,
++                tmp_path,
++            )
++
++
+ def test_deploy_defaults_to_plan_and_production_apply_is_explicit_and_gated() -> None:
+     text = workflow_text(DEPLOY_WORKFLOW)
+     parsed = yaml.safe_load(text)
+diff --git a/backend/test_worker_handler.py b/backend/test_worker_handler.py
+index 381808f..122a52d 100644
+--- a/backend/test_worker_handler.py
++++ b/backend/test_worker_handler.py
+@@ -1,10 +1,20 @@
++import importlib
+ import unittest
+ from unittest import mock
+ 
+-import worker_handler
++from storage import dynamodb_store
++
++_dynamodb_resource_factory = dynamodb_store.create_dynamodb_resource
++_dynamodb_client_factory = dynamodb_store.create_dynamodb_client
++
++worker_handler = importlib.import_module("worker_handler")
+ 
+ 
+ class WorkerHandlerTests(unittest.TestCase):
++    def test_worker_lambda_entrypoint_keeps_both_dynamodb_factories(self):
++        self.assertIs(dynamodb_store.create_dynamodb_resource, _dynamodb_resource_factory)
++        self.assertIs(dynamodb_store.create_dynamodb_client, _dynamodb_client_factory)
++
+     @mock.patch.object(worker_handler, "get_preload_content_store")
+     @mock.patch.object(worker_handler, "get_usage_repository")
+     @mock.patch.object(worker_handler, "get_subscription_repository")
+diff --git a/backend/worker_handler.py b/backend/worker_handler.py
+index 3f71d99..8b59e95 100644
+--- a/backend/worker_handler.py
++++ b/backend/worker_handler.py
+@@ -5,11 +5,9 @@ preload_id, learner_profile_fingerprint} messages onto the preload jobs queue.
+ This worker conditionally claims the matching record before running the slow
+ analysis, so stale or duplicate messages cannot publish results.
+ 
+-Like lambda_handler.py, this replaces the DynamoDB resource factory before
+-importing anything that builds repositories: config.py passes an explicit
+-access key / secret key pair (a local-development convenience), but Lambda
+-issues temporary role credentials that also require a session token, so
+-boto3's default credential chain must be used instead.
++The DynamoDB store factory applies the SDK default credential chain outside
++DynamoDB Local, so this entrypoint imports its dependencies without rewriting
++storage factories.
+ 
+ Returns a partial batch response (batchItemFailures): only messages that
+ raised an infrastructure error are reported for redelivery. A failed
+@@ -21,26 +19,15 @@ from __future__ import annotations
+ 
+ import json
+ import logging
+-import os
+ from typing import Any
+ 
+-import boto3
+-import storage.dynamodb_store as dynamodb_store
+-
+-
+-def _lambda_dynamodb_resource():
+-    return boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
+-
+-
+-dynamodb_store.create_dynamodb_resource = _lambda_dynamodb_resource
+-
+-from deps import (  # noqa: E402  (must come after the override above)
++from deps import (
+     get_page_preload_repository,
+     get_preload_content_store,
+     get_subscription_repository,
+     get_usage_repository,
+ )
+-from services.reading import run_preload_job  # noqa: E402
++from services.reading import run_preload_job
+ 
+ logger = logging.getLogger("untangle.worker")
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+diff --git a/scripts/bootstrap.sh b/scripts/bootstrap.sh
+index 1b74cc5..d0d0adb 100755
+--- a/scripts/bootstrap.sh
++++ b/scripts/bootstrap.sh
+@@ -21,9 +21,9 @@ readonly TOOLS_ROOT="${BOOTSTRAP_TOOLS_DIR:-${REPOSITORY_ROOT}/.tools}"
+ readonly MISE_ROOT="${TOOLS_ROOT}/mise"
+ readonly MISE_BIN_DIR="${MISE_ROOT}/bin"
+ readonly MISE_BIN="${MISE_BIN_DIR}/mise"
+-readonly MISE_SHIMS_DIR="${MISE_ROOT}/shims"
+ 
+ export MISE_DATA_DIR="${MISE_ROOT}/data"
++readonly MISE_SHIMS_DIR="${MISE_DATA_DIR}/shims"
+ export MISE_CACHE_DIR="${MISE_ROOT}/cache"
+ export MISE_STATE_DIR="${MISE_ROOT}/state"
+ export MISE_CONFIG_DIR="${MISE_ROOT}/config"

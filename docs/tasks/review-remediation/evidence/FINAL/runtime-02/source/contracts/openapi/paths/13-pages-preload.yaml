@@ -1,0 +1,213 @@
+get:
+  summary: Get Page Preload
+  operationId: getPagePreload
+  parameters:
+  - name: page_url
+    in: query
+    required: true
+    schema:
+      type: string
+      minLength: 1
+      title: Page Url
+    example: https://example.test/article
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/PagePreloadStatusResponse.yaml
+          examples:
+            processing:
+              x-contract-test-case: processing
+              value:
+                ready: false
+                preload: null
+                status: processing
+                error: null
+            ready:
+              x-contract-test-case: ready
+              value:
+                ready: true
+                preload:
+                  id: 018f47a2-7b3c-7abc-8def-0123456789ab
+                  page_url: https://example.test/article
+                  page_title: A public sample article
+                  summary: A short public sample.
+                  topics:
+                  - learning
+                  sentences: []
+                  study_items: []
+                  created_at: '2026-07-19T00:00:00+00:00'
+                  status: ready
+                status: ready
+                error: null
+            failed:
+              x-contract-test-case: failed
+              value:
+                ready: false
+                preload: null
+                status: failed
+                error: Synthetic local analysis failure.
+    '403':
+      description: Account access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Account is suspended.
+            code: account_suspended
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '422':
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Request validation failed.
+  x-contract-test:
+    mode: generic
+    auth: localBearer
+    setup: emptyRepositories
+    owner: reading
+  security:
+  - bearerAuth: []
+post:
+  summary: Create Page Preload
+  operationId: createPagePreload
+  parameters:
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/PagePreloadRequest.yaml
+        examples:
+          happy:
+            summary: Deterministic local request
+            x-contract-test-case: happy
+            value:
+              operation_id: 018f47a2-7b3c-7abc-8def-0123456789ab
+              page_url: https://example.test/article
+              page_title: A public sample article
+              html: <article><p>Learning takes practice.</p></article>
+              target_language: en
+              native_language: ja
+              vocabulary_coverage_percent: 10
+  responses:
+    '202':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/PagePreloadStatusResponse.yaml
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                ready: false
+                preload: null
+                status: processing
+                error: null
+    '400':
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The request is invalid.
+    '403':
+      description: Account access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Account is suspended.
+            code: account_suspended
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '402':
+      description: Plan quota exceeded
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The current plan quota is exhausted.
+            code: article_quota_exceeded
+    '409':
+      description: Conflict
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The operation conflicts with existing state.
+    '422':
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Request validation failed.
+    '429':
+      description: Usage limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The usage limit is exhausted.
+            code: article_quota_exceeded
+    '500':
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The request could not be completed.
+  x-contract-test:
+    mode: manual
+    auth: localBearer
+    setup: fakePreloadPipeline
+    owner: reading
+    reason: Submission executes asynchronous extraction and analysis.
+    test: backend/test_openapi_manual_contract.py::test_create_page_preload
+  security:
+  - bearerAuth: []

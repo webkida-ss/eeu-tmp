@@ -1,0 +1,454 @@
+diff --git a/private/tmp/untangle-remediation-20260914/rm13-base/backend/auth/dynamodb_email_auth.py b/docs/tasks/review-remediation/evidence/RM-13/A-runtime-01/source/backend/auth/dynamodb_email_auth.py
+index 603de26..b33cf7a 100644
+--- a/private/tmp/untangle-remediation-20260914/rm13-base/backend/auth/dynamodb_email_auth.py
++++ b/docs/tasks/review-remediation/evidence/RM-13/A-runtime-01/source/backend/auth/dynamodb_email_auth.py
+@@ -8,15 +8,20 @@ composition root.
+ 
+ from __future__ import annotations
+ 
++import json
+ import secrets
+ from collections.abc import Callable
+ from datetime import UTC, datetime, timedelta
+ from typing import Any
+ 
+ from accounts.models import User
++from boto3.dynamodb.types import TypeSerializer
++from botocore.exceptions import ClientError
+ from core.ids import generate_uuid7
+ from storage.dynamodb_keys import SK_PROFILE, SK_SESSION, SK_USER, email_pk, session_pk, user_pk
+-from storage.dynamodb_store import DynamoDbStore
++from storage.dynamodb_store import DOCUMENT_ATTRIBUTE, DynamoDbStore
++
++_SERIALIZER = TypeSerializer()
+ 
+ 
+ def _normalize_email(email: str) -> str:
+@@ -48,10 +53,29 @@ class DynamoEmailAuthService:
+                 or normalized_email,
+                 "created_at": self._clock().isoformat(),
+             }
+-            self._store.put_document(
+-                email_pk(normalized_email), SK_USER, {"user_id": user_record["id"]}
+-            )
+-            self._store.put_document(user_pk(user_record["id"]), SK_PROFILE, user_record)
++            try:
++                self._store.transact_write(
++                    [
++                        _conditional_put(
++                            self._store.table_name,
++                            email_pk(normalized_email),
++                            SK_USER,
++                            {"user_id": user_record["id"]},
++                        ),
++                        _conditional_put(
++                            self._store.table_name,
++                            user_pk(user_record["id"]),
++                            SK_PROFILE,
++                            user_record,
++                        ),
++                    ]
++                )
++            except ClientError as exc:
++                if not _is_conditional_identity_conflict(exc):
++                    raise
++                user_record = self._get_user_by_email(normalized_email, consistent_read=True)
++                if user_record is None:
++                    raise ValueError("Account identity could not be resolved.") from None
+         elif display_name and display_name.strip():
+             user_record["display_name"] = display_name.strip()
+             self._store.put_document(user_pk(user_record["id"]), SK_PROFILE, user_record)
+@@ -106,8 +130,12 @@ class DynamoEmailAuthService:
+             return
+         self._store.delete(session_pk(token), SK_SESSION)
+ 
+-    def _get_user_by_email(self, normalized_email: str) -> dict[str, Any] | None:
+-        email_lookup = self._store.get_document(email_pk(normalized_email), SK_USER)
++    def _get_user_by_email(
++        self, normalized_email: str, *, consistent_read: bool = False
++    ) -> dict[str, Any] | None:
++        email_lookup = self._store.get_document(
++            email_pk(normalized_email), SK_USER, consistent_read=consistent_read
++        )
+         if not email_lookup:
+             return None
+ 
+@@ -115,9 +143,13 @@ class DynamoEmailAuthService:
+         if not isinstance(user_id, str) or not user_id:
+             return None
+ 
+-        user_record = self._store.get_document(user_pk(user_id), SK_PROFILE)
++        user_record = self._store.get_document(
++            user_pk(user_id), SK_PROFILE, consistent_read=consistent_read
++        )
+         if not user_record:
+             return None
++        if user_record.get("id") != user_id:
++            return None
+         if user_record.get("email") != normalized_email:
+             return None
+         return user_record
+@@ -136,3 +168,36 @@ class DynamoEmailAuthService:
+             },
+         )
+         return token
++
++
++def _conditional_put(
++    table_name: str,
++    partition_key: str,
++    sort_key: str,
++    document: dict[str, Any],
++) -> dict[str, Any]:
++    item = {
++        "pk": partition_key,
++        "sk": sort_key,
++        DOCUMENT_ATTRIBUTE: json.dumps(document, ensure_ascii=False, separators=(",", ":")),
++    }
++    return {
++        "Put": {
++            "TableName": table_name,
++            "Item": {field: _SERIALIZER.serialize(value) for field, value in item.items()},
++            "ConditionExpression": "attribute_not_exists(pk) AND attribute_not_exists(sk)",
++        }
++    }
++
++
++def _is_conditional_identity_conflict(exc: ClientError) -> bool:
++    if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
++        return False
++    reasons = exc.response.get("CancellationReasons")
++    if not isinstance(reasons, list) or not reasons:
++        return False
++    reason_codes = {reason.get("Code") for reason in reasons if isinstance(reason, dict)}
++    return (
++        reason_codes <= {"None", "ConditionalCheckFailed"}
++        and "ConditionalCheckFailed" in reason_codes
++    )
+diff --git a/private/tmp/untangle-remediation-20260914/rm13-base/backend/test_dynamodb_composition.py b/docs/tasks/review-remediation/evidence/RM-13/A-runtime-01/source/backend/test_dynamodb_composition.py
+index 1593f13..2726314 100644
+--- a/private/tmp/untangle-remediation-20260914/rm13-base/backend/test_dynamodb_composition.py
++++ b/docs/tasks/review-remediation/evidence/RM-13/A-runtime-01/source/backend/test_dynamodb_composition.py
+@@ -1,21 +1,39 @@
+ from __future__ import annotations
+ 
++import json
+ import os
++import uuid
+ from datetime import UTC, datetime, timedelta
+ from unittest import mock
+ 
+ import deps
++import pytest
+ from accounts import AccountsSettings
++from accounts.models import User
+ from auth.dynamodb_email_auth import DynamoEmailAuthService
++from boto3.dynamodb.types import TypeDeserializer
++from botocore.exceptions import ClientError
+ from storage import dynamodb_store
+-from storage.dynamodb_keys import SK_SESSION, session_pk
++from storage.dynamodb_keys import SK_PROFILE, SK_SESSION, SK_USER, email_pk, session_pk, user_pk
++
++_DESERIALIZER = TypeDeserializer()
+ 
+ 
+ class MemoryDynamoStore:
++    table_name = "auth-test"
++
+     def __init__(self) -> None:
+         self.documents: dict[tuple[str, str], dict[str, object]] = {}
++        self.transactions: list[list[dict[str, object]]] = []
++        self.consistent_reads: list[tuple[str, str]] = []
++        self.before_transact = None
++        self.transaction_error: ClientError | None = None
+ 
+-    def get_document(self, partition_key: str, sort_key: str) -> dict[str, object] | None:
++    def get_document(
++        self, partition_key: str, sort_key: str, *, consistent_read: bool = False
++    ) -> dict[str, object] | None:
++        if consistent_read:
++            self.consistent_reads.append((partition_key, sort_key))
+         document = self.documents.get((partition_key, sort_key))
+         return dict(document) if document is not None else None
+ 
+@@ -31,6 +49,49 @@ class MemoryDynamoStore:
+     def delete(self, partition_key: str, sort_key: str) -> None:
+         self.documents.pop((partition_key, sort_key), None)
+ 
++    def transact_write(self, transactions: list[dict[str, object]]) -> None:
++        self.transactions.append(transactions)
++        if self.transaction_error is not None:
++            raise self.transaction_error
++        if self.before_transact is not None:
++            callback = self.before_transact
++            self.before_transact = None
++            callback()
++
++        decoded = [self._decode_put(transaction) for transaction in transactions]
++        for partition_key, sort_key, _document, condition in decoded:
++            if condition != "attribute_not_exists(pk) AND attribute_not_exists(sk)":
++                raise AssertionError(f"Unexpected condition: {condition}")
++            if (partition_key, sort_key) in self.documents:
++                raise _conditional_transaction_failure()
++        for partition_key, sort_key, document, _condition in decoded:
++            self.documents[(partition_key, sort_key)] = document
++
++    @staticmethod
++    def _decode_put(transaction: dict[str, object]) -> tuple[str, str, dict[str, object], str]:
++        put = transaction["Put"]
++        assert isinstance(put, dict)
++        item = {field: _DESERIALIZER.deserialize(value) for field, value in put["Item"].items()}
++        return (
++            str(item["pk"]),
++            str(item["sk"]),
++            json.loads(str(item["document"])),
++            str(put["ConditionExpression"]),
++        )
++
++
++def _conditional_transaction_failure() -> ClientError:
++    return ClientError(
++        {
++            "Error": {"Code": "TransactionCanceledException", "Message": "conditional"},
++            "CancellationReasons": [
++                {"Code": "ConditionalCheckFailed"},
++                {"Code": "None"},
++            ],
++        },
++        "TransactWriteItems",
++    )
++
+ 
+ class MutableClock:
+     def __init__(self, now: datetime) -> None:
+@@ -130,3 +191,156 @@ def test_dynamo_auth_composition_uses_configured_ttl_and_rejects_expired_session
+     clock.now = start + timedelta(days=1)
+     assert auth.resolve_user(access_token) is None
+     assert store.get_document(session_pk(access_token), SK_SESSION) is None
++
++
++def test_dynamo_auth_first_login_uses_one_conditional_identity_transaction() -> None:
++    store = MemoryDynamoStore()
++    auth = DynamoEmailAuthService(store)
++
++    access_token, user = auth.login(email=" Reader@Example.Test ", display_name="Reader")
++
++    assert uuid.UUID(user.id).version == 7
++    assert len(store.transactions) == 1
++    transaction = store.transactions[0]
++    assert len(transaction) == 2
++    decoded = [MemoryDynamoStore._decode_put(item) for item in transaction]
++    assert {key[:2] for key in decoded} == {
++        (email_pk("reader@example.test"), SK_USER),
++        (user_pk(user.id), SK_PROFILE),
++    }
++    assert all(
++        condition == "attribute_not_exists(pk) AND attribute_not_exists(sk)"
++        for *_, condition in decoded
++    )
++    assert store.documents[(email_pk("reader@example.test"), SK_USER)] == {"user_id": user.id}
++    assert store.documents[(user_pk(user.id), SK_PROFILE)]["email"] == "reader@example.test"
++    assert store.get_document(session_pk(access_token), SK_SESSION)["user_id"] == user.id
++
++
++def test_dynamo_auth_concurrent_first_logins_recover_the_same_winner() -> None:
++    store = MemoryDynamoStore()
++    first = DynamoEmailAuthService(store)
++    second = DynamoEmailAuthService(store)
++    second_result: list[tuple[str, User]] = []
++
++    def complete_second_login() -> None:
++        second_result.append(second.login(email="reader@example.test", display_name="Second"))
++
++    store.before_transact = complete_second_login
++    first_token, first_user = first.login(email="reader@example.test", display_name="First")
++    second_token, second_user = second_result[0]
++
++    assert first_user.id == second_user.id
++    assert first_user.display_name == "Second"
++    assert first_token != second_token
++    assert len(store.transactions) == 2
++    assert store.get_document(session_pk(first_token), SK_SESSION)["user_id"] == first_user.id
++    assert store.get_document(session_pk(second_token), SK_SESSION)["user_id"] == first_user.id
++    assert (email_pk("reader@example.test"), SK_USER) in store.consistent_reads
++    assert (user_pk(first_user.id), SK_PROFILE) in store.consistent_reads
++    profile_keys = [key for key in store.documents if key[1] == SK_PROFILE]
++    assert profile_keys == [(user_pk(first_user.id), SK_PROFILE)]
++
++
++def test_dynamo_auth_uses_a_validated_existing_identity_without_a_transaction() -> None:
++    store = MemoryDynamoStore()
++    store.put_document(email_pk("reader@example.test"), SK_USER, {"user_id": "winner"})
++    store.put_document(
++        user_pk("winner"),
++        SK_PROFILE,
++        {"id": "winner", "email": "reader@example.test", "display_name": "Original"},
++    )
++
++    access_token, user = DynamoEmailAuthService(store).login(
++        email="reader@example.test", display_name="Updated"
++    )
++
++    assert user.id == "winner"
++    assert user.display_name == "Updated"
++    assert store.transactions == []
++    assert store.documents[(user_pk("winner"), SK_PROFILE)]["display_name"] == "Updated"
++    assert store.get_document(session_pk(access_token), SK_SESSION)["user_id"] == "winner"
++
++
++@pytest.mark.parametrize(
++    "email_lookup, profile",
++    [
++        ({"user_id": 42}, None),
++        ({"user_id": "winner"}, None),
++        (
++            {"user_id": "winner"},
++            {"id": "other-user", "email": "reader@example.test", "display_name": "Other"},
++        ),
++        (
++            {"user_id": "winner"},
++            {"id": "winner", "email": "other@example.test", "display_name": "Other"},
++        ),
++    ],
++)
++def test_dynamo_auth_rejects_malformed_or_dangling_existing_identity(
++    email_lookup: dict[str, object], profile: dict[str, object] | None
++) -> None:
++    store = MemoryDynamoStore()
++    store.put_document(email_pk("reader@example.test"), SK_USER, email_lookup)
++    if profile is not None:
++        store.put_document(user_pk("winner"), SK_PROFILE, profile)
++    original_documents = dict(store.documents)
++
++    with pytest.raises(ValueError, match="identity"):
++        DynamoEmailAuthService(store).login(email="reader@example.test")
++
++    assert not [key for key in store.documents if key[1] == SK_SESSION]
++    assert store.documents == original_documents
++    assert (email_pk("reader@example.test"), SK_USER) in store.consistent_reads
++
++
++def test_dynamo_auth_uuid_collision_keeps_the_email_claim_absent() -> None:
++    store = MemoryDynamoStore()
++    store.put_document(
++        user_pk("collision-id"),
++        SK_PROFILE,
++        {"id": "collision-id", "email": "other@example.test", "display_name": "Other"},
++    )
++
++    with (
++        mock.patch("auth.dynamodb_email_auth.generate_uuid7", return_value="collision-id"),
++        pytest.raises(ValueError, match="identity"),
++    ):
++        DynamoEmailAuthService(store).login(email="reader@example.test")
++
++    assert (email_pk("reader@example.test"), SK_USER) not in store.documents
++    assert store.documents[(user_pk("collision-id"), SK_PROFILE)]["email"] == "other@example.test"
++    assert not [key for key in store.documents if key[1] == SK_SESSION]
++
++
++def test_dynamo_auth_rejects_a_corrupt_winner_after_conditional_conflict() -> None:
++    store = MemoryDynamoStore()
++
++    def create_corrupt_winner() -> None:
++        store.put_document(email_pk("reader@example.test"), SK_USER, {"user_id": "winner"})
++        store.put_document(
++            user_pk("winner"),
++            SK_PROFILE,
++            {"id": "other-user", "email": "reader@example.test", "display_name": "Other"},
++        )
++
++    store.before_transact = create_corrupt_winner
++    with pytest.raises(ValueError, match="identity"):
++        DynamoEmailAuthService(store).login(email="reader@example.test")
++
++    assert not [key for key in store.documents if key[1] == SK_SESSION]
++    assert len(store.transactions) == 1
++    assert (email_pk("reader@example.test"), SK_USER) in store.consistent_reads
++
++
++def test_dynamo_auth_transaction_failure_does_not_become_contention() -> None:
++    store = MemoryDynamoStore()
++    store.transaction_error = ClientError(
++        {"Error": {"Code": "ValidationException", "Message": "invalid transaction"}},
++        "TransactWriteItems",
++    )
++
++    with pytest.raises(ClientError, match="ValidationException"):
++        DynamoEmailAuthService(store).login(email="reader@example.test")
++
++    assert store.documents == {}
+diff --git a/private/tmp/untangle-remediation-20260914/rm13-base/backend/test_uuid7_domain_ids.py b/docs/tasks/review-remediation/evidence/RM-13/A-runtime-01/source/backend/test_uuid7_domain_ids.py
+index a1a4239..6864427 100644
+--- a/private/tmp/untangle-remediation-20260914/rm13-base/backend/test_uuid7_domain_ids.py
++++ b/docs/tasks/review-remediation/evidence/RM-13/A-runtime-01/source/backend/test_uuid7_domain_ids.py
+@@ -1,15 +1,20 @@
+ from __future__ import annotations
+ 
++import json
+ import uuid
+ from importlib import import_module, util
+ 
+ from accounts.storage import JsonEmailAuthService
+ from auth.dynamodb_email_auth import DynamoEmailAuthService
++from boto3.dynamodb.types import TypeDeserializer
++from botocore.exceptions import ClientError
+ from core import pipeline
+ from repositories.phrase_repository import JsonPhraseRepository
+ from schemas import AnalyzeResponse, OperationRequest, PhraseCreateRequest
+ from services import reading
+ 
++_DESERIALIZER = TypeDeserializer()
++
+ 
+ def assert_uuid7(value: str) -> None:
+     parsed = uuid.UUID(value)
+@@ -40,19 +45,47 @@ def test_json_auth_creates_uuid7_user(tmp_path):
+ 
+ 
+ class MemoryDynamoStore:
++    table_name = "uuid7-test"
++
+     def __init__(self):
+         self.documents = {}
+ 
+     def put_document(self, partition_key, sort_key, value):
+         self.documents[(partition_key, sort_key)] = dict(value)
+ 
+-    def get_document(self, partition_key, sort_key):
++    def get_document(self, partition_key, sort_key, *, consistent_read=False):
+         value = self.documents.get((partition_key, sort_key))
+         return dict(value) if value is not None else None
+ 
+     def delete(self, partition_key, sort_key):
+         self.documents.pop((partition_key, sort_key), None)
+ 
++    def transact_write(self, transactions):
++        decoded = []
++        for transaction in transactions:
++            put = transaction["Put"]
++            item = {name: _DESERIALIZER.deserialize(value) for name, value in put["Item"].items()}
++            decoded.append((item, put["ConditionExpression"]))
++        for item, condition in decoded:
++            if condition != "attribute_not_exists(pk) AND attribute_not_exists(sk)":
++                raise AssertionError(f"Unexpected condition: {condition}")
++            if (item["pk"], item["sk"]) in self.documents:
++                raise ClientError(
++                    {
++                        "Error": {
++                            "Code": "TransactionCanceledException",
++                            "Message": "conditional",
++                        },
++                        "CancellationReasons": [
++                            {"Code": "ConditionalCheckFailed"},
++                            {"Code": "None"},
++                        ],
++                    },
++                    "TransactWriteItems",
++                )
++        for item, _condition in decoded:
++            self.documents[(item["pk"], item["sk"])] = json.loads(item["document"])
++
+ 
+ def test_dynamodb_auth_creates_uuid7_user():
+     service = DynamoEmailAuthService(MemoryDynamoStore())

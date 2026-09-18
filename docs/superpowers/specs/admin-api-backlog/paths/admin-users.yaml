@@ -1,0 +1,73 @@
+# Historical design proposal; not a supported runtime contract.
+get:
+  operationId: listAdminUsers
+  summary: Search and page users
+  security:
+    - bearerAuth: []
+  parameters:
+    - name: search
+      in: query
+      description: Case-insensitive email search.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 320
+      example: learner@example.com
+    - name: account_status
+      in: query
+      schema:
+        type: string
+        enum: [active, suspended]
+    - name: plan_id
+      in: query
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 100
+      example: launch
+    - name: sort
+      in: query
+      schema:
+        type: string
+        enum: [created_at, tokens]
+        default: created_at
+    - name: order
+      in: query
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+    - name: cursor
+      in: query
+      description: Opaque cursor returned by the previous page.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+      example: eyJpZCI6InVzZXItMTcifQ
+    - name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+      example: 25
+  responses:
+    "200":
+      description: A deterministic cursor page of users.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/AdminUserPage
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "403":
+      $ref: ../admin-openapi.yaml#/components/responses/AdminForbidden
+    "422":
+      $ref: ../admin-openapi.yaml#/components/responses/ValidationError
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

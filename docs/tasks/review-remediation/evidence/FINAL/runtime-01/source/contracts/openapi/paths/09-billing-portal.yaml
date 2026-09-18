@@ -1,0 +1,81 @@
+post:
+  summary: Create Billing Portal
+  operationId: openBillingPortal
+  parameters:
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/PortalResponse.yaml
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                url: https://billing.example.test/portal/fake
+    '403':
+      description: Account access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Account is suspended.
+            code: account_suspended
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '404':
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The resource was not found.
+    '502':
+      description: Upstream provider failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The provider request failed.
+    '422':
+      description: Validation Error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/HTTPValidationError.yaml
+          example:
+            detail:
+            - type: value_error
+              loc:
+              - body
+              - field
+              msg: Request validation failed.
+              input: null
+  x-contract-test:
+    mode: manual
+    auth: localBearer
+    setup: mockBilling
+    owner: billing
+    reason: Portal creation crosses the billing-provider boundary.
+    test: backend/test_openapi_manual_contract.py::test_open_billing_portal
+  security:
+  - bearerAuth: []

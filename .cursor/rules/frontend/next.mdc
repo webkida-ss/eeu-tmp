@@ -1,0 +1,38 @@
+---
+alwaysApply: false
+description: Next.js frontend conventions based on Bulletproof React
+globs: frontend/**/*.{ts,tsx}
+---
+
+# Frontend Conventions (Next.js + Bulletproof React)
+
+Follow the [Bulletproof React](https://github.com/alan2207/bulletproof-react) architecture.
+
+## Directory Structure
+
+```
+src/
+├── app/              # Next.js App Router — pages and layouts only
+├── components/
+│   ├── ui/           # Primitive UI components (Button, Input, Modal…)
+│   └── layout/       # App-level layout components (Header, Sidebar…)
+├── features/         # Feature modules (self-contained)
+│   └── <feature>/
+│       ├── components/
+│       ├── hooks/
+│       ├── api/
+│       ├── types/
+│       └── stores/
+├── hooks/            # Shared global hooks
+├── lib/              # Third-party library configs (e.g. axios instance)
+├── stores/           # Global state
+├── types/            # Global TypeScript types
+└── utils/            # Utility functions
+```
+
+## Rules
+
+- Keep pages thin — delegate logic to `features/` or `hooks/`
+- Co-locate everything related to a feature inside `features/<feature>/`
+- Do not import across features directly; lift shared code to `components/` or `hooks/`
+- Use named exports for components

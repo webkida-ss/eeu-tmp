@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Frequently asked questions</title>
+    <style>
+      .collapsed {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="title">Frequently asked questions</h1>
+
+      <p id="visible-1">
+        The service keeps request logs for thirty days and then deletes them permanently.
+      </p>
+
+      <p id="hidden-attribute" hidden>
+        This answer was withdrawn and should never be read aloud to anyone.
+      </p>
+
+      <p id="hidden-inline" style="display: none">
+        An old pricing paragraph that the template still renders but hides.
+      </p>
+
+      <div id="hidden-class" class="collapsed">
+        <p id="hidden-class-child">Deleted logs cannot be restored, not even by support staff.</p>
+      </div>
+
+      <p id="visible-2">
+        Export your logs before the retention window closes if you need them for an audit.
+      </p>
+    </main>
+  </body>
+</html>

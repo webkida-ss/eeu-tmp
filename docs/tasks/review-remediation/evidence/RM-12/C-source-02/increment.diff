@@ -1,0 +1,770 @@
+--- a/backend/core/pipeline.py
++++ b/backend/core/pipeline.py
+@@ -422,6 +422,7 @@
+     total_tokens: int
+     cost_micro_usd: int
+     missing_usage: bool
++    incurred_call_uncertainty: bool = False
+ 
+     @property
+     def actual_cost_micro_usd(self) -> int:
+@@ -447,6 +448,7 @@
+         self.output_tokens = 0
+         self.total_tokens = 0
+         self.missing_usage = False
++        self.incurred_call_uncertainty = False
+ 
+     def set_dispatch_callback(self, callback: Callable[[], None] | None) -> None:
+         self._dispatch_callback = callback
+@@ -457,6 +459,12 @@
+             callback()
+         with self._lock:
+             self._any_dispatch_attempted = True
++
++    def mark_incurred_call_uncertainty(self) -> None:
++        """Record an actual provider-call failure without discarding known usage."""
++        with self._lock:
++            self.incurred_call_uncertainty = True
++            self.missing_usage = True
+ 
+     @property
+     def any_dispatch_attempted(self) -> bool:
+@@ -531,6 +539,7 @@
+             output_tokens = self.output_tokens
+             total_tokens = self.total_tokens
+             missing_usage = self.missing_usage
++            incurred_call_uncertainty = self.incurred_call_uncertainty
+         rate = rate or load_model_rate(OPENAI_MODEL)
+         return UsageSnapshot(
+             model=rate.model,
+@@ -541,6 +550,7 @@
+             total_tokens=total_tokens,
+             cost_micro_usd=calculate_cost_micro_usd(input_tokens, output_tokens, rate),
+             missing_usage=missing_usage,
++            incurred_call_uncertainty=incurred_call_uncertainty,
+         )
+ 
+ 
+@@ -551,11 +561,14 @@
+     **request: Any,
+ ) -> Any:
+     with _openai_call_slots:
++        create = client.chat.completions.create
+         if tally:
+             tally.mark_dispatch_attempt()
+         try:
+-            return client.chat.completions.create(**request)
++            return create(**request)
+         except Exception as exc:
++            if tally:
++                tally.mark_incurred_call_uncertainty()
+             raise PipelineError(
+                 f"OpenAI API request failed: {exc}",
+                 status_code=502,
+--- a/backend/services/preloading.py
++++ b/backend/services/preloading.py
+@@ -182,14 +182,33 @@
+     operation: Any,
+     *,
+     result_ref: str,
++    fallback_usage: dict[str, Any] | None = None,
+ ) -> str:
+-    """Settle durable provider evidence without relying on private results."""
+-    usage = operation.dispatch_usage or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd}
+-    completeness = (
+-        "measured" if operation.dispatch_usage_completeness == "measured" else "conservative"
+-    )
++    """Settle canonical evidence, retaining local usage after a failed promotion."""
++    latest = meter.get_operation(operation.operation_id) or operation
++    if latest.state == "finalized":
++        return (
++            "finalized"
++            if latest.dispatch_usage_completeness == "measured"
++            else "finalized_conservative"
++        )
++    if latest.dispatch_evidence_state == "completed":
++        usage = latest.dispatch_usage or {
++            "actual_cost_micro_usd": latest.reserved_cost_micro_usd
++        }
++        completeness = (
++            "measured"
++            if latest.dispatch_usage_completeness == "measured"
++            else "conservative"
++        )
++    elif fallback_usage is not None:
++        usage = fallback_usage
++        completeness = "measured" if usage.get("usage_complete") is True else "conservative"
++    else:
++        usage = {"actual_cost_micro_usd": latest.reserved_cost_micro_usd}
++        completeness = "conservative"
+     meter.finalize(
+-        operation.operation_id,
++        latest.operation_id,
+         usage,
+         result_ref=result_ref,
+         evidence_completeness=completeness,
+@@ -1085,16 +1104,37 @@
+ def _durable_shadow_usage(tally: UsageTally, operation: Any) -> dict[str, Any]:
+     """Use exact measured cost, preserving a floor only for uncertain usage."""
+     usage = _settlement_usage(tally, operation)
+-    snapshot = tally.snapshot()
+-    if snapshot.missing_usage or operation.pricing_available is not True:
++    if not usage["usage_complete"] or operation.pricing_available is not True:
+         usage["actual_cost_micro_usd"] = max(
+             int(usage.get("actual_cost_micro_usd") or 0),
+-            int(snapshot.cost_micro_usd or 0),
++            int(usage.get("cost_micro_usd") or 0),
+             int(operation.reserved_cost_micro_usd),
+         )
+-    else:
+-        usage["actual_cost_micro_usd"] = int(snapshot.cost_micro_usd or 0)
+     return usage
++
++
++def _promote_durable_shadow_usage(
++    meter: UsageMeter,
++    operation_id: str,
++    usage: dict[str, Any],
++) -> bool:
++    """Retry numeric evidence before a shadow outcome can become immutable."""
++    result = {
++        "kind": "preload",
++        "state": "completed",
++        "usage": usage,
++    }
++    for _ in range(2):
++        try:
++            meter.save_result(operation_id, result)
++            return True
++        except Exception:  # noqa: BLE001 - inspect the canonical winner before retrying
++            latest = meter.get_operation(operation_id)
++            if latest is not None and (
++                latest.state == "finalized" or latest.dispatch_evidence_state == "completed"
++            ):
++                return True
++    return False
+ 
+ 
+ def _valid_shadow_ready_payload(result: dict[str, Any] | None) -> dict[str, Any] | None:
+@@ -1342,6 +1382,20 @@
+ 
+     status = str(record.get("status") or "")
+     if status in ("ready_pending_usage", "failed_pending_usage"):
++        retry_usage = record.get("shadow_evidence_retry_usage")
++        if isinstance(retry_usage, dict) and not _promote_durable_shadow_usage(
++            meter,
++            operation_id,
++            retry_usage,
++        ):
++            logger.warning(
++                "durable shadow numeric evidence remains retryable operation_id=%s",
++                operation_id,
++            )
++            return
++        if isinstance(retry_usage, dict):
++            record = dict(record)
++            record.pop("shadow_evidence_retry_usage", None)
+         intended_outcome = record.get("shadow_pending_outcome")
+         if intended_outcome not in (
+             "success",
+@@ -1533,9 +1587,7 @@
+                 vocabulary_coverage=vocabulary_coverage,
+             )
+             repository.validate_publication(user_id, _shadow_ready_record(record, payload))
+-            snapshot = tally.snapshot()
+             usage = _durable_shadow_usage(tally, operation)
+-            usage["usage_complete"] = bool(not snapshot.missing_usage and snapshot.total_tokens > 0)
+             meter.save_result(
+                 operation_id,
+                 {
+@@ -1557,22 +1609,27 @@
+             owns_publication = heartbeat.stop_and_verify()
+ 
+         if provider_error is not None and _dispatch_was_attempted(tally, provider_error):
+-            try:
+-                partial_usage = _durable_shadow_usage(tally, operation)
+-                partial_usage["usage_complete"] = False
+-                meter.save_result(
++            partial_usage = _durable_shadow_usage(tally, operation)
++            if not _promote_durable_shadow_usage(meter, operation_id, partial_usage):
++                pending = dict(record)
++                pending["status"] = "failed_pending_usage"
++                pending["shadow_pending_outcome"] = desired_outcome
++                pending["shadow_pending_result_ref"] = preload_id
++                pending["shadow_evidence_retry_usage"] = partial_usage
++                pending["content_retirement_pending"] = True
++                pending.pop("_claimed_from_unstarted_processing", None)
++                repository.finish_processing(
++                    user_id,
++                    preload_id,
++                    learner_profile_fingerprint,
++                    pending,
++                    lease_id=lease_id,
++                )
++                logger.warning(
++                    "durable shadow numeric evidence remains retryable operation_id=%s",
+                     operation_id,
+-                    {
+-                        "kind": "preload",
+-                        "state": "completed",
+-                        "usage": partial_usage,
+-                    },
+-                )
+-            except Exception:  # noqa: BLE001 - retain the already-persisted dispatch marker
+-                logger.warning(
+-                    "durable shadow partial evidence could not be saved operation_id=%s",
+-                    operation_id,
+-                )
++                )
++                return
+ 
+         try:
+             operation = _settle_durable_shadow(
+@@ -1929,7 +1986,12 @@
+             and record.get("usage_tally")
+         ):
+             if operation.dispatch_evidence_state in ("dispatched", "completed"):
+-                _finalize_dispatch_evidence(meter, operation, result_ref=preload_id)
++                _finalize_dispatch_evidence(
++                    meter,
++                    operation,
++                    result_ref=preload_id,
++                    fallback_usage=record["usage_tally"],
++                )
+             else:
+                 meter.finalize(
+                     operation_id,
+@@ -1968,6 +2030,7 @@
+                     meter,
+                     operation,
+                     result_ref=preload_id,
++                    fallback_usage=record.get("failure_usage"),
+                 )
+             elif record.get("failure_settlement") == "finalize_conservative":
+                 meter.finalize(
+@@ -2107,6 +2170,7 @@
+                     meter,
+                     latest_operation,
+                     result_ref=preload_id,
++                    fallback_usage=durable_result.get("usage") if durable_result else None,
+                 )
+                 interrupted = dict(record)
+                 interrupted["status"] = "failed"
+@@ -2314,6 +2378,7 @@
+     )
+     started = time.perf_counter()
+     provider_error = None
++    durable_usage: dict[str, Any] | None = None
+     heartbeat.start()
+     try:
+         sentences = _split_sentences(
+@@ -2341,21 +2406,7 @@
+     finally:
+         try:
+             if meter and (provider_error is None or _dispatch_was_attempted(tally, provider_error)):
+-                durable_usage = (
+-                    _settlement_usage(tally, operation)
+-                    if provider_error is None
+-                    else {"actual_cost_micro_usd": (operation.reserved_cost_micro_usd)}
+-                )
+-                if provider_error is None:
+-                    snapshot = tally.snapshot()
+-                    durable_usage["usage_complete"] = bool(
+-                        not snapshot.missing_usage and snapshot.total_tokens > 0
+-                    )
+-                else:
+-                    # A dispatch-attempted provider error has no complete
+-                    # provider tally, even when its empty snapshot reports no
+-                    # missing fields. Preserve the reservation floor instead.
+-                    durable_usage["usage_complete"] = False
++                durable_usage = _settlement_usage(tally, operation)
+                 meter.save_result(
+                     operation_id,
+                     {
+@@ -2390,14 +2441,12 @@
+         failed["error"] = str(exc) or "Article analysis failed. Please try again."
+         if meter:
+             if _dispatch_was_attempted(tally, exc):
++                failed["failure_usage"] = durable_usage or _settlement_usage(tally, operation)
+                 latest_operation = meter.get_operation(operation_id) or operation
+                 if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
+                     failed["failure_settlement"] = "finalize_evidence"
+                 else:
+                     failed["failure_settlement"] = "finalize_conservative"
+-                    failed["failure_usage"] = {
+-                        "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-                    }
+             else:
+                 failed["failure_settlement"] = "release"
+                 failed["failure_reason"] = "analysis_failed_before_dispatch"
+@@ -2415,6 +2464,7 @@
+                     meter,
+                     meter.get_operation(operation_id) or operation,
+                     result_ref=preload_id,
++                    fallback_usage=failed.get("failure_usage"),
+                 )
+             elif failed["failure_settlement"] == "finalize_conservative":
+                 meter.finalize(
+@@ -2516,14 +2566,12 @@
+         failed["error"] = str(exc)
+         failed["content_retirement_pending"] = True
+         if meter:
++            failed["failure_usage"] = ready["usage_tally"]
+             latest_operation = meter.get_operation(operation_id) or operation
+             if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
+                 failed["failure_settlement"] = "finalize_evidence"
+             else:
+                 failed["failure_settlement"] = "finalize_conservative"
+-                failed["failure_usage"] = {
+-                    "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-                }
+             failed["usage_state"] = "reserved"
+         published = repository.finish_processing(
+             user_id,
+@@ -2538,6 +2586,7 @@
+                     meter,
+                     meter.get_operation(operation_id) or operation,
+                     result_ref=preload_id,
++                    fallback_usage=failed.get("failure_usage"),
+                 )
+             else:
+                 meter.finalize(
+@@ -2591,6 +2640,7 @@
+                 meter,
+                 latest_operation,
+                 result_ref=preload_id,
++                fallback_usage=ready["usage_tally"],
+             )
+         else:
+             meter.finalize(operation_id, ready["usage_tally"], result_ref=preload_id)
+--- a/backend/services/reading_support.py
++++ b/backend/services/reading_support.py
+@@ -47,9 +47,22 @@
+ 
+ 
+ def _settlement_usage(tally: UsageTally, operation: Any) -> dict[str, Any]:
++    """Build one durable usage snapshot without replacing known partial usage.
++
++    Complete provider usage settles at its measured cost. Any missing or
++    incurred-call uncertainty retains every known counter and applies only the
++    reservation floor, rather than adding that floor on top of known cost.
++    """
+     snapshot = asdict(tally.snapshot())
+-    if snapshot.get("missing_usage") or snapshot.get("total_tokens") == 0:
+-        snapshot["actual_cost_micro_usd"] = operation.reserved_cost_micro_usd
++    complete = not snapshot["missing_usage"] and snapshot["total_tokens"] > 0
++    snapshot["usage_complete"] = complete
++    if complete:
++        snapshot["actual_cost_micro_usd"] = int(snapshot["cost_micro_usd"])
++    else:
++        snapshot["actual_cost_micro_usd"] = max(
++            int(snapshot["cost_micro_usd"]),
++            int(operation.reserved_cost_micro_usd),
++        )
+     return snapshot
+ 
+ 
+--- a/backend/services/synchronous_execution.py
++++ b/backend/services/synchronous_execution.py
+@@ -49,7 +49,14 @@
+         return None
+     if stored.get("state") == "dispatching":
+         return None
+-    response = model(**stored["response"])
++    response_document = stored.get("response")
++    if not isinstance(response_document, dict):
++        _settle_durable_dispatch_evidence(meter, operation)
++        raise PipelineError(
++            "The previous provider dispatch had an uncertain result.",
++            status_code=502,
++        )
++    response = model(**response_document)
+     if operation.state == "reserved":
+         meter.finalize(
+             operation.operation_id,
+@@ -70,18 +77,46 @@
+     return response
+ 
+ 
++def _finalize_synchronous_evidence(
++    meter: UsageMeter,
++    operation: Any,
++    *,
++    fallback_usage: dict[str, Any] | None = None,
++    result_ref: str | None = None,
++) -> None:
++    """Finalize the canonical evidence, retaining local usage after a failed promotion."""
++    latest = meter.get_operation(operation.operation_id) or operation
++    if latest.state == "finalized":
++        return
++    if latest.dispatch_evidence_state == "completed":
++        usage = latest.dispatch_usage or {
++            "actual_cost_micro_usd": latest.reserved_cost_micro_usd
++        }
++        completeness = (
++            "measured"
++            if latest.dispatch_usage_completeness == "measured"
++            else "conservative"
++        )
++    elif fallback_usage is not None:
++        usage = fallback_usage
++        completeness = "measured" if usage.get("usage_complete") is True else "conservative"
++    elif latest.dispatch_evidence_state == "dispatched":
++        usage = {"actual_cost_micro_usd": latest.reserved_cost_micro_usd}
++        completeness = "conservative"
++    else:
++        return
++    meter.finalize(
++        latest.operation_id,
++        usage,
++        result_ref=result_ref or f"usage-evidence:{latest.operation_id}",
++        evidence_completeness=completeness,
++    )
++
++
+ def _settle_durable_dispatch_evidence(meter: UsageMeter, operation: Any) -> None:
+     if operation.dispatch_evidence_state not in ("dispatched", "completed"):
+         return
+-    usage = operation.dispatch_usage or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd}
+-    meter.finalize(
+-        operation.operation_id,
+-        usage,
+-        result_ref=f"usage-evidence:{operation.operation_id}",
+-        evidence_completeness=(
+-            "measured" if operation.dispatch_usage_completeness == "measured" else "conservative"
+-        ),
+-    )
++    _finalize_synchronous_evidence(meter, operation)
+     raise PipelineError(
+         "The previous provider dispatch had an uncertain result.",
+         status_code=502,
+@@ -229,21 +264,33 @@
+     operation: Any,
+     error: Exception,
+     *,
++    tally: UsageTally,
++    kind: str,
+     dispatch_attempted: bool,
+ ) -> None:
+     if dispatch_attempted:
++        usage = _settlement_usage(tally, operation)
++        try:
++            meter.save_result(
++                operation.operation_id,
++                {
++                    "kind": kind,
++                    "state": "completed",
++                    "usage": usage,
++                },
++            )
++        except Exception:  # noqa: BLE001 - preserve the prior durable marker for settlement
++            logger.warning(
++                "synchronous partial evidence could not be saved operation_id=%s",
++                operation.operation_id,
++            )
+         latest = meter.get_operation(operation.operation_id)
+         if latest and latest.dispatch_evidence_state in ("dispatched", "completed"):
+-            meter.finalize(
+-                operation.operation_id,
+-                latest.dispatch_usage
+-                or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
++            _finalize_synchronous_evidence(
++                meter,
++                latest,
++                fallback_usage=usage,
+                 result_ref=f"usage-evidence:{operation.operation_id}",
+-                evidence_completeness=(
+-                    "measured"
+-                    if latest.dispatch_usage_completeness == "measured"
+-                    else "conservative"
+-                ),
+             )
+             return
+         pending = meter.get_result(operation.operation_id)
+@@ -385,16 +432,14 @@
+                 self.meter,
+                 self.operation,
+                 provider_error,
++                tally=tally,
++                kind=self.kind,
+                 dispatch_attempted=_dispatch_was_attempted(tally, provider_error),
+             )
+             raise provider_error
+         try:
+             response = build_response(provider_result)
+             self.usage = _settlement_usage(tally, self.operation)
+-            snapshot = tally.snapshot()
+-            self.usage["usage_complete"] = bool(
+-                not snapshot.missing_usage and snapshot.total_tokens > 0
+-            )
+             self.meter.save_result(
+                 self.operation.operation_id,
+                 {
+@@ -404,16 +449,14 @@
+                     "usage": self.usage,
+                 },
+             )
+-            latest = self.meter.get_operation(self.operation.operation_id) or self.operation
+-            self.meter.finalize(
+-                self.operation.operation_id,
+-                latest.dispatch_usage or self.usage,
++            latest_operation = (
++                self.meter.get_operation(self.operation.operation_id) or self.operation
++            )
++            _finalize_synchronous_evidence(
++                self.meter,
++                latest_operation,
++                fallback_usage=self.usage,
+                 result_ref=f"usage-result:{self.operation.operation_id}",
+-                evidence_completeness=(
+-                    "measured"
+-                    if latest.dispatch_usage_completeness == "measured"
+-                    else "conservative"
+-                ),
+             )
+         except Exception as error:
+             if on_failure:
+@@ -422,6 +465,8 @@
+                 self.meter,
+                 self.operation,
+                 error,
++                tally=tally,
++                kind=self.kind,
+                 dispatch_attempted=True,
+             )
+             raise
+--- a/backend/test_pipeline_usage.py
++++ b/backend/test_pipeline_usage.py
+@@ -9,6 +9,7 @@
+ import core.pipeline as pipeline
+ from core.plans import get_plan_limits
+ from core.usage_costs import ModelRate, UnknownModelRateError
++from services.reading_support import _settlement_usage
+ 
+ 
+ class _WordEncoding:
+@@ -124,6 +125,79 @@
+         self.assertEqual(
+             (snapshot.input_tokens, snapshot.output_tokens, snapshot.total_tokens), (100, 200, 300)
+         )
++
++    def test_incurred_call_uncertainty_is_sticky_across_concurrent_responses(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        client = mock.Mock()
++        client.chat.completions.create.side_effect = TimeoutError("provider timeout")
++
++        with self.assertRaises(pipeline.PipelineError):
++            pipeline._create_chat_completion_at_dispatch_boundary(
++                client,
++                tally=tally,
++                model="priced-model",
++                messages=[],
++            )
++
++        usage = types.SimpleNamespace(input_tokens=1, output_tokens=2, total_tokens=3)
++        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++            list(pool.map(lambda _: tally.add_response(_response(usage=usage)), range(100)))
++
++        snapshot = tally.snapshot()
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertTrue(snapshot.incurred_call_uncertainty)
++        self.assertTrue(snapshot.missing_usage)
++        self.assertEqual(
++            (snapshot.input_tokens, snapshot.output_tokens, snapshot.total_tokens),
++            (100, 200, 300),
++        )
++        self.assertFalse(settlement["usage_complete"])
++        self.assertEqual(settlement["actual_cost_micro_usd"], 800)
++
++    def test_uncertain_settlement_keeps_the_reservation_floor_without_losing_tokens(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        tally.add_response(
++            _response(
++                usage=types.SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1)
++            )
++        )
++        tally.mark_incurred_call_uncertainty()
++
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertFalse(settlement["usage_complete"])
++        self.assertEqual(
++            (
++                settlement["input_tokens"],
++                settlement["output_tokens"],
++                settlement["total_tokens"],
++                settlement["actual_cost_micro_usd"],
++            ),
++            (1, 0, 1, 13),
++        )
++
++    def test_complete_settlement_keeps_exact_cost_below_the_reservation_floor(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        tally.add_response(
++            _response(
++                usage=types.SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1)
++            )
++        )
++
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertTrue(settlement["usage_complete"])
++        self.assertEqual(settlement["actual_cost_micro_usd"], 2)
+ 
+     def test_rejects_inconsistent_response_models(self):
+         tally = pipeline.UsageTally()
+@@ -348,6 +422,26 @@
+ 
+         dispatch_callback.assert_not_called()
+         self.assertFalse(tally.any_dispatch_attempted)
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
++
++    def test_dispatch_marker_failure_does_not_mark_incurred_call_uncertainty(self):
++        tally = pipeline.UsageTally(
++            rate=ModelRate(pipeline.OPENAI_MODEL, 1, 1, "test")
++        )
++        tally.set_dispatch_callback(mock.Mock(side_effect=RuntimeError("marker failed")))
++        client = mock.Mock()
++
++        with self.assertRaisesRegex(RuntimeError, "marker failed"):
++            pipeline._create_chat_completion_at_dispatch_boundary(
++                client,
++                tally=tally,
++                model=pipeline.OPENAI_MODEL,
++                messages=[],
++            )
++
++        client.chat.completions.create.assert_not_called()
++        self.assertFalse(tally.any_dispatch_attempted)
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
+ 
+     def test_split_agent_local_post_boundary_failure_is_classified_dispatched(self):
+         tally = pipeline.UsageTally()
+@@ -448,6 +542,7 @@
+ 
+     def test_preflight_rejects_before_provider_dispatch(self):
+         client = mock.Mock()
++        tally = pipeline.UsageTally()
+         with (
+             mock.patch.object(pipeline, "_client", return_value=client),
+             mock.patch.object(pipeline, "estimate_tokens", return_value=10),
+@@ -459,9 +554,14 @@
+             mock.patch.dict("os.environ", {"OPENAI_MAX_INPUT_TOKENS_PER_CALL": "12"}),
+         ):
+             with self.assertRaises(pipeline.PipelineError) as raised:
+-                pipeline._call_openai_json("large prompt", max_completion_tokens=3)
++                pipeline._call_openai_json(
++                    "large prompt",
++                    max_completion_tokens=3,
++                    tally=tally,
++                )
+         self.assertEqual(raised.exception.status_code, pipeline.INPUT_TOKEN_LIMIT_STATUS_CODE)
+         client.chat.completions.create.assert_not_called()
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
+ 
+     def test_batch_envelope_accepts_exact_limit(self):
+         with (
+--- a/backend/test_synchronous_usage_retention.py
++++ b/backend/test_synchronous_usage_retention.py
+@@ -0,0 +1,91 @@
++"""Synchronous retries retain durable accounting evidence without redispatching."""
++
++from datetime import UTC, datetime
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++from accounts.storage import JsonSubscriptionRepository
++from core.pipeline import UsageTally
++from core.plans import PlanLimits
++from core.usage_costs import ModelRate
++from repositories.usage_repository import JsonUsageRepository
++from schemas import ChatResponse
++from services.synchronous_execution import SynchronousExecution
++from services.usage_meter import UsageMeter
++
++
++def _meter(tmp_path) -> UsageMeter:
++    return UsageMeter(
++        JsonSubscriptionRepository(tmp_path / "subscriptions.json"),
++        JsonUsageRepository(tmp_path / "usage.json"),
++        "019b63f8-f600-7000-8000-000000000111",
++        rate=ModelRate("test-model", 1_000_000, 1_000_000, "test-v1"),
++        now=datetime.now(UTC),
++        plan_loader=lambda _: PlanLimits(
++            "pro",
++            articles_per_month=10,
++            chats_per_month=10,
++            tokens_per_month=100_000,
++            sentences_per_article=50,
++            cost_micro_usd_per_month=100_000,
++            source_tokens_per_article=12_000,
++        ),
++    )
++
++
++def test_retry_preserves_full_result_after_finalization_failure_without_redispatch(tmp_path):
++    meter = _meter(tmp_path)
++    operation = meter.reserve(
++        "019b63f8-f600-7000-8000-000000000211",
++        "payload",
++        "chat",
++        13,
++    )
++    tally = UsageTally(rate=meter.rate)
++
++    def provider() -> str:
++        tally.mark_dispatch_attempt()
++        tally.add_response(
++            SimpleNamespace(
++                model="test-model",
++                usage=SimpleNamespace(input_tokens=17, output_tokens=0, total_tokens=17),
++            )
++        )
++        return "reply"
++
++    execution = SynchronousExecution(
++        meter,
++        operation,
++        kind="chat",
++        response_model=ChatResponse,
++    )
++    with patch.object(meter, "finalize", side_effect=RuntimeError("finalize unavailable")):
++        with execution, pytest.raises(RuntimeError, match="finalize unavailable"):
++            execution.run(tally, provider, lambda reply: ChatResponse(reply=reply))
++
++    stored = meter.get_result(operation.operation_id)
++    assert stored is not None
++    assert stored["response"] == {"reply": "reply"}
++    assert meter.get_operation(operation.operation_id).state == "reserved"
++
++    blocked_provider = Mock(side_effect=AssertionError("retry must not redispatch"))
++    with SynchronousExecution(
++        meter,
++        meter.get_operation(operation.operation_id),
++        kind="chat",
++        response_model=ChatResponse,
++    ) as retry:
++        assert retry.run(UsageTally(rate=meter.rate), blocked_provider, ChatResponse) == ChatResponse(
++            reply="reply"
++        )
++
++    blocked_provider.assert_not_called()
++    finalized = meter.get_operation(operation.operation_id)
++    month = meter.usage_repository.get_month(finalized.user_id, finalized.month)
++    assert (finalized.state, finalized.actual_cost_micro_usd, finalized.tokens) == (
++        "finalized",
++        17,
++        17,
++    )
++    assert (month["committed_cost_micro_usd"], month["tokens"]) == (17, 17)

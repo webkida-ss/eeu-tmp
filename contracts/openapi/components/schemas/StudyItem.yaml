@@ -1,0 +1,35 @@
+properties:
+  id:
+    type: string
+    title: Id
+    description: Opaque compatibility identifier; examples use UUID v7.
+    x-id-compatibility: legacy-string-or-uuid
+  type:
+    type: string
+    title: Type
+  text:
+    type: string
+    title: Text
+  meaning:
+    type: string
+    title: Meaning
+  part_of_speech:
+    type: string
+    title: Part Of Speech
+    default: ''
+  example:
+    type: string
+    title: Example
+    default: ''
+  sentence_ids:
+    items:
+      type: string
+    type: array
+    title: Sentence Ids
+type: object
+required:
+- id
+- type
+- text
+- meaning
+title: StudyItem

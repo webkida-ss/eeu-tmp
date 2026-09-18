@@ -1,0 +1,46 @@
+properties:
+  operation_id:
+    type: string
+    pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$
+    format: uuid
+    title: Operation Id
+    description: Opaque RFC 9562 UUID v7 idempotency identifier.
+    example: 018f47a2-7b3c-7abc-8def-0123456789ab
+  text:
+    type: string
+    maxLength: 3000
+    minLength: 1
+    title: Text
+  page_url:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Url
+  page_title:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Title
+  page_preload_id:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Preload Id
+    description: Opaque compatibility identifier; examples use UUID v7.
+    x-id-compatibility: legacy-string-or-uuid
+  target_language:
+    anyOf:
+    - type: string
+      maxLength: 16
+    - type: 'null'
+    title: Target Language
+  native_language:
+    anyOf:
+    - type: string
+      maxLength: 16
+    - type: 'null'
+    title: Native Language
+type: object
+required:
+- text
+title: AnalyzeRequest

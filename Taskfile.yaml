@@ -1,0 +1,622 @@
+version: "3"
+
+vars:
+  BACKEND_VENV: '{{default "backend/.venv" .BACKEND_VENV}}'
+  REPOSITORY_TOOLS_DIR: '{{default ".tools" .REPOSITORY_TOOLS_DIR}}'
+
+# ====================================================================================
+# Setup
+# ====================================================================================
+
+tasks:
+  setup:backend:
+    desc: Install backend development and test dependencies
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec python -m venv "{{.BACKEND_VENV}}"
+      - ./scripts/with-isolated-pypi.sh "{{.BACKEND_VENV}}/bin/python" -m pip install --index-url https://pypi.org/simple --require-hashes --requirement backend/requirements-dev.txt
+
+  setup:extension:
+    desc: Install extension development and test dependencies
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec npm ci --ignore-scripts --prefix extension
+
+  setup:agents:
+    desc: Install exact repository agent tooling without lifecycle scripts
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec npm ci --ignore-scripts
+
+  setup:tools:
+    desc: Install checksum-verified repository quality tools
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/install-actionlint.sh
+      - ./scripts/install-oasdiff.sh
+
+  setup:
+    aliases:
+      - s
+    desc: Install backend and extension test dependencies
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --verify
+      - task: setup:backend
+      - task: setup:extension
+      - task: setup:agents
+      - task: setup:tools
+
+  setup:browser:
+    aliases:
+      - sb
+    desc: Install the managed Playwright Chromium browser
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - |
+        playwright_bin="extension/node_modules/.bin/playwright"
+        if [ ! -x "${playwright_bin}" ]; then
+          echo "Playwright is not installed at ${playwright_bin}. Run './scripts/bootstrap.sh --exec npm ci --ignore-scripts --prefix extension' first." >&2
+          exit 1
+        fi
+        case "$(uname -s)" in
+          Darwin)
+            ./scripts/bootstrap.sh --exec "${playwright_bin}" install chromium
+            ;;
+          Linux)
+            if [ "${DEVCONTAINER:-0}" = "1" ]; then
+              ./scripts/bootstrap.sh --exec "${playwright_bin}" install chromium
+            else
+              ./scripts/bootstrap.sh --exec "${playwright_bin}" install --with-deps chromium
+            fi
+            ;;
+          *)
+            echo "Unsupported operating system: $(uname -s)" >&2
+            exit 1
+            ;;
+        esac
+
+# ====================================================================================
+# Dependencies
+# ====================================================================================
+
+  deps:backend:bootstrap-compiler:
+    desc: Build the isolated hash-checked Python lock compiler environment
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - rm -rf .tools/backend-lock-venv
+      - ./scripts/bootstrap.sh --exec python -m venv .tools/backend-lock-venv
+      - ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m pip install --index-url https://pypi.org/simple --require-hashes --requirement backend/requirements-lock-tools.txt
+
+  deps:backend:lock:
+    desc: Regenerate Python locks without upgrading existing pins
+    dir: "{{.ROOT_DIR}}"
+    deps:
+      - deps:backend:bootstrap-compiler
+    cmds:
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --allow-unsafe --generate-hashes --no-emit-index-url --no-upgrade --resolver=backtracking --strip-extras --output-file backend/requirements-lock-tools.txt backend/requirements-lock-tools.in
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --generate-hashes --no-emit-index-url --no-upgrade --resolver=backtracking --strip-extras --output-file backend/requirements.txt backend/requirements.in
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --generate-hashes --no-emit-index-url --no-upgrade --resolver=backtracking --strip-extras --output-file backend/requirements-dev.txt backend/requirements-dev.in
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --generate-hashes --no-emit-index-url --no-upgrade --resolver=backtracking --strip-extras --output-file backend/requirements-lambda.txt backend/requirements-lambda.in
+
+  deps:backend:upgrade:
+    desc: Explicitly upgrade and regenerate all Python locks
+    dir: "{{.ROOT_DIR}}"
+    deps:
+      - deps:backend:bootstrap-compiler
+    cmds:
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --allow-unsafe --generate-hashes --no-emit-index-url --upgrade --resolver=backtracking --strip-extras --output-file backend/requirements-lock-tools.txt backend/requirements-lock-tools.in
+      - task: deps:backend:bootstrap-compiler
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --generate-hashes --no-emit-index-url --upgrade --resolver=backtracking --strip-extras --output-file backend/requirements.txt backend/requirements.in
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --generate-hashes --no-emit-index-url --upgrade --resolver=backtracking --strip-extras --output-file backend/requirements-dev.txt backend/requirements-dev.in
+      - CUSTOM_COMPILE_COMMAND='task deps:backend:lock' ./scripts/with-isolated-pypi.sh .tools/backend-lock-venv/bin/python -m piptools compile --index-url https://pypi.org/simple --generate-hashes --no-emit-index-url --upgrade --resolver=backtracking --strip-extras --output-file backend/requirements-lambda.txt backend/requirements-lambda.in
+
+  deps:backend:check:
+    desc: Verify Python locks reproduce without upgrading
+    dir: "{{.ROOT_DIR}}"
+    deps:
+      - deps:backend:bootstrap-compiler
+    cmds:
+      - |
+        tmp_dir="$(mktemp -d)"
+        trap 'rm -rf "${tmp_dir}"' EXIT
+        cp backend/requirements-lock-tools.txt "${tmp_dir}/requirements-lock-tools.txt"
+        CUSTOM_COMPILE_COMMAND='task deps:backend:lock' \
+          ./scripts/with-isolated-pypi.sh \
+          .tools/backend-lock-venv/bin/python -m piptools compile \
+            --index-url https://pypi.org/simple \
+            --allow-unsafe \
+            --generate-hashes \
+            --no-emit-index-url \
+            --no-upgrade \
+            --quiet \
+            --resolver=backtracking \
+            --strip-extras \
+            --output-file "${tmp_dir}/requirements-lock-tools.txt" \
+            backend/requirements-lock-tools.in
+        cmp \
+          backend/requirements-lock-tools.txt \
+          "${tmp_dir}/requirements-lock-tools.txt"
+
+        for lock in requirements requirements-dev requirements-lambda; do
+          cp "backend/${lock}.txt" "${tmp_dir}/${lock}.txt"
+          CUSTOM_COMPILE_COMMAND='task deps:backend:lock' \
+            ./scripts/with-isolated-pypi.sh \
+            .tools/backend-lock-venv/bin/python -m piptools compile \
+              --index-url https://pypi.org/simple \
+              --generate-hashes \
+              --no-emit-index-url \
+              --no-upgrade \
+              --quiet \
+              --resolver=backtracking \
+              --strip-extras \
+              --output-file "${tmp_dir}/${lock}.txt" \
+              "backend/${lock}.in"
+          cmp "backend/${lock}.txt" "${tmp_dir}/${lock}.txt"
+        done
+
+  deps:extension:audit:
+    desc: Audit the locked extension dependency tree
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm audit
+
+  deps:agents:audit:
+    desc: Audit the locked root agent-tool dependency tree
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec npm audit
+
+# ====================================================================================
+# Canonical API schema
+# ====================================================================================
+
+  schema:validate:
+    desc: Lint and validate the canonical split OpenAPI schema
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - 'BACKEND_VENV="{{.BACKEND_VENV}}" "{{.BACKEND_VENV}}/bin/python" scripts/schema/schema_tasks.py validate'
+
+  schema:generate:
+    desc: Generate checked-in artifacts from canonical OpenAPI
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - 'BACKEND_VENV="{{.BACKEND_VENV}}" "{{.BACKEND_VENV}}/bin/python" scripts/schema/schema_tasks.py generate'
+
+  schema:check:
+    desc: Check schema, generated artifacts, adapter drift, and route security
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - 'ADMIN_ENABLED=false BACKEND_VENV="{{.BACKEND_VENV}}" "{{.BACKEND_VENV}}/bin/python" scripts/schema/schema_tasks.py check'
+      - 'ADMIN_ENABLED=true BACKEND_VENV="{{.BACKEND_VENV}}" "{{.BACKEND_VENV}}/bin/python" scripts/schema/schema_tasks.py check'
+
+  schema:compatibility:
+    desc: Compare canonical OpenAPI with the fail-closed merge-base contract
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - scripts/install-oasdiff.sh
+      - 'BACKEND_VENV="{{.BACKEND_VENV}}" "{{.BACKEND_VENV}}/bin/python" scripts/schema/schema_tasks.py compatibility'
+
+  api:generate:
+    desc: Alias for canonical schema generation
+    cmds:
+      - task: schema:generate
+
+  api:check:
+    desc: Alias for canonical schema checks before consumer integration
+    cmds:
+      - task: schema:check
+      - task: schema:compatibility
+
+# ====================================================================================
+# Run
+# ====================================================================================
+
+  run:backend:
+    aliases:
+      - rb
+    desc: Run the backend development server on port 18765
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - "{{.ROOT_DIR}}/{{.BACKEND_VENV}}/bin/uvicorn main:app --app-dir backend --host 127.0.0.1 --port 18765"
+
+# ====================================================================================
+# Test
+# ====================================================================================
+
+  dynamodb:up:
+    desc: Start the worktree-scoped in-memory DynamoDB Local service
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/local-dynamodb.sh up
+
+  dynamodb:down:
+    desc: Stop only this worktree's DynamoDB Local Compose project
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/local-dynamodb.sh down
+
+  test:dynamodb:automation:
+    desc: Test local DynamoDB identity, port, and environment safeguards
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/test-local-dynamodb-automation.sh
+
+  test:backend:unit:
+    aliases:
+      - tbu
+    desc: Run service-free backend unit tests
+    dir: "{{.ROOT_DIR}}/backend"
+    env:
+      AUTH_PROVIDER: mock
+      BILLING_PROVIDER: mock
+      STORAGE_BACKEND: json
+      JOB_RUNNER: inline
+      PRELOAD_CONTENT_BUCKET: ""
+      PYTHON_DOTENV_DISABLED: "1"
+      ADMIN_ENABLED: "false"
+    cmds:
+      - AUTH_PROVIDER=mock BILLING_PROVIDER=mock STORAGE_BACKEND=json JOB_RUNNER=inline PRELOAD_CONTENT_BUCKET= PYTHON_DOTENV_DISABLED=1 ADMIN_ENABLED=false "{{.ROOT_DIR}}/{{.BACKEND_VENV}}/bin/python" -m pytest -q --ignore=test_dynamodb_storage.py --ignore=test_preload_dynamodb_integration.py --ignore=test_lambda_package.py
+
+  test:backend:coverage:
+    desc: Collect service-free backend coverage without enforcing a threshold
+    dir: "{{.ROOT_DIR}}"
+    env:
+      AUTH_PROVIDER: mock
+      BILLING_PROVIDER: mock
+      STORAGE_BACKEND: json
+      JOB_RUNNER: inline
+      PRELOAD_CONTENT_BUCKET: ""
+      PYTHON_DOTENV_DISABLED: "1"
+      ADMIN_ENABLED: "false"
+    cmds:
+      - mkdir -p output/coverage/backend
+      - AUTH_PROVIDER=mock BILLING_PROVIDER=mock STORAGE_BACKEND=json JOB_RUNNER=inline PRELOAD_CONTENT_BUCKET= PYTHON_DOTENV_DISABLED=1 ADMIN_ENABLED=false "{{.BACKEND_VENV}}/bin/python" -m pytest -q backend --ignore=backend/test_dynamodb_storage.py --ignore=backend/test_preload_dynamodb_integration.py --ignore=backend/test_lambda_package.py --cov=backend --cov-report=term-missing --cov-report=xml:output/coverage/backend/coverage.xml --cov-report=json:output/coverage/backend/coverage.json --cov-report=html:output/coverage/backend/html
+
+  test:backend:integration:
+    aliases:
+      - tbi
+    desc: Run the two DynamoDB integration test files
+    dir: "{{.ROOT_DIR}}/backend"
+    cmds:
+      - '"{{.ROOT_DIR}}/{{.BACKEND_VENV}}/bin/python" -m pytest -q test_dynamodb_storage.py test_preload_dynamodb_integration.py'
+
+  test:backend:integration:local:
+    desc: Run all DynamoDB integration tests against managed DynamoDB Local
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/local-dynamodb.sh test
+
+  test:lambda:package:
+    desc: Verify the built Lambda package cold-start imports
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m pytest -q backend/test_lambda_package.py'
+
+  test:api:contract:
+    desc: Run generated and manually owned canonical contract tests
+    dir: "{{.ROOT_DIR}}/backend"
+    env:
+      AUTH_PROVIDER: mock
+      BILLING_PROVIDER: mock
+      STORAGE_BACKEND: json
+      JOB_RUNNER: inline
+      PRELOAD_CONTENT_BUCKET: ""
+      PYTHON_DOTENV_DISABLED: "1"
+      ADMIN_ENABLED: "false"
+    cmds:
+      - 'AUTH_PROVIDER=mock BILLING_PROVIDER=mock STORAGE_BACKEND=json JOB_RUNNER=inline PRELOAD_CONTENT_BUCKET= PYTHON_DOTENV_DISABLED=1 ADMIN_ENABLED=false "{{.ROOT_DIR}}/{{.BACKEND_VENV}}/bin/python" -m pytest -q test_openapi_generated_contract.py test_openapi_manual_contract.py'
+
+  test:backend:admin:
+    desc: Run admin authorization, learner transport, and contract tests with admin enabled
+    dir: "{{.ROOT_DIR}}/backend"
+    env:
+      AUTH_PROVIDER: mock
+      BILLING_PROVIDER: mock
+      STORAGE_BACKEND: json
+      JOB_RUNNER: inline
+      PRELOAD_CONTENT_BUCKET: ""
+      PYTHON_DOTENV_DISABLED: "1"
+      ADMIN_ENABLED: "true"
+    cmds:
+      - 'AUTH_PROVIDER=mock BILLING_PROVIDER=mock STORAGE_BACKEND=json JOB_RUNNER=inline PRELOAD_CONTENT_BUCKET= PYTHON_DOTENV_DISABLED=1 ADMIN_ENABLED=true "{{.ROOT_DIR}}/{{.BACKEND_VENV}}/bin/python" -m pytest -q test_admin_auth.py test_learner_suspension.py test_admin_runtime.py test_admin_transport.py test_admin_openapi.py test_openapi_operation_ids.py test_openapi_generated_contract.py test_openapi_manual_contract.py'
+
+  test:extension:package:
+    desc: Verify the release ZIP and its runtime dependency closure
+    dir: "{{.ROOT_DIR}}"
+    env:
+      AUTH_PROVIDER: mock
+      BILLING_PROVIDER: mock
+      STORAGE_BACKEND: json
+      JOB_RUNNER: inline
+      PRELOAD_CONTENT_BUCKET: ""
+      PYTHON_DOTENV_DISABLED: "1"
+      ADMIN_ENABLED: "false"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m pytest -q extension/test/test_build_release.py'
+
+  test:extension:package:smoke:
+    desc: Run the packaged-extension acceptance test in managed Chromium
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run test:package:smoke
+
+  test:extension:unit:
+    aliases:
+      - teu
+    desc: Run extension unit tests through the package script
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run test:unit
+
+  test:extension:coverage:
+    desc: Collect extension coverage without enforcing a threshold
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run test:coverage
+
+  test:extension:fidelity:
+    desc: Compare jsdom content extraction behavior with real Chromium
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run test:fidelity
+
+  test:extension:automation:static:
+    desc: Verify static browser-automation and CI contracts
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run test:automation:static
+
+  test:extension:automation:lifecycle:
+    desc: Exercise browser smoke lifecycle and artifact isolation
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run test:automation:lifecycle
+
+  test:extension:smoke:
+    aliases:
+      - tes
+    desc: Run the extension browser smoke test through Playwright
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run test:smoke
+
+  test:workflow:security:
+    desc: Verify GitHub workflow permissions and trust boundaries
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m pytest -q backend/test_github_automation.py'
+
+  test:agents:
+    desc: Test agent drift, inventory, safety, and deterministic generation
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec python3 -m unittest backend.test_agent_configuration
+
+  test:online-agents:
+    desc: Test online-agent roles, intake policy, sanitization, and deploy gates
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m pytest -q backend/test_online_agent_operations.py'
+
+  test:deploy:policy:
+    desc: Dry-run exact-plan and intake policy helpers with fake services
+    dir: "{{.ROOT_DIR}}"
+    deps:
+      - validate:aws-plan-policies
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m pytest -q backend/test_online_agent_policy_helpers.py backend/test_exact_plan_cli.py'
+
+  validate:aws-plan-policies:
+    desc: Validate environment-specific least-privilege AWS plan policies
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" scripts/validate_aws_plan_policies.py'
+
+  devcontainer:validate:
+    desc: Validate dev container security and immutable image metadata
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - "{{.BACKEND_VENV}}/bin/python scripts/validate-devcontainer.py"
+
+  devcontainer:base-lock:verify:
+    desc: Verify the immutable OCI index and platform manifests against MCR
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - "{{.BACKEND_VENV}}/bin/python scripts/verify-base-image-lock.py"
+
+  test:devcontainer:manifest:
+    desc: Test content-aware post-create workspace mutation detection
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m pytest -q backend/test_devcontainer_workspace_manifest.py'
+
+# ====================================================================================
+# Format and lint
+# ====================================================================================
+
+  format:backend:
+    desc: Format Python source and tests with Ruff
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m ruff format .'
+
+  format:backend:check:
+    desc: Check Python formatting with Ruff
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m ruff format --check .'
+
+  lint:backend:
+    desc: Lint Python source and tests with Ruff
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - '"{{.BACKEND_VENV}}/bin/python" -m ruff check .'
+
+  format:extension:
+    desc: Format hand-written extension files with Prettier
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run format
+
+  format:extension:check:
+    desc: Check extension formatting with Prettier
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run format:check
+
+  lint:extension:
+    desc: Lint hand-written extension JavaScript with ESLint
+    dir: "{{.ROOT_DIR}}/extension"
+    cmds:
+      - ../scripts/bootstrap.sh --exec npm run lint
+
+  workflow:lint:
+    desc: Lint every GitHub Actions workflow with checksum-pinned actionlint
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/install-actionlint.sh
+      - "{{.REPOSITORY_TOOLS_DIR}}/actionlint/1.7.12/bin/actionlint"
+
+  agents:preflight:
+    desc: Validate locked agent executables before repository-local execution
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec npm run agents:preflight
+
+  agents:generate:
+    desc: Generate committed agent configuration from Rulesync sources
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - task: agents:preflight
+      - ./scripts/bootstrap.sh --exec npm run agents:generate
+
+  agents:check:
+    desc: Check native Rulesync drift, inventory, safety, and determinism
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - task: agents:preflight
+      - ./scripts/bootstrap.sh --exec npm run agents:check
+
+  format:
+    desc: Format all supported repository source files
+    cmds:
+      - task: format:backend
+      - task: format:extension
+
+  format:check:
+    desc: Verify all supported repository source files are formatted
+    cmds:
+      - task: format:backend:check
+      - task: format:extension:check
+
+  lint:
+    desc: Run all repository linters
+    cmds:
+      - task: lint:backend
+      - task: lint:extension
+
+  coverage:
+    desc: Collect backend and extension coverage reports
+    cmds:
+      - task: test:backend:coverage
+      - task: test:extension:coverage
+
+# ====================================================================================
+# Infrastructure
+# ====================================================================================
+
+  infra:format:check:
+    aliases:
+      - ifc
+    desc: Check Terraform formatting
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec terraform -chdir=infra fmt -check -recursive
+
+  infra:lock:update:
+    desc: Intentionally update Terraform provider locks in place
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec terraform -chdir=infra/envs/dev providers lock -platform=darwin_arm64 -platform=darwin_amd64 -platform=linux_amd64 -platform=linux_arm64
+      - ./scripts/bootstrap.sh --exec terraform -chdir=infra/envs/prod providers lock -platform=darwin_arm64 -platform=darwin_amd64 -platform=linux_amd64 -platform=linux_arm64
+
+  infra:lock:check:
+    desc: Verify committed Terraform provider locks are current
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/check_terraform_locks.sh
+
+  infra:validate:dev:
+    desc: Initialize and validate the development Terraform environment
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec terraform -chdir=infra/envs/dev init -backend=false -input=false -lockfile=readonly
+      - ./scripts/bootstrap.sh --exec terraform -chdir=infra/envs/dev validate
+
+  infra:validate:prod:
+    desc: Initialize and validate the production Terraform environment
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - ./scripts/bootstrap.sh --exec terraform -chdir=infra/envs/prod init -backend=false -input=false -lockfile=readonly
+      - ./scripts/bootstrap.sh --exec terraform -chdir=infra/envs/prod validate
+
+  infra:validate:
+    aliases:
+      - iv
+    desc: Check formatting and validate all Terraform environments
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - task: infra:format:check
+      - task: infra:validate:dev
+      - task: infra:validate:prod
+
+  infra:test:provider-guards:
+    desc: Run offline Terraform plan-time provider guard tests with mocked AWS
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - bash ./scripts/test_terraform_provider_guards.sh
+
+# ====================================================================================
+# Build
+# ====================================================================================
+
+  build:lambda:
+    aliases:
+      - bl
+    desc: Build the Lambda deployment package
+    dir: "{{.ROOT_DIR}}"
+    env:
+      PYTHON_BIN: "{{.ROOT_DIR}}/{{.BACKEND_VENV}}/bin/python"
+    cmds:
+      - backend/scripts/build_lambda.sh
+      - task: test:lambda:package
+
+# ====================================================================================
+# Check
+# ====================================================================================
+
+  check:
+    aliases:
+      - c
+    desc: Run the repository service-free quality gate
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - task: agents:check
+      - task: test:agents
+      - task: test:online-agents
+      - task: test:deploy:policy
+      - task: workflow:lint
+      - task: test:workflow:security
+      - task: devcontainer:validate
+      - task: format:check
+      - task: lint
+      - task: schema:check
+      - task: test:api:contract
+      - task: test:backend:admin
+      - task: test:extension:package
+      - task: test:extension:automation:static
+      - task: coverage
+      - task: build:lambda
+      - task: infra:lock:check
+      - task: infra:validate

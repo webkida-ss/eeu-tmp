@@ -1,0 +1,16 @@
+--- a/extension/test/automation.test.mjs
++++ b/extension/test/automation.test.mjs
+@@ -21,11 +21,12 @@
+   assert.doesNotMatch(taskfile, /\bnpx\b|npm exec/);
+   assert.match(taskfile, /Playwright is not installed/);
+ 
+-  assert.equal(workflow.match(/run: \.\/scripts\/bootstrap\.sh$/gm)?.length, 4);
++  assert.equal(workflow.match(/run: \.\/scripts\/bootstrap\.sh$/gm)?.length, 5);
+   for (const task of [
+     'setup:agents',
+     'agents:check',
+     'test:agents',
++    'secrets:check',
+     'deps:agents:audit',
+     'setup:backend',
+     'setup:extension',

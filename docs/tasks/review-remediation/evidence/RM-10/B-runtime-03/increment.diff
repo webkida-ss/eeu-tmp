@@ -1,0 +1,839 @@
+--- before/backend/services/preloading.py
++++ after/backend/services/preloading.py
+@@ -244,6 +244,31 @@
+     )
+     reservation_enabled = bool(usage_meter and usage_meter.reservation_enabled)
+     shadow_enabled = bool(usage_meter and not reservation_enabled)
++    payload_hash = canonical_payload_hash(request, exclude={"operation_id"})
++    requested_record = repository.get_by_id(user_id, request.operation_id)
++    if requested_record and (
++        requested_record.get("payload_hash") != payload_hash
++        or requested_record.get("learner_profile_fingerprint") != learner_profile_fingerprint
++    ):
++        raise EntitlementError(
++            "Operation ID was already used for a different payload.",
++            code="operation_payload_conflict",
++            status_code=409,
++        )
++    if (
++        requested_record
++        and requested_record.get("status") == "failed_pending_release"
++        and not reservation_enabled
++    ):
++        return _to_status_response(
++            _recover_failed_content_handoff(
++                repository,
++                content_store,
++                user_id,
++                requested_record,
++                usage_meter,
++            )
++        )
+     existing = repository.get_by_page_url(user_id, request.page_url)
+     if existing and _is_fresh_processing(existing) and not reservation_enabled:
+         existing_fingerprint = existing.get(
+@@ -290,8 +315,6 @@
+         source_token_limit=source_token_limit,
+     )
+ 
+-    payload_hash = canonical_payload_hash(request, exclude={"operation_id"})
+-    requested_record = repository.get_by_id(user_id, request.operation_id)
+     existing_matches_request = bool(
+         existing
+         and existing.get("payload_hash") == payload_hash
+@@ -356,6 +379,7 @@
+             existing
+             and existing.get("operation_id") == operation.operation_id
+             and existing.get("payload_hash") == operation.payload_hash
++            and existing.get("status") != "content_pending"
+         ):
+             if (
+                 existing.get("enqueue_state") in ("pending", "queued_unconfirmed")
+@@ -603,12 +627,18 @@
+             failed = repository.get_by_id(user_id, record["id"]) or record
+             _recover_failed_content_handoff(repository, content_store, user_id, failed, usage_meter)
+         else:
++            current = repository.get_by_id(user_id, record["id"])
++            if (
++                current
++                and current.get("status") == "failed_pending_release"
++                and current.get("content_handoff_token") == handoff_token
++            ):
++                raise
+             logger.info(
+                 "preload handoff ownership changed before cleanup user=%s preload_id=%s",
+                 user_id,
+                 record["id"],
+             )
+-            current = repository.get_by_id(user_id, record["id"])
+             if current is not None:
+                 return _to_status_response(current)
+         raise
+@@ -790,16 +820,35 @@
+                 "Usage operation "
+                 f"{reservation_operation_id} is missing; refusing provider dispatch."
+             )
+-        if operation.state == "released":
+-            if record.get("status") not in ("ready", "failed"):
++        if operation.state == "released" and record.get("status") not in (
++            "ready",
++            "failed",
++            "failed_pending_usage",
++        ):
++            if record.get("status") == "processing":
+                 blocked = dict(record)
+                 blocked["status"] = "failed"
++                blocked["content_retirement_pending"] = True
+                 blocked["usage_state"] = "released"
+                 blocked["error"] = (
+                     "The usage reservation expired before analysis started. "
+                     "Please submit the article again."
+                 )
+-                repository.save(user_id, blocked, make_latest=False)
++                completed = repository.finish_processing(
++                    user_id,
++                    preload_id,
++                    learner_profile_fingerprint,
++                    blocked,
++                    expected_status="processing",
++                )
++                if completed:
++                    _retire_terminal_content(
++                        repository,
++                        content_store,
++                        user_id,
++                        blocked,
++                        learner_profile_fingerprint,
++                    )
+             return
+         if operation and operation.state == "finalized":
+             if record.get("status") in ("processing", "running"):
+@@ -807,6 +856,7 @@
+                 if crash_result and crash_result.get("kind") == "preload":
+                     interrupted = dict(record)
+                     interrupted["status"] = "failed"
++                    interrupted["content_retirement_pending"] = True
+                     interrupted["usage_state"] = "finalized_conservative"
+                     interrupted["error"] = (
+                         "Article analysis was interrupted after provider "
+@@ -831,6 +881,13 @@
+                         kind="preload",
+                         outcome="interrupted",
+                     )
++                    _retire_terminal_content(
++                        repository,
++                        content_store,
++                        user_id,
++                        interrupted,
++                        learner_profile_fingerprint,
++                    )
+                 return
+             if record.get("status") == "ready_pending_usage":
+                 repaired = dict(record)
+@@ -992,6 +1049,7 @@
+             return
+ 
+     latest = repository.get_by_page_url(user_id, page_url)
++    was_unclaimed_processing = record.get("status") == "processing"
+ 
+     lease_id = generate_uuid7()
+     lease_now = datetime.now(UTC)
+@@ -1019,7 +1077,7 @@
+             operation_id=operation_id or preload_id,
+             kind="preload",
+         )
+-    if latest and latest.get("id") != preload_id:
++    if was_unclaimed_processing and latest and latest.get("id") != preload_id:
+         superseded = dict(record)
+         superseded["status"] = "failed_pending_usage" if meter else "failed"
+         superseded["content_retirement_pending"] = True
+@@ -1096,6 +1154,7 @@
+                 )
+                 interrupted = dict(record)
+                 interrupted["status"] = "failed"
++                interrupted["content_retirement_pending"] = True
+                 interrupted["usage_state"] = (
+                     "finalized_conservative"
+                     if durable_result.get("state") == "dispatching"
+@@ -1115,18 +1174,27 @@
+                 _require_published_transition(repository, user_id, preload_id, completed)
+             finally:
+                 meter.release_execution(operation_id, lease_id)
++            if completed:
++                _retire_terminal_content(
++                    repository,
++                    content_store,
++                    user_id,
++                    interrupted,
++                    learner_profile_fingerprint,
++                )
+             return
+         try:
+             operation = meter.renew(operation_id, lease_expires_at)
+         except UsageOperationStateError:
+             blocked = dict(record)
+             blocked["status"] = "failed"
++            blocked["content_retirement_pending"] = True
+             blocked["usage_state"] = "released"
+             blocked["error"] = (
+                 "The usage reservation expired before analysis started. "
+                 "Please submit the article again."
+             )
+-            repository.finish_processing(
++            completed = repository.finish_processing(
+                 user_id,
+                 preload_id,
+                 learner_profile_fingerprint,
+@@ -1134,6 +1202,14 @@
+                 lease_id=lease_id,
+             )
+             meter.release_execution(operation_id, lease_id)
++            if completed:
++                _retire_terminal_content(
++                    repository,
++                    content_store,
++                    user_id,
++                    blocked,
++                    learner_profile_fingerprint,
++                )
+             return
+         except Exception:
+             retryable = dict(record)
+--- before/backend/repositories/page_preload_repository.py
++++ after/backend/repositories/page_preload_repository.py
+@@ -292,6 +292,7 @@
+             user_id,
+             preload_id,
+             expected_states={"pending", "queued_unconfirmed"},
++            required_status="processing",
+             enqueue_state="queued_unconfirmed",
+             submitted=True,
+         )
+@@ -301,6 +302,7 @@
+             user_id,
+             preload_id,
+             expected_states={"queued_unconfirmed", "queued"},
++            required_status=None,
+             enqueue_state="queued",
+             submitted=True,
+         )
+@@ -311,6 +313,7 @@
+         preload_id: str,
+         *,
+         expected_states: set[str],
++        required_status: str | None,
+         enqueue_state: str,
+         submitted: bool,
+     ) -> bool:
+@@ -319,7 +322,12 @@
+             current = self._find(records, user_id, preload_id)
+             if (
+                 not current
+-                or current.get("status") in {"content_pending", "failed"}
++                or (required_status is not None and current.get("status") != required_status)
++                or (
++                    required_status is None
++                    and current.get("status")
++                    in {"content_pending", "failed", "failed_pending_release"}
++                )
+                 or current.get("enqueue_state") not in expected_states
+             ):
+                 return False
+--- before/backend/repositories/dynamodb_page_preload_repository.py
++++ after/backend/repositories/dynamodb_page_preload_repository.py
+@@ -288,6 +288,7 @@
+             user_id,
+             preload_id,
+             expected_states={"pending", "queued_unconfirmed"},
++            required_status="processing",
+             enqueue_state="queued_unconfirmed",
+             submitted=True,
+         )
+@@ -297,6 +298,7 @@
+             user_id,
+             preload_id,
+             expected_states={"queued_unconfirmed", "queued"},
++            required_status=None,
+             enqueue_state="queued",
+             submitted=True,
+         )
+@@ -307,6 +309,7 @@
+         preload_id: str,
+         *,
+         expected_states: set[str],
++        required_status: str | None,
+         enqueue_state: str,
+         submitted: bool,
+     ) -> bool:
+@@ -314,7 +317,12 @@
+             current = self.get_by_id(user_id, preload_id)
+             if (
+                 not current
+-                or current.get("status") in {"content_pending", "failed"}
++                or (required_status is not None and current.get("status") != required_status)
++                or (
++                    required_status is None
++                    and current.get("status")
++                    in {"content_pending", "failed", "failed_pending_release"}
++                )
+                 or current.get("enqueue_state") not in expected_states
+             ):
+                 return False
+--- before/backend/test_preload_submission_repository.py
++++ after/backend/test_preload_submission_repository.py
+@@ -99,7 +99,58 @@
+         )
+         self.assertFalse(self.repository.mark_enqueue_submitting("u1", "op-1"))
+ 
++    def test_json_handoff_failure_requires_the_current_unclaimed_processing_owner(self) -> None:
++        winner = self.repository.create_if_absent("u1", _record(), now=self.now)
++        token = winner.record["content_handoff_token"]
++        self.assertTrue(self.repository.mark_content_available("u1", "op-1", token))
++        self.assertTrue(self.repository.fail_content_handoff("u1", "op-1", token, "queue failed"))
+ 
++        stale = self.repository.create_if_absent("u1", _record("op-stale"), now=self.now)
++        takeover = self.repository.claim_content_handoff(
++            "u1", _record("op-stale"), now=self.now + timedelta(minutes=6)
++        )
++        self.assertTrue(
++            self.repository.mark_content_available(
++                "u1", "op-stale", takeover.record["content_handoff_token"]
++            )
++        )
++        self.assertFalse(
++            self.repository.fail_content_handoff(
++                "u1", "op-stale", stale.record["content_handoff_token"], "queue failed"
++            )
++        )
++
++        expired = self.repository.create_if_absent("u1", _record("op-expired"), now=self.now)
++        expired_record = dict(expired.record)
++        expired_record["content_handoff_expires_at"] = (self.now - timedelta(minutes=1)).isoformat()
++        self.repository.save("u1", expired_record, make_latest=False)
++        self.assertFalse(
++            self.repository.fail_content_handoff(
++                "u1", "op-expired", expired.record["content_handoff_token"], "queue failed"
++            )
++        )
++
++        active = self.repository.create_if_absent("u1", _record("op-active"), now=self.now)
++        active_token = active.record["content_handoff_token"]
++        self.assertTrue(self.repository.mark_content_available("u1", "op-active", active_token))
++        claimed = self.repository.claim_processing(
++            "u1", "op-active", "profile-a", lease_id="worker-lease", now=self.now
++        )
++        self.assertIsNotNone(claimed)
++        self.assertFalse(
++            self.repository.fail_content_handoff("u1", "op-active", active_token, "queue failed")
++        )
++        terminal = {**claimed, "status": "ready"}
++        self.assertTrue(
++            self.repository.finish_processing(
++                "u1", "op-active", "profile-a", terminal, lease_id="worker-lease"
++            )
++        )
++        self.assertFalse(
++            self.repository.fail_content_handoff("u1", "op-active", active_token, "queue failed")
++        )
++
++
+ class _FakeDynamoStore:
+     table_name = "preloads"
+ 
+@@ -189,7 +240,11 @@
+         self.attributes[(pk, sk)] = dict(extra_attributes or {})
+         return True
+ 
++    def put_document(self, pk, sk, document, *, extra_attributes=None):
++        self.documents[(pk, sk)] = dict(document)
++        self.attributes[(pk, sk)] = dict(extra_attributes or {})
+ 
++
+ def _deserialize_attribute(value: dict[str, object]) -> object:
+     if "S" in value:
+         return value["S"]
+@@ -353,6 +408,61 @@
+             )
+         )
+ 
++    def test_dynamo_handoff_failure_requires_the_current_unclaimed_processing_owner(self) -> None:
++        store = _FakeDynamoStore()
++        repository = DynamoPagePreloadRepository(store)
++        now = datetime.now(UTC)
++        winner = repository.create_if_absent("u1", _record(), now=now)
++        token = winner.record["content_handoff_token"]
++        self.assertTrue(repository.mark_content_available("u1", "op-1", token))
++        self.assertTrue(repository.fail_content_handoff("u1", "op-1", token, "queue failed"))
++        self.assertFalse(repository.mark_enqueue_submitting("u1", "op-1"))
++
++        stale = repository.create_if_absent("u1", _record("op-stale"), now=now)
++        takeover = repository.claim_content_handoff(
++            "u1", _record("op-stale"), now=now + timedelta(minutes=6)
++        )
++        self.assertTrue(
++            repository.mark_content_available(
++                "u1", "op-stale", takeover.record["content_handoff_token"]
++            )
++        )
++        self.assertFalse(
++            repository.fail_content_handoff(
++                "u1", "op-stale", stale.record["content_handoff_token"], "queue failed"
++            )
++        )
++
++        expired = repository.create_if_absent("u1", _record("op-expired"), now=now)
++        expired_record = dict(expired.record)
++        expired_record["content_handoff_expires_at"] = (now - timedelta(minutes=1)).isoformat()
++        repository.save("u1", expired_record, make_latest=False)
++        self.assertFalse(
++            repository.fail_content_handoff(
++                "u1", "op-expired", expired.record["content_handoff_token"], "queue failed"
++            )
++        )
++
++        active = repository.create_if_absent("u1", _record("op-active"), now=now)
++        active_token = active.record["content_handoff_token"]
++        self.assertTrue(repository.mark_content_available("u1", "op-active", active_token))
++        claimed = repository.claim_processing(
++            "u1", "op-active", "profile-a", lease_id="worker-lease", now=now
++        )
++        self.assertIsNotNone(claimed)
++        self.assertFalse(
++            repository.fail_content_handoff("u1", "op-active", active_token, "queue failed")
++        )
++        terminal = {**claimed, "status": "ready"}
++        self.assertTrue(
++            repository.finish_processing(
++                "u1", "op-active", "profile-a", terminal, lease_id="worker-lease"
++            )
++        )
++        self.assertFalse(
++            repository.fail_content_handoff("u1", "op-active", active_token, "queue failed")
++        )
++
+     def test_dynamo_legacy_page_record_is_materialized_before_index_replacement(self) -> None:
+         store = _FakeDynamoStore()
+         page_key = (user_pk("u1"), preload_sk("https://example.com/article"))
+@@ -460,3 +570,20 @@
+         self.assertIsNone(store.get("u1", "op-1"))
+         client.put_object.reset_mock()
+         self.assertTrue(store.put_if_absent("u1", "op-1", "late after lifecycle expiry"))
++
++    def test_s3_retirement_failure_propagates_and_a_later_retry_succeeds(self) -> None:
++        client = mock.Mock()
++        client.put_object.side_effect = [
++            ClientError(
++                {"Error": {"Code": "SlowDown"}, "ResponseMetadata": {"HTTPStatusCode": 503}},
++                "PutObject",
++            ),
++            {},
++        ]
++        store = S3PreloadContentStore("bucket")
++        store._client = client
++
++        with self.assertRaises(ClientError):
++            store.retire("u1", "op-1")
++        self.assertTrue(store.retire("u1", "op-1"))
++        self.assertEqual(client.put_object.call_args.kwargs["Body"], b"")
+--- before/backend/test_preload_jobs.py
++++ after/backend/test_preload_jobs.py
+@@ -839,47 +839,35 @@
+         self.assertGreater(operation.reserved_cost_micro_usd, 0)
+         self.assertEqual(runner.calls[0][4]["operation_id"], request.operation_id)
+ 
+-    def test_enqueue_failure_releases_reservation_and_marks_failed(self):
++    def test_enqueue_failure_retains_reservation_when_dispatch_is_ambiguous(self):
+         runner = _UsageAwareRunner(self.usage, fail=True)
+         request = self._request()
+-
+-        with self.assertRaisesRegex(RuntimeError, "queue unavailable"):
+-            reading.submit_preload(
+-                self.preloads,
+-                runner,
+-                self.content,
+-                "u1",
+-                request,
+-                usage_meter=self._meter(),
+-            )
+ 
+-        operation = self.usage.get_operation("u1", request.operation_id)
+-        record = self.preloads.get_by_id("u1", request.operation_id)
+-        self.assertEqual(operation.state, "released")
+-        self.assertEqual(operation.release_reason, "enqueue_failed")
+-        self.assertEqual(record["status"], "failed")
+-        self.assertEqual(record["usage_state"], "released")
+-        self.assertIsNone(self.content.get("u1", request.operation_id))
+-
+-        retry_runner = _UsageAwareRunner(self.usage)
+-        replay = reading.submit_preload(
++        response = reading.submit_preload(
+             self.preloads,
+-            retry_runner,
++            runner,
+             self.content,
+             "u1",
+             request,
+             usage_meter=self._meter(),
+         )
+-        self.assertEqual(replay.status, "failed")
+-        self.assertEqual(retry_runner.calls, [])
+ 
++        operation = self.usage.get_operation("u1", request.operation_id)
++        record = self.preloads.get_by_id("u1", request.operation_id)
++        self.assertEqual(response.status, "processing")
++        self.assertEqual(operation.state, "reserved")
++        self.assertEqual(record["status"], "processing")
++        self.assertEqual(record["enqueue_state"], "queued_unconfirmed")
++        self.assertIsNotNone(self.content.get("u1", request.operation_id))
++
+     def test_content_store_failure_releases_reservation(self):
+         runner = _UsageAwareRunner(self.usage)
+         request = self._request().model_copy(
+             update={"operation_id": "019b63f8-f600-7000-8000-000000000060"}
+         )
+         failing_content = mock.Mock()
+-        failing_content.put.side_effect = RuntimeError("content unavailable")
++        failing_content.get.return_value = None
++        failing_content.put_if_absent.side_effect = RuntimeError("content unavailable")
+ 
+         with self.assertRaisesRegex(RuntimeError, "content unavailable"):
+             reading.submit_preload(
+@@ -895,7 +883,7 @@
+         self.assertEqual(operation.state, "released")
+         self.assertEqual(runner.calls, [])
+ 
+-    def test_preload_repository_failure_releases_reservation(self):
++    def test_conditional_creation_failure_retains_ambiguous_reservation(self):
+         runner = _UsageAwareRunner(self.usage)
+         request = self._request().model_copy(
+             update={"operation_id": "019b63f8-f600-7000-8000-000000000061"}
+@@ -904,7 +892,7 @@
+         with (
+             mock.patch.object(
+                 self.preloads,
+-                "save",
++                "create_if_absent",
+                 side_effect=RuntimeError("preload unavailable"),
+             ),
+             self.assertRaisesRegex(RuntimeError, "preload unavailable"),
+@@ -919,12 +907,19 @@
+             )
+ 
+         operation = self.usage.get_operation("u1", request.operation_id)
+-        self.assertEqual(operation.state, "released")
++        self.assertEqual(operation.state, "reserved")
+         self.assertIsNone(self.content.get("u1", request.operation_id))
+         self.assertEqual(runner.calls, [])
+ 
+-    def test_enqueue_and_release_failure_recovers_without_overwriting_latest(self):
+-        failing_runner = _UsageAwareRunner(self.usage, fail=True)
++    def test_pre_enqueue_release_failure_recovers_without_overwriting_latest(self):
++        class PreEnqueueFailureRepository(JsonPagePreloadRepository):
++            def mark_enqueue_submitting(self, user_id, preload_id):
++                if preload_id == "019b63f8-f600-7000-8000-000000000064":
++                    return False
++                return super().mark_enqueue_submitting(user_id, preload_id)
++
++        repository = PreEnqueueFailureRepository(Path(self._tmpdir.name) / "preloads.json")
++        runner = _UsageAwareRunner(self.usage)
+         old_request = self._request().model_copy(
+             update={"operation_id": "019b63f8-f600-7000-8000-000000000064"}
+         )
+@@ -939,17 +934,17 @@
+             self.assertRaises(RuntimeError),
+         ):
+             reading.submit_preload(
+-                self.preloads,
+-                failing_runner,
++                repository,
++                runner,
+                 self.content,
+                 "u1",
+                 old_request,
+                 usage_meter=old_meter,
+             )
+ 
+-        pending = self.preloads.get_by_id("u1", old_request.operation_id)
++        pending = repository.get_by_id("u1", old_request.operation_id)
+         self.assertEqual(pending["status"], "failed_pending_release")
+-        self.assertEqual(pending["usage_state"], "pending_release")
++        self.assertEqual(pending["usage_state"], "reserved")
+         self.assertIsNotNone(self.content.get("u1", old_request.operation_id))
+ 
+         new_request = self._request().model_copy(
+@@ -957,7 +952,7 @@
+         )
+         new_runner = _UsageAwareRunner(self.usage)
+         reading.submit_preload(
+-            self.preloads,
++            repository,
+             new_runner,
+             self.content,
+             "u1",
+@@ -966,7 +961,7 @@
+         )
+ 
+         replay = reading.submit_preload(
+-            self.preloads,
++            repository,
+             new_runner,
+             self.content,
+             "u1",
+@@ -976,7 +971,7 @@
+ 
+         self.assertEqual(replay.status, "failed")
+         self.assertEqual(
+-            self.preloads.get_by_page_url("u1", _PAGE_URL)["id"],
++            repository.get_by_page_url("u1", _PAGE_URL)["id"],
+             new_request.operation_id,
+         )
+         self.assertIsNone(self.content.get("u1", old_request.operation_id))
+--- before/backend/test_preload_handoff_workflow.py
++++ after/backend/test_preload_handoff_workflow.py
+@@ -152,6 +152,50 @@
+         return super().retire(user_id, preload_id)
+ 
+ 
++class FailPublicationAndRetirementContentStore(FilesystemPreloadContentStore):
++    def __init__(self, base_dir: Path) -> None:
++        super().__init__(base_dir)
++        self._publication_failed = False
++        self.retirement_calls = 0
++
++    def put_if_absent(self, user_id: str, preload_id: str, content: str) -> bool:
++        if not self._publication_failed:
++            self._publication_failed = True
++            raise OSError("simulated content publication failure")
++        return super().put_if_absent(user_id, preload_id, content)
++
++    def retire(self, user_id: str, preload_id: str) -> bool:
++        self.retirement_calls += 1
++        if self.retirement_calls == 1:
++            raise OSError("simulated retirement failure")
++        return super().retire(user_id, preload_id)
++
++
++class AdvancedWinnerOnEnqueueJsonRepository(JsonPagePreloadRepository):
++    def __init__(self, path: Path) -> None:
++        super().__init__(path)
++        self._advance_once = True
++
++    def mark_enqueue_submitting(self, user_id: str, preload_id: str) -> bool:
++        if self._advance_once:
++            self._advance_once = False
++            record = self.get_by_id(user_id, preload_id)
++            if record is None:
++                raise AssertionError("The competing worker requires a preload record")
++            claimed = self.claim_processing(
++                user_id,
++                preload_id,
++                str(record["learner_profile_fingerprint"]),
++                lease_id="advanced-winner-lease",
++                now=datetime.now(UTC),
++                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
++            )
++            if claimed is None:
++                raise AssertionError("The competing worker could not claim the preload")
++            return False
++        return super().mark_enqueue_submitting(user_id, preload_id)
++
++
+ class PreloadHandoffWorkflowTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self._rate_environment = _rate_environment()
+@@ -183,14 +227,22 @@
+             reservation_enabled=True,
+         )
+ 
+-    def _submit(self, repository, runner, content_store):
++    def _shadow_meter(self) -> UsageMeter:
++        return UsageMeter(
++            self.subscriptions,
++            self.usage,
++            _USER_ID,
++            reservation_enabled=False,
++        )
++
++    def _submit(self, repository, runner, content_store, *, request=None, meter=None):
+         return preloading.submit_preload(
+             repository,
+             runner,
+             content_store,
+             _USER_ID,
+-            self._request(),
+-            usage_meter=self._meter(),
++            request or self._request(),
++            usage_meter=meter or self._meter(),
+         )
+ 
+     def _run_job(self, repository, runner, content_store) -> None:
+@@ -207,6 +259,20 @@
+                 *runner.calls[0],
+             )
+ 
++    def _run_job_without_provider(self, repository, runner, content_store) -> None:
++        with mock.patch.object(
++            preloading,
++            "_split_sentences",
++            side_effect=AssertionError("provider work must not replay"),
++        ):
++            preloading.run_preload_job(
++                repository,
++                self.subscriptions,
++                self.usage,
++                content_store,
++                *runner.calls[0],
++            )
++
+     def _expire_handoff(self, repository) -> None:
+         record = repository.get_by_id(_USER_ID, _OPERATION_ID)
+         self.assertIsNotNone(record)
+@@ -353,6 +419,86 @@
+         self.assertEqual(len(runner.calls), 1)
+         self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
+ 
++    def test_shadow_replay_keeps_operation_identity_and_rejects_changed_payload(self) -> None:
++        repository = JsonPagePreloadRepository(self.preload_path)
++        content = FilesystemPreloadContentStore(self.content_dir)
++        runner = RecordingRunner()
++        shadow_meter = self._shadow_meter()
++
++        self._submit(repository, runner, content, meter=shadow_meter)
++        self._submit(repository, runner, content, meter=shadow_meter)
++        winner = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        conflicting_request = self._request().model_copy(update={"html": _CONFLICTING_PAGE_HTML})
++
++        with self.assertRaises(EntitlementError) as raised:
++            self._submit(
++                repository,
++                runner,
++                content,
++                request=conflicting_request,
++                meter=shadow_meter,
++            )
++
++        self.assertEqual(raised.exception.status_code, 409)
++        current = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(current["id"], _OPERATION_ID)
++        self.assertEqual(current["operation_id"], _OPERATION_ID)
++        self.assertEqual(current["shadow_usage"]["operation_id"], _OPERATION_ID)
++        self.assertEqual(current["payload_hash"], winner["payload_hash"])
++        self.assertEqual(len(runner.calls), 1)
++        self.assertIsNone(shadow_meter.get_operation(_OPERATION_ID))
++        self.assertIsNone(self.usage.get_operation(_USER_ID, _OPERATION_ID))
++
++    def test_shadow_failed_handoff_retries_retirement_without_usage_release(self) -> None:
++        repository = JsonPagePreloadRepository(self.preload_path)
++        content = FailPublicationAndRetirementContentStore(self.content_dir)
++        runner = RecordingRunner()
++        shadow_meter = self._shadow_meter()
++
++        try:
++            self._submit(repository, runner, content, meter=shadow_meter)
++        except OSError as exc:
++            self.assertIn("simulated", str(exc))
++
++        pending = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(pending["status"], "failed_pending_release")
++        self.assertEqual(content.retirement_calls, 1)
++        with mock.patch.object(
++            shadow_meter,
++            "release",
++            side_effect=AssertionError("shadow mode must not release a reservation"),
++        ):
++            replay = self._submit(repository, runner, content, meter=shadow_meter)
++
++        recovered = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(replay.status, "failed")
++        self.assertEqual(recovered["status"], "failed")
++        self.assertFalse(recovered["content_retirement_pending"])
++        self.assertEqual(content.retirement_calls, 2)
++        self.assertIsNone(content.get(_USER_ID, _OPERATION_ID))
++        self.assertIsNone(shadow_meter.get_operation(_OPERATION_ID))
++        self.assertIsNone(self.usage.get_operation(_USER_ID, _OPERATION_ID))
++
++    def test_advanced_winner_rejects_stale_submitter_release_and_retirement(self) -> None:
++        repository = AdvancedWinnerOnEnqueueJsonRepository(self.preload_path)
++        content = FilesystemPreloadContentStore(self.content_dir)
++        runner = RecordingRunner()
++        meter = self._meter()
++
++        with mock.patch.object(
++            meter,
++            "release",
++            side_effect=AssertionError("a stale submitter must not release the winner"),
++        ):
++            self._submit(repository, runner, content, meter=meter)
++
++        current = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(current["status"], "running")
++        self.assertEqual(current["lease_id"], "advanced-winner-lease")
++        self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
++        self.assertEqual(runner.calls, [])
++        self.assertEqual(meter.get_operation(_OPERATION_ID).state, "reserved")
++
+     def test_stale_publication_cannot_recreate_content_after_winner_retires(self) -> None:
+         first_repository = JsonPagePreloadRepository(self.preload_path)
+         winner_repository = JsonPagePreloadRepository(self.preload_path)
+@@ -494,6 +640,61 @@
+         self.assertIsNone(content.get(_USER_ID, _OPERATION_ID))
+         self.assertEqual(content.retirement_calls, 2)
+ 
++    def test_terminal_recovery_retries_retirement_without_provider_work(self) -> None:
++        for outcome in ("released", "interrupted"):
++            with self.subTest(outcome=outcome):
++                operation_id = (
++                    "019b63f8-f600-7000-8000-000000000103"
++                    if outcome == "released"
++                    else "019b63f8-f600-7000-8000-000000000104"
++                )
++                request = self._request().model_copy(
++                    update={
++                        "operation_id": operation_id,
++                        "page_url": f"{_PAGE_URL}/{outcome}",
++                    }
++                )
++                repository = JsonPagePreloadRepository(self.preload_path)
++                content = FailOnceRetirementContentStore(self.content_dir / outcome)
++                runner = RecordingRunner()
++                meter = self._meter()
++                self._submit(repository, runner, content, request=request, meter=meter)
+ 
++                if outcome == "released":
++                    meter.release(operation_id, "simulated expiration")
++                else:
++                    operation = meter.get_operation(operation_id)
++                    meter.save_result(
++                        operation_id,
++                        {
++                            "kind": "preload",
++                            "state": "dispatching",
++                            "usage": {
++                                "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
++                            },
++                        },
++                    )
++                    meter.finalize(
++                        operation_id,
++                        {
++                            "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
++                        },
++                        result_ref=operation_id,
++                    )
++
++                self._run_job_without_provider(repository, runner, content)
++                first = repository.get_by_id(_USER_ID, operation_id)
++                self.assertEqual(first["status"], "failed")
++                self.assertTrue(first["content_retirement_pending"])
++                self.assertIsNotNone(content.get(_USER_ID, operation_id))
++
++                self._run_job_without_provider(repository, runner, content)
++                recovered = repository.get_by_id(_USER_ID, operation_id)
++                self.assertEqual(recovered["status"], "failed")
++                self.assertFalse(recovered["content_retirement_pending"])
++                self.assertIsNone(content.get(_USER_ID, operation_id))
++                self.assertEqual(content.retirement_calls, 2)
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,53 @@
+properties:
+  operation_id:
+    type: string
+    pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$
+    format: uuid
+    title: Operation Id
+    description: Opaque RFC 9562 UUID v7 idempotency identifier.
+    example: 018f47a2-7b3c-7abc-8def-0123456789ab
+  page_url:
+    type: string
+    maxLength: 4096
+    minLength: 1
+    title: Page Url
+  page_title:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Title
+  html:
+    type: string
+    maxLength: 500000
+    minLength: 1
+    title: Html
+  learner_level:
+    anyOf:
+    - type: string
+      maxLength: 500
+    - type: 'null'
+    title: Learner Level
+  target_language:
+    anyOf:
+    - type: string
+      maxLength: 16
+    - type: 'null'
+    title: Target Language
+  native_language:
+    anyOf:
+    - type: string
+      maxLength: 16
+    - type: 'null'
+    title: Native Language
+  vocabulary_coverage_percent:
+    anyOf:
+    - type: number
+      maximum: 50.0
+      minimum: 1.0
+    - type: 'null'
+    title: Vocabulary Coverage Percent
+type: object
+required:
+- page_url
+- html
+title: PagePreloadRequest

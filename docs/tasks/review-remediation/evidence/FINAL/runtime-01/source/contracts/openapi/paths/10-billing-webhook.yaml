@@ -1,0 +1,95 @@
+post:
+  summary: Billing Webhook
+  operationId: processBillingWebhook
+  parameters:
+  - name: Stripe-Signature
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Stripe-Signature
+    example: t=1700000000,v1=fake-local-signature
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties:
+              type: string
+            title: Response Processbillingwebhook
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                status: applied
+    '400':
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The request is invalid.
+    '413':
+      description: Request body too large
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Webhook payload is too large.
+    '500':
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The request could not be completed.
+    '422':
+      description: Validation Error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/HTTPValidationError.yaml
+          example:
+            detail:
+            - type: value_error
+              loc:
+              - body
+              - field
+              msg: Request validation failed.
+              input: null
+  x-max-body-bytes: 262144
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          additionalProperties: true
+        examples:
+          happy:
+            summary: Deterministic local request
+            x-contract-test-case: happy
+            value:
+              id: evt_test_0001
+              type: customer.subscription.updated
+              data:
+                object:
+                  id: sub_test_0001
+                  customer: cus_test_0001
+  x-contract-test:
+    mode: manual
+    auth: stripeSignature
+    setup: signedWebhook
+    owner: billing-security
+    reason: Signature verification depends on exact raw bytes.
+    test: backend/test_openapi_manual_contract.py::test_process_billing_webhook
+  security:
+  - stripeSignature: []

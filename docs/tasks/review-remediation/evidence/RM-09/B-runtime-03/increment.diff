@@ -1,0 +1,277 @@
+diff --git a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/source/backend/accounts/billing/stripe_billing.py b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/accounts/billing/stripe_billing.py
+index 435d7f5..0626273 100644
+--- a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/source/backend/accounts/billing/stripe_billing.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/accounts/billing/stripe_billing.py
+@@ -99,6 +99,13 @@ class StripeBillingProvider:
+                 "success_url": success_url,
+                 "cancel_url": cancel_url,
+                 "client_reference_id": user.id,
++                "subscription_data": {
++                    "metadata": {
++                        "user_id": user.id,
++                        "plan": plan_id,
++                        "checkout_operation_id": operation_id,
++                    }
++                },
+                 "metadata": {
+                     "user_id": user.id,
+                     "plan": plan_id,
+diff --git a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/source/backend/accounts/services/billing_flow.py b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/accounts/services/billing_flow.py
+index f6a9173..e5f61d6 100644
+--- a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/source/backend/accounts/services/billing_flow.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/accounts/services/billing_flow.py
+@@ -548,11 +548,11 @@ def handle_webhook(
+             isinstance(known_subscription_id, str)
+             and known_subscription_id
+             and known_subscription_id != snapshot.stripe_subscription_id
+-            and existing.get("status") in {"active", "trialing"}
++            and existing.get("status") not in _TERMINAL_SUBSCRIPTION_STATUSES
+         ):
+-            if snapshot.status in {"active", "trialing"}:
++            if snapshot.status not in _TERMINAL_SUBSCRIPTION_STATUSES:
+                 raise _safe_checkout_conflict(
+-                    "Concurrent live subscriptions require reconciliation."
++                    "Differing nonterminal subscriptions require reconciliation."
+                 )
+             return "ignored_mismatch"
+         candidate = {
+diff --git a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/source/backend/test_billing.py b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/test_billing.py
+index 16ce27e..ef763d8 100644
+--- a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/source/backend/test_billing.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/test_billing.py
+@@ -432,6 +432,180 @@ class AuthoritativeWebhookReconciliationTests(unittest.TestCase):
+         self.assertEqual(record["status"], "canceled")
+         self.assertNotEqual(resolve_plan_id(record), "pro")
+ 
++    def test_differing_nonterminal_subscription_cannot_replace_tracked_resource(self):
++        for status in ("past_due", "paused", "incomplete", "unpaid", "unknown"):
++            with self.subTest(status=status):
++                self.subs.upsert(
++                    "u1",
++                    {
++                        "plan": "pro",
++                        "status": status,
++                        "stripe_customer_id": "cus_1",
++                        "stripe_subscription_id": "sub_tracked",
++                    },
++                )
++                provider = _LifecycleProvider(
++                    self._event(f"evt_{status}", subscription_id="sub_new"),
++                    [self._snapshot(subscription_id="sub_new")],
++                )
++
++                with self.assertRaises(BillingError) as context:
++                    billing_flow.handle_webhook(
++                        self.subs,
++                        provider,
++                        b"{}",
++                        "sig",
++                        plans=PLAN_CATALOG,
++                    )
++                self.assertEqual(context.exception.status_code, 409)
++                self.assertEqual(self.subs.get("u1")["stripe_subscription_id"], "sub_tracked")
++
++    def test_unrelated_terminal_resource_cannot_replace_a_tracked_nonterminal_subscription(self):
++        self.subs.upsert(
++            "u1",
++            {
++                "plan": "pro",
++                "status": "past_due",
++                "stripe_customer_id": "cus_1",
++                "stripe_subscription_id": "sub_tracked",
++            },
++        )
++        provider = _LifecycleProvider(
++            self._event("evt_unrelated_canceled", subscription_id="sub_old"),
++            [replace(self._snapshot(subscription_id="sub_old", status="canceled"), plan=None)],
++        )
++
++        result = billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++
++        self.assertEqual(result, "ignored_mismatch")
++        self.assertEqual(self.subs.get("u1")["stripe_subscription_id"], "sub_tracked")
++
++    def test_simultaneous_handlers_refresh_after_a_real_competing_cas(self):
++        shared_state = InMemorySubscriptionRepository.shared_state()
++        initial_retrieval_barrier = threading.Barrier(2)
++        winner_committed = threading.Event()
++
++        class _WinnerRepository(InMemorySubscriptionRepository):
++            def compare_and_swap(self, user_id, record, *, expected_revision):
++                persisted = super().compare_and_swap(
++                    user_id,
++                    record,
++                    expected_revision=expected_revision,
++                )
++                if persisted is not None:
++                    winner_committed.set()
++                return persisted
++
++        class _LoserRepository(InMemorySubscriptionRepository):
++            def __init__(self, state):
++                super().__init__(state)
++                self.first_write = True
++
++            def compare_and_swap(self, user_id, record, *, expected_revision):
++                if self.first_write:
++                    self.first_write = False
++                    if not winner_committed.wait(timeout=1):
++                        raise AssertionError("winner did not commit before stale CAS")
++                return super().compare_and_swap(
++                    user_id,
++                    record,
++                    expected_revision=expected_revision,
++                )
++
++        first_repository = _WinnerRepository(shared_state)
++        second_repository = _LoserRepository(shared_state)
++
++        class _BarrierProvider(_LifecycleProvider):
++            def retrieve_subscription(self, stripe_subscription_id):
++                if self.retrievals == 0:
++                    try:
++                        initial_retrieval_barrier.wait(timeout=1)
++                    except threading.BrokenBarrierError as exc:
++                        raise AssertionError("handlers did not reach initial retrieval") from exc
++                return super().retrieve_subscription(stripe_subscription_id)
++
++        first_provider = _BarrierProvider(
++            self._event("evt_winner"),
++            [replace(self._snapshot(status="canceled"), plan=None)],
++        )
++        second_provider = _BarrierProvider(
++            self._event("evt_loser"),
++            [
++                self._snapshot(status="active"),
++                replace(self._snapshot(status="canceled"), plan=None),
++            ],
++        )
++
++        with ThreadPoolExecutor(max_workers=2) as executor:
++            results = list(
++                executor.map(
++                    lambda inputs: billing_flow.handle_webhook(
++                        inputs[0],
++                        inputs[1],
++                        b"{}",
++                        "sig",
++                        plans=PLAN_CATALOG,
++                    ),
++                    (
++                        (first_repository, first_provider),
++                        (second_repository, second_provider),
++                    ),
++                )
++            )
++
++        self.assertEqual(results, ["applied", "applied"])
++        self.assertEqual(first_provider.retrievals, 1)
++        self.assertEqual(second_provider.retrievals, 2)
++        self.assertEqual(first_repository.get("u1")["status"], "canceled")
++        self.assertEqual(
++            set(first_repository.get("u1")["processed_billing_events"]),
++            {"evt_winner", "evt_loser"},
++        )
++
++    def test_evicted_event_replay_fetches_current_state_instead_of_using_old_payload(self):
++        for index in range(billing_flow._EVENT_HISTORY_LIMIT + 1):
++            provider = _LifecycleProvider(
++                self._event(f"evt_{index}"),
++                [self._snapshot()],
++            )
++            billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++        processed = self.subs.get("u1")["processed_billing_events"]
++        self.assertEqual(len(processed), billing_flow._EVENT_HISTORY_LIMIT)
++        self.assertNotIn("evt_0", processed)
++
++        provider = _LifecycleProvider(
++            self._event("evt_0"),
++            [replace(self._snapshot(status="canceled"), plan=None)],
++        )
++
++        billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++
++        self.assertEqual(provider.retrievals, 1)
++        self.assertEqual(self.subs.get("u1")["status"], "canceled")
++        self.assertEqual(
++            len(self.subs.get("u1")["processed_billing_events"]),
++            billing_flow._EVENT_HISTORY_LIMIT,
++        )
++
++    def test_malformed_or_unsupported_active_snapshot_does_not_grant_access(self):
++        for snapshot in (
++            replace(self._snapshot(), plan=None),
++            replace(self._snapshot(), current_period_end=True),
++        ):
++            with self.subTest(snapshot=snapshot):
++                provider = _LifecycleProvider(self._event("evt_malformed"), [snapshot])
++
++                with self.assertRaises(BillingError) as context:
++                    billing_flow.handle_webhook(
++                        self.subs,
++                        provider,
++                        b"{}",
++                        "sig",
++                        plans=PLAN_CATALOG,
++                    )
++                self.assertEqual(context.exception.status_code, 409)
++                self.assertIsNone(self.subs.get("u1"))
++
+     def test_cas_conflict_retrieves_a_fresh_provider_snapshot_before_commit(self):
+         class _ConflictOnceRepository(JsonSubscriptionRepository):
+             def __init__(self, path):
+@@ -690,6 +864,13 @@ class StripeProviderCustomerIdTests(unittest.TestCase):
+             cancel_url="http://c",
+             client_reference_id="u1",
+             customer_email="u1@example.com",
++            subscription_data={
++                "metadata": {
++                    "user_id": "u1",
++                    "plan": "pro",
++                    "checkout_operation_id": "019c0000-0000-7000-8000-000000000001",
++                }
++            },
+             metadata={
+                 "user_id": "u1",
+                 "plan": "pro",
+@@ -840,7 +1021,7 @@ class StripeProviderCustomerIdTests(unittest.TestCase):
+         self.assertEqual(snapshot.current_period_end, 1_900_000_000)
+         retrieve.assert_called_once_with("sub_1", expand=["items.data.price"])
+ 
+-    def test_legacy_pending_idempotency_replay_does_not_add_subscription_metadata(self):
++    def test_pending_idempotency_replay_keeps_the_complete_a_request_shape(self):
+         with tempfile.TemporaryDirectory() as directory:
+             repository = JsonSubscriptionRepository(Path(directory) / "subscriptions.json")
+             repository.upsert(
+@@ -881,7 +1062,30 @@ class StripeProviderCustomerIdTests(unittest.TestCase):
+                     cancel_url="https://app.example/cancel",
+                 )
+ 
+-            self.assertNotIn("subscription_data", create_session.call_args.kwargs)
++            self.assertEqual(
++                create_session.call_args.kwargs,
++                {
++                    "mode": "subscription",
++                    "line_items": [{"price": "price_pro", "quantity": 1}],
++                    "success_url": "https://app.example/success",
++                    "cancel_url": "https://app.example/cancel",
++                    "client_reference_id": "u1",
++                    "customer_email": "u1@example.com",
++                    "subscription_data": {
++                        "metadata": {
++                            "user_id": "u1",
++                            "plan": "pro",
++                            "checkout_operation_id": "019c0000-0000-7000-8000-000000000001",
++                        }
++                    },
++                    "metadata": {
++                        "user_id": "u1",
++                        "plan": "pro",
++                        "checkout_operation_id": "019c0000-0000-7000-8000-000000000001",
++                    },
++                    "idempotency_key": "legacy-key",
++                },
++            )
+ 
+     def test_checkout_completion_preserves_verified_reference_and_customer_identity(self):
+         stripe = SimpleNamespace(

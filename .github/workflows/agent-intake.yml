@@ -1,0 +1,86 @@
+name: Agent Intake Policy Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Existing repository issue number to sanitize
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: agent-intake-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  sanitize:
+    name: Validate and sanitize agent intake
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout protected default branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Record checked-out commit
+        id: checkout
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Gate identity and fetch minimal issue metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTED_AGENT_ACTOR_IDS: ${{ vars.TRUSTED_AGENT_ACTOR_IDS }}
+          POLICY_ACTOR_ID: ${{ github.actor_id }}
+          POLICY_REPOSITORY: ${{ github.repository }}
+          POLICY_GIT_REF: ${{ github.ref }}
+          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
+          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
+          POLICY_RUN_ID: ${{ github.run_id }}
+          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          python scripts/online_agent_policy.py intake \
+            --output _agent-intake/raw.json \
+            --trusted-actor-ids "${TRUSTED_AGENT_ACTOR_IDS}" \
+            --actor-id "${POLICY_ACTOR_ID}" \
+            --repository "${POLICY_REPOSITORY}" \
+            --issue-number "${ISSUE_NUMBER}" \
+            --git-ref "${POLICY_GIT_REF}" \
+            --workflow-ref "${POLICY_WORKFLOW_REF}" \
+            --workflow-path ".github/workflows/agent-intake.yml" \
+            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
+            --run-id "${POLICY_RUN_ID}" \
+            --run-attempt "${POLICY_RUN_ATTEMPT}" \
+            --ref-protected "${POLICY_REF_PROTECTED}"
+
+      - name: Sanitize selected untrusted issue fields
+        run: |
+          python scripts/validate_agent_intake.py \
+            --input _agent-intake/raw.json \
+            --json-output _agent-intake/intake.json \
+            --text-output _agent-intake/intake.txt \
+            --provenance-output _agent-intake/provenance.json
+
+      - name: Upload sanitized intake evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sanitized-agent-intake-${{ inputs.issue_number }}-${{ github.run_id }}
+          path: |
+            _agent-intake/intake.json
+            _agent-intake/intake.txt
+            _agent-intake/provenance.json
+          if-no-files-found: error
+          retention-days: 14

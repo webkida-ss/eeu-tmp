@@ -1,0 +1,65 @@
+post:
+  summary: Login
+  operationId: createAuthSession
+  requestBody:
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/SsoLoginRequest.yaml
+        examples:
+          happy:
+            summary: Deterministic local request
+            x-contract-test-case: happy
+            value:
+              credential: mock:learner@example.test:Learner
+    required: true
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/AuthSessionResponse.yaml
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                access_token: fake-session-token
+                token_type: Bearer
+                user:
+                  id: 018f47a2-7b3c-7abc-8def-0123456789ab
+                  email: learner@example.test
+                  display_name: Learner
+    '400':
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The request is invalid.
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '422':
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Request validation failed.
+  x-contract-test:
+    mode: manual
+    auth: anonymous
+    setup: mockIdentity
+    owner: auth
+    reason: Identity-provider credentials require explicit fake-provider coverage.
+    test: backend/test_openapi_manual_contract.py::test_create_auth_session
+  security: []

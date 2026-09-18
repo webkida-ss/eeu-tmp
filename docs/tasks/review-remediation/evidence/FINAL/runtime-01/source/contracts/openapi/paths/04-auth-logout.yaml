@@ -1,0 +1,57 @@
+post:
+  summary: Logout
+  operationId: closeAuthSession
+  parameters:
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties:
+              type: string
+            title: Response Closeauthsession
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                status: ok
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '422':
+      description: Validation Error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/HTTPValidationError.yaml
+          example:
+            detail:
+            - type: value_error
+              loc:
+              - body
+              - field
+              msg: Request validation failed.
+              input: null
+  x-contract-test:
+    mode: generic
+    auth: localBearer
+    setup: authenticatedUser
+    owner: auth
+  security:
+  - bearerAuth: []

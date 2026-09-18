@@ -1,0 +1,32 @@
+properties:
+  translation:
+    type: string
+    title: Translation
+  grammar:
+    type: string
+    title: Grammar
+  nuance:
+    type: string
+    title: Nuance
+  vocabulary:
+    items:
+      type: string
+    type: array
+    title: Vocabulary
+  examples:
+    items:
+      type: string
+    type: array
+    title: Examples
+  study_tip:
+    type: string
+    title: Study Tip
+type: object
+required:
+- translation
+- grammar
+- nuance
+- vocabulary
+- examples
+- study_tip
+title: SentenceAnalysis

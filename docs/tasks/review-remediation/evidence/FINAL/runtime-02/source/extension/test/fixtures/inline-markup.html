@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>How the parser finds a sentence</title>
+  </head>
+  <body>
+    <main>
+      <h1 id="title">How the parser finds a sentence</h1>
+      <p id="body-1">
+        The <em>tokenizer</em> runs before the <strong>parser</strong>, and a
+        <a href="/docs/grammar">grammar rule</a> decides where each clause ends.
+      </p>
+      <p id="body-2">
+        Call <code>parse(input)</code> with the raw string; the function returns a tree even when
+        the input is <em>partially</em> malformed.
+      </p>
+      <p id="body-3">
+        Whitespace between inline elements is significant, which is exactly where naive
+        implementations lose the sentence boundary.
+      </p>
+    </main>
+  </body>
+</html>

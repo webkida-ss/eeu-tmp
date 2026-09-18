@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Untangle",
+  "description": "AI language learning reading assistant: translation, grammar, nuance, and vocabulary explained sentence by sentence as you read.",
+  "version": "0.1.0",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Untangle",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["settings.js", "i18n.js", "shared.js", "content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "host_permissions": [
+    "http://localhost:18765/*",
+    "http://127.0.0.1:18765/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sidepanel.html",
+        "settings.js",
+        "i18n.js",
+        "shared.js",
+        "signin-methods.js",
+        "reading-panel.js",
+        "panel-ui.js",
+        "panel-ui.css",
+        "reading-panel.css"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "permissions": ["storage", "activeTab", "tabs", "scripting", "identity"]
+}

@@ -1,0 +1,25 @@
+diff --git a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-02/source/backend/test_billing.py b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/test_billing.py
+index 045dc5a..ef763d8 100644
+--- a/docs/tasks/review-remediation/evidence/RM-09/B-runtime-02/source/backend/test_billing.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/B-runtime-03/source/backend/test_billing.py
+@@ -530,7 +530,10 @@ class AuthoritativeWebhookReconciliationTests(unittest.TestCase):
+         )
+         second_provider = _BarrierProvider(
+             self._event("evt_loser"),
+-            [self._snapshot(status="active"), replace(self._snapshot(status="canceled"), plan=None)],
++            [
++                self._snapshot(status="active"),
++                replace(self._snapshot(status="canceled"), plan=None),
++            ],
+         )
+ 
+         with ThreadPoolExecutor(max_workers=2) as executor:
+@@ -548,7 +551,7 @@ class AuthoritativeWebhookReconciliationTests(unittest.TestCase):
+                         (second_repository, second_provider),
+                     ),
+                 )
+-        )
++            )
+ 
+         self.assertEqual(results, ["applied", "applied"])
+         self.assertEqual(first_provider.retrievals, 1)

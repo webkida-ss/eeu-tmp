@@ -1,0 +1,1271 @@
+--- before/backend/repositories/usage_repository.py
++++ after/backend/repositories/usage_repository.py
+@@ -802,8 +802,7 @@
+     request: UsageFinalizeRequest,
+     actual_tokens: int,
+ ) -> dict[str, int] | None:
+-    if existing is None:
+-        return None
++    existing = existing or {}
+     return {
+         "actual_cost_micro_usd": max(
+             int(existing.get("actual_cost_micro_usd") or 0),
+@@ -823,6 +822,7 @@
+         return "unknown", None
+     values: dict[str, int] = {}
+     present = False
++    malformed = False
+     aliases = {
+         "actual_cost_micro_usd": ("actual_cost_micro_usd", "cost_micro_usd"),
+         "input_tokens": ("input_tokens",),
+@@ -837,18 +837,23 @@
+         present = True
+         raw = usage[matching]
+         if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+-            return "unknown", None
++            # A malformed counter cannot erase independently valid lower
++            # bounds, which remain useful for conservative settlement.
++            malformed = True
++            continue
+         values[target] = raw
+     if not present:
+         return "unknown", None
+-    if values["total_tokens"] == 0 and ("input_tokens" in usage or "output_tokens" in usage):
+-        values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
++    if "total_tokens" not in values and ("input_tokens" in values or "output_tokens" in values):
++        values["total_tokens"] = values.get("input_tokens", 0) + values.get("output_tokens", 0)
++    for target in aliases:
++        values.setdefault(target, 0)
+     # A response object alone is not usage evidence. New callers supply this
+     # flag from UsageTally; numeric-only historical results remain compatible.
+     complete = usage.get("usage_complete")
+     if complete is None:
+         complete = not bool(usage.get("missing_usage", False))
+-    if complete is not True:
++    if malformed or complete is not True:
+         return "unknown", values
+     return "measured", values
+ 
+@@ -875,12 +880,35 @@
+     if operation.dispatch_evidence_state == "settled":
+         raise UsageOperationStateError("Cannot replace settled dispatch evidence")
+     if operation.dispatch_evidence_state == "completed":
++        existing_usage = operation.dispatch_usage or {}
+         if operation.dispatch_usage_completeness == "measured":
+-            if completeness != "measured" or operation.dispatch_usage != usage:
++            if completeness == "measured" and usage != existing_usage:
+                 raise UsageOperationConflict("Completed dispatch evidence conflicts")
++            if usage and any(
++                value > int(existing_usage.get(key) or 0) for key, value in usage.items()
++            ):
++                raise UsageOperationConflict("Completed dispatch evidence conflicts")
+             return operation
+-        if completeness != "measured":
+-            return operation
++        merged_usage = {
++            key: max(int(existing_usage.get(key) or 0), int((usage or {}).get(key) or 0))
++            for key in {
++                "actual_cost_micro_usd",
++                "input_tokens",
++                "output_tokens",
++                "total_tokens",
++            }
++            if key in existing_usage or key in (usage or {})
++        }
++        can_promote_measured = completeness == "measured" and all(
++            int((usage or {}).get(key) or 0) >= int(existing_usage.get(key) or 0)
++            for key in existing_usage
++        )
++        return operation.with_dispatch_evidence(
++            state="completed",
++            kind=kind,
++            completeness="measured" if can_promote_measured else "unknown",
++            usage=usage if can_promote_measured else merged_usage or None,
++        )
+     return operation.with_dispatch_evidence(
+         state="completed",
+         kind=kind,
+@@ -890,11 +918,18 @@
+ 
+ 
+ def _conservative_finalize_request(operation: UsageOperation) -> UsageFinalizeRequest:
+-    known_cost = int((operation.dispatch_usage or {}).get("actual_cost_micro_usd") or 0)
++    usage = operation.dispatch_usage or {}
++    known_cost = int(usage.get("actual_cost_micro_usd") or 0)
++    input_tokens = int(usage.get("input_tokens") or 0)
++    output_tokens = int(usage.get("output_tokens") or 0)
++    tokens = max(int(usage.get("total_tokens") or 0), input_tokens + output_tokens)
+     return UsageFinalizeRequest(
+         user_id=operation.user_id,
+         operation_id=operation.operation_id,
+         actual_cost_micro_usd=max(operation.reserved_cost_micro_usd, known_cost),
++        input_tokens=input_tokens,
++        output_tokens=output_tokens,
++        tokens=tokens,
+         result_ref=f"usage-evidence:{operation.operation_id}",
+         evidence_completeness="conservative",
+     )
+--- before/backend/repositories/dynamodb_billing_repositories.py
++++ after/backend/repositories/dynamodb_billing_repositories.py
+@@ -195,6 +195,18 @@
+                 raise UsageOperationStateError("Cannot release an operation with dispatch evidence")
+             if expired_before is not None and operation.expires_at > expired_before:
+                 return operation, False
++            if expired_before is not None:
++                execution = (
++                    self._store.get_item(
++                        user_pk(user_id),
++                        usage_execution_sk(operation_id),
++                        consistent_read=True,
++                    )
++                    or {}
++                )
++                execution_expiry = execution.get("expires_at")
++                if execution_expiry and _parse_datetime(str(execution_expiry)) > expired_before:
++                    return operation, False
+ 
+             month = self._load_month(operation.user_id, operation.month)
+             expected_version = int(month.get("version") or 0)
+@@ -220,6 +232,11 @@
+                             ),
+                         ),
+                         self._event_put(released, "release", reason=reason),
++                        *(
++                            [self._expired_execution_check(user_id, operation_id, expired_before)]
++                            if expired_before is not None
++                            else []
++                        ),
+                     ]
+                 )
+                 return released, True
+@@ -498,45 +515,13 @@
+             except Exception:
+                 continue
+             if expired:
+-                execution_item = (
+-                    self._store.get_item(
+-                        user_pk(user_id),
+-                        usage_execution_sk(str(record["operation_id"])),
+-                        consistent_read=True,
+-                    )
+-                    or {}
+-                )
+-                execution_expiry = execution_item.get("expires_at")
+-                if execution_expiry and _parse_datetime(str(execution_expiry)) > now:
+-                    continue
+                 operation = self.get_operation(user_id, str(record["operation_id"]))
+                 if operation is None or operation.state != "reserved":
+                     continue
+-                if operation.dispatch_evidence_state in ("dispatched", "completed"):
+-                    try:
+-                        self.finalize(_finalize_request_from_evidence(operation))
+-                        reclaimed += 1
+-                    except Exception:
+-                        continue
+-                    continue
+-                if operation.dispatch_evidence_state == "unknown":
+-                    # A legacy result is positive evidence. A missing result is
+-                    # deliberately unresolved rather than silently released.
+-                    result = self.get_result(user_id, operation.operation_id)
+-                    if result is None:
+-                        continue
+-                    try:
+-                        request = _finalize_request_from_result(operation, result)
+-                    except Exception:
+-                        request = _conservative_finalize_request(operation)
+-                    try:
+-                        self.finalize(request)
++                if operation.dispatch_evidence_state != "not_dispatched":
++                    if self._reclaim_finalize(user_id, operation.operation_id, now):
+                         reclaimed += 1
+-                    except Exception:
+-                        continue
+                     continue
+-                if operation.dispatch_evidence_state != "not_dispatched":
+-                    continue
+                 try:
+                     _operation, transitioned = self._release_transition(
+                         user_id,
+@@ -550,6 +535,90 @@
+                     pass
+         return reclaimed
+ 
++    def _reclaim_finalize(self, user_id: str, operation_id: str, now: datetime) -> bool:
++        """Settle only an operation that remains expired and unowned at commit."""
++        for _attempt in range(4):
++            operation = self.get_operation(user_id, operation_id)
++            if operation is None or operation.state != "reserved" or operation.expires_at > now:
++                return False
++            execution = (
++                self._store.get_item(
++                    user_pk(user_id),
++                    usage_execution_sk(operation_id),
++                    consistent_read=True,
++                )
++                or {}
++            )
++            execution_expiry = execution.get("expires_at")
++            if execution_expiry and _parse_datetime(str(execution_expiry)) > now:
++                return False
++            if operation.dispatch_evidence_state in ("dispatched", "completed"):
++                request = _finalize_request_from_evidence(operation)
++            elif operation.dispatch_evidence_state == "unknown":
++                # A legacy private result is positive evidence. Its absence is
++                # unresolved, never authorization to release a reservation.
++                result = self.get_result(user_id, operation_id)
++                if result is None:
++                    return False
++                try:
++                    request = _finalize_request_from_result(operation, result)
++                except Exception:
++                    request = _conservative_finalize_request(operation)
++            else:
++                return False
++
++            month = self._load_month(operation.user_id, operation.month)
++            expected_version = int(month.get("version") or 0)
++            _subtract_reserved(month, operation)
++            month["committed_articles"] += operation.reserved_articles
++            month["committed_chats"] += operation.reserved_chats
++            month["committed_cost_micro_usd"] += request.actual_cost_micro_usd
++            month["articles"] += operation.reserved_articles
++            month["chats"] += operation.reserved_chats
++            month["shadow_cost_micro_usd"] += request.actual_cost_micro_usd
++            actual_tokens = request.tokens or request.input_tokens + request.output_tokens
++            month["tokens"] += actual_tokens
++            month["version"] = expected_version + 1
++            finalized = operation.finalized(request, actual_tokens=actual_tokens)
++            try:
++                self._store.transact_write(
++                    [
++                        self._aggregate_put(month, expected_version),
++                        self._operation_put(
++                            finalized,
++                            expected_state="reserved",
++                            expected_expires_at=operation.expires_at,
++                            expected_dispatch_evidence_version=(
++                                operation.dispatch_evidence_version
++                            ),
++                            expected_missing_dispatch_evidence=(
++                                operation.dispatch_evidence_state == "unknown"
++                                and operation.dispatch_evidence_version == 0
++                            ),
++                        ),
++                        self._event_put(finalized, "finalize"),
++                        self._expired_execution_check(user_id, operation_id, now),
++                    ]
++                )
++                return True
++            except ClientError as exc:
++                if not _is_transaction_failure(exc):
++                    raise
++        return False
++
++    def _expired_execution_check(
++        self, user_id: str, operation_id: str, now: datetime
++    ) -> dict[str, Any]:
++        return {
++            "ConditionCheck": {
++                "TableName": self._store.table_name,
++                "Key": _serialize({"pk": user_pk(user_id), "sk": usage_execution_sk(operation_id)}),
++                "ConditionExpression": "attribute_not_exists(pk) OR #expires_at <= :now",
++                "ExpressionAttributeNames": {"#expires_at": "expires_at"},
++                "ExpressionAttributeValues": _serialize_values({":now": now.isoformat()}),
++            }
++        }
++
+     def _load_month(self, user_id: str, month: str) -> dict[str, Any]:
+         pk = user_pk(user_id)
+         sk = usage_sk(month)
+--- before/backend/services/preloading.py
++++ after/backend/services/preloading.py
+@@ -1456,6 +1456,11 @@
+                     durable_usage["usage_complete"] = bool(
+                         not snapshot.missing_usage and snapshot.total_tokens > 0
+                     )
++                else:
++                    # A dispatch-attempted provider error has no complete
++                    # provider tally, even when its empty snapshot reports no
++                    # missing fields. Preserve the reservation floor instead.
++                    durable_usage["usage_complete"] = False
+                 meter.save_result(
+                     operation_id,
+                     {
+--- before/backend/test_usage_repository.py
++++ after/backend/test_usage_repository.py
+@@ -6,11 +6,11 @@
+ import threading
+ import unittest
+ from copy import deepcopy
+-from dataclasses import asdict
++from dataclasses import asdict, replace
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+ from types import SimpleNamespace
+-from unittest.mock import Mock, patch
++from unittest.mock import patch
+ 
+ from boto3.dynamodb.types import TypeDeserializer
+ from botocore.exceptions import ClientError
+@@ -25,6 +25,7 @@
+ )
+ from storage.dynamodb_keys import (
+     usage_event_sk,
++    usage_operation_sk,
+     usage_result_sk,
+     usage_sk,
+     user_pk,
+@@ -123,12 +124,21 @@
+             "output_tokens": 0,
+             "tokens": 0,
+             "release_reason": None,
++            "dispatch_evidence_state": "unknown",
++            "dispatch_evidence_version": 0,
++            "dispatch_kind": None,
++            "dispatch_usage_completeness": "unknown",
++            "dispatch_usage": None,
+         }
+ 
+     def test_reserved_factory_preserves_every_request_field(self) -> None:
+         self.assertEqual(
+             asdict(UsageOperation.reserved(self.request)),
+-            self.reserved_fields,
++            {
++                **self.reserved_fields,
++                "dispatch_evidence_state": "not_dispatched",
++                "dispatch_evidence_version": 1,
++            },
+         )
+ 
+     def test_finalized_transition_changes_only_settlement_fields(self) -> None:
+@@ -157,6 +167,15 @@
+                 "input_tokens": 7,
+                 "output_tokens": 11,
+                 "tokens": 18,
++                "dispatch_evidence_state": "settled",
++                "dispatch_evidence_version": 1,
++                "dispatch_usage_completeness": "measured",
++                "dispatch_usage": {
++                    "actual_cost_micro_usd": 91,
++                    "input_tokens": 7,
++                    "output_tokens": 11,
++                    "total_tokens": 18,
++                },
+             },
+         )
+ 
+@@ -171,6 +190,7 @@
+                 **self.reserved_fields,
+                 "state": "released",
+                 "release_reason": "provider_failed",
++                "dispatch_evidence_version": 1,
+             },
+         )
+ 
+@@ -182,7 +202,11 @@
+ 
+         self.assertEqual(
+             asdict(renewed),
+-            {**self.reserved_fields, "expires_at": renewed_expiry},
++            {
++                **self.reserved_fields,
++                "expires_at": renewed_expiry,
++                "dispatch_evidence_version": 1,
++            },
+         )
+ 
+ 
+@@ -932,6 +956,7 @@
+         self.failures_remaining = 0
+         self.failure_exception: ClientError | None = None
+         self.on_failure = None
++        self.before_conditions = None
+         self.query_barrier: threading.Barrier | None = None
+         self._lock = threading.RLock()
+ 
+@@ -994,9 +1019,26 @@
+                 if self.on_failure:
+                     self.on_failure()
+                 raise self.failure_exception or _transaction_cancelled()
++            if self.before_conditions:
++                callback = self.before_conditions
++                self.before_conditions = None
++                callback()
+ 
+             writes: list[tuple[tuple[str, str], dict]] = []
+             for entry in items:
++                if "ConditionCheck" in entry:
++                    check = entry["ConditionCheck"]
++                    key_values = {
++                        key: _DESERIALIZER.deserialize(value) for key, value in check["Key"].items()
++                    }
++                    key = (key_values["pk"], key_values["sk"])
++                    if not self._condition_matches(
++                        check,
++                        self.items.get(key),
++                        check.get("ConditionExpression"),
++                    ):
++                        raise _transaction_cancelled()
++                    continue
+                 put = entry["Put"]
+                 item = {key: _DESERIALIZER.deserialize(value) for key, value in put["Item"].items()}
+                 key = (item["pk"], item["sk"])
+@@ -1035,6 +1077,8 @@
+         }
+         if condition == "#version = :expected_version":
+             return existing is not None and existing.get("version") == values[":expected_version"]
++        if condition == "attribute_not_exists(pk) OR #expires_at <= :now":
++            return existing is None or str(existing.get("expires_at") or "") <= values[":now"]
+         if condition.startswith("#state = :expected_state"):
+             if existing is None or existing.get("state") != values[":expected_state"]:
+                 return False
+@@ -1196,6 +1240,88 @@
+             "reserved",
+         )
+ 
++    def test_dynamo_reclaim_rechecks_expiry_after_renewal_conflict(self) -> None:
++        store = _MemoryDynamoStore()
++        repository = DynamoUsageRepository(store)
++        request = reservation(
++            "reclaim-renew-race",
++            cost_micro_usd=13,
++            expires_at=NOW - timedelta(seconds=1),
++        )
++        repository.reserve(request)
++        repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {"kind": "preload", "state": "dispatching", "usage": {}},
++        )
++        self.assertEqual(
++            repository.claim_execution(
++                request.user_id,
++                request.operation_id,
++                "live-owner",
++                NOW - timedelta(seconds=2),
++                NOW - timedelta(seconds=1),
++            ),
++            "claimed",
++        )
++
++        store.failures_remaining = 1
++
++        def renew_before_reclaim_retry() -> None:
++            repository.renew(
++                request.user_id,
++                request.operation_id,
++                NOW + timedelta(minutes=5),
++            )
++            self.assertTrue(
++                repository.renew_execution(
++                    request.user_id,
++                    request.operation_id,
++                    "live-owner",
++                    NOW + timedelta(minutes=5),
++                )
++            )
++
++        store.on_failure = renew_before_reclaim_retry
++
++        self.assertEqual(repository.reclaim_expired(request.user_id, NOW), 0)
++        self.assertEqual(
++            repository.get_operation(request.user_id, request.operation_id).state,
++            "reserved",
++        )
++
++    def test_dynamo_no_dispatch_reclaim_does_not_release_after_execution_starts(self) -> None:
++        store = _MemoryDynamoStore()
++        repository = DynamoUsageRepository(store)
++        request = reservation(
++            "reclaim-start-race",
++            cost_micro_usd=13,
++            expires_at=NOW - timedelta(seconds=1),
++        )
++        repository.reserve(request)
++
++        def start_execution_before_release_conditions() -> None:
++            self.assertEqual(
++                repository.claim_execution(
++                    request.user_id,
++                    request.operation_id,
++                    "live-owner",
++                    NOW,
++                    NOW + timedelta(minutes=5),
++                ),
++                "claimed",
++            )
++
++        # The reclaim has observed the expired reservation, but the execution
++        # starts before its release transaction checks every predicate.
++        store.before_conditions = start_execution_before_release_conditions
++
++        self.assertEqual(repository.reclaim_expired(request.user_id, NOW), 0)
++        self.assertEqual(
++            repository.get_operation(request.user_id, request.operation_id).state,
++            "reserved",
++        )
++
+     def test_dynamo_result_enforces_serialized_size_ceiling(self) -> None:
+         store = _MemoryDynamoStore()
+         repository = DynamoUsageRepository(store)
+@@ -1326,6 +1452,22 @@
+             expires_at=NOW - timedelta(seconds=1),
+         )
+         repository.reserve(request)
++        # This represents a pre-evidence durable operation with a surviving
++        # trusted private result, rather than a new explicit no-dispatch record.
++        operation_item = store.items[
++            (user_pk(request.user_id), usage_operation_sk(request.operation_id))
++        ]
++        legacy_operation = json.loads(operation_item[DOCUMENT_ATTRIBUTE])
++        for field in (
++            "dispatch_evidence_state",
++            "dispatch_evidence_version",
++            "dispatch_kind",
++            "dispatch_usage_completeness",
++            "dispatch_usage",
++        ):
++            legacy_operation.pop(field, None)
++            operation_item.pop(field, None)
++        operation_item[DOCUMENT_ATTRIBUTE] = json.dumps(legacy_operation)
+         store.items[(user_pk(request.user_id), usage_result_sk(request.operation_id))] = {
+             "pk": user_pk(request.user_id),
+             "sk": usage_result_sk(request.operation_id),
+@@ -1344,16 +1486,10 @@
+         self.assertEqual(operation.actual_cost_micro_usd, 3)
+ 
+     def test_pending_result_uses_dedicated_dynamo_document(self) -> None:
+-        store = Mock()
+-        store.get_item.return_value = {
+-            DOCUMENT_ATTRIBUTE: json.dumps(
+-                {
+-                    "kind": "analyze",
+-                    "response": {"translation": "saved"},
+-                }
+-            )
+-        }
++        store = _MemoryDynamoStore()
+         repository = DynamoUsageRepository(store)
++        request = replace(reservation("operation-1"), user_id="u1")
++        repository.reserve(request)
+ 
+         repository.save_result(
+             "u1",
+@@ -1363,10 +1499,9 @@
+         loaded = repository.get_result("u1", "operation-1")
+ 
+         self.assertEqual(loaded["response"]["translation"], "saved")
+-        self.assertEqual(store.put_document_if_absent.call_args.args[0], user_pk("u1"))
+         self.assertIn(
+-            "USAGE_RESULT#operation-1",
+-            store.put_document_if_absent.call_args.args,
++            (user_pk("u1"), usage_result_sk("operation-1")),
++            store.items,
+         )
+ 
+     def test_reserve_uses_one_conditional_three_item_transaction(self) -> None:
+--- before/backend/test_usage_evidence_recovery.py
++++ after/backend/test_usage_evidence_recovery.py
+@@ -3,12 +3,15 @@
+ from __future__ import annotations
+ 
+ import json
++import multiprocessing
+ import tempfile
+ import threading
+ import unittest
+-from concurrent.futures import ThreadPoolExecutor
+-from datetime import UTC, datetime
++from collections.abc import Callable
++from datetime import UTC, datetime, timedelta
+ from pathlib import Path
++from queue import Empty
++from typing import Any
+ from unittest import mock
+ 
+ from accounts.storage import JsonSubscriptionRepository
+@@ -49,6 +52,66 @@
+     )
+ 
+ 
++def _run_worker_process(
++    worker: Callable[[], int],
++    ready: Any,
++    release: Any,
++    outcomes: Any,
++) -> None:
++    ready.set()
++    if not release.wait(timeout=2):
++        outcomes.put(("error", "test coordinator did not release the worker"))
++        return
++    try:
++        outcomes.put(("result", worker()))
++    except Exception as exc:
++        outcomes.put(("error", repr(exc)))
++
++
++def _run_bounded_workers(*workers: Callable[[], int]) -> list[int]:
++    """Run independent file-lock contenders in terminable child processes."""
++    context = multiprocessing.get_context("fork")
++    release = context.Event()
++    ready = [context.Event() for _ in workers]
++    outcomes = context.Queue()
++    processes = [
++        context.Process(
++            target=_run_worker_process,
++            args=(worker, ready[index], release, outcomes),
++        )
++        for index, worker in enumerate(workers)
++    ]
++    for process in processes:
++        process.start()
++    results: list[int] = []
++    errors: list[str] = []
++    try:
++        if not all(event.wait(timeout=2) for event in ready):
++            raise AssertionError("concurrent adapter worker did not start")
++        release.set()
++        for _ in workers:
++            try:
++                outcome, value = outcomes.get(timeout=2)
++            except Empty as exc:
++                raise AssertionError("concurrent adapter worker did not finish") from exc
++            if outcome == "error":
++                errors.append(str(value))
++            else:
++                results.append(value)
++    finally:
++        release.set()
++        for process in processes:
++            process.join(timeout=2)
++            if process.is_alive():
++                process.terminate()
++                process.join(timeout=2)
++    if errors:
++        raise AssertionError(f"concurrent adapter worker failed: {errors}")
++    if any(process.exitcode not in (0, None) for process in processes):
++        raise AssertionError("concurrent adapter worker exited unexpectedly")
++    return results
++
++
+ class _FailingMarkerJsonUsageRepository(JsonUsageRepository):
+     def save_result(self, user_id: str, operation_id: str, result: dict) -> dict:
+         if result.get("state") == "dispatching":
+@@ -56,6 +119,83 @@
+         return super().save_result(user_id, operation_id, result)
+ 
+ 
++class _PausingJsonUsageRepository(JsonUsageRepository):
++    """Pause one real protected read while a second adapter contends for its lock."""
++
++    def __init__(self, path: Path) -> None:
++        super().__init__(path)
++        self.read_paused = threading.Event()
++        self.resume_read = threading.Event()
++        self._pause_next_read = False
++
++    def pause_on_next_read(self) -> None:
++        self.read_paused.clear()
++        self.resume_read.clear()
++        self._pause_next_read = True
++
++    def _load_items_with_cleanup(self) -> list[dict]:
++        items = super()._load_items_with_cleanup()
++        if self._pause_next_read:
++            self._pause_next_read = False
++            self.read_paused.set()
++            if not self.resume_read.wait(timeout=2):
++                raise TimeoutError("test did not resume the protected repository read")
++        return items
++
++
++def _run_paused_interleaving(
++    paused_adapter: _PausingJsonUsageRepository,
++    owner: Callable[[], object],
++    contender: Callable[[], object],
++) -> tuple[object | None, object | None, Exception | None, Exception | None]:
++    """Exercise a real JSON lock handoff with bounded cleanup for each temp path."""
++    paused_adapter.pause_on_next_read()
++    contender_started = threading.Event()
++    contender_finished = threading.Event()
++    owner_result: object | None = None
++    contender_result: object | None = None
++    owner_error: Exception | None = None
++    contender_error: Exception | None = None
++
++    def run_owner() -> None:
++        nonlocal owner_result, owner_error
++        try:
++            owner_result = owner()
++        except Exception as exc:
++            owner_error = exc
++
++    def run_contender() -> None:
++        nonlocal contender_result, contender_error
++        contender_started.set()
++        try:
++            contender_result = contender()
++        except Exception as exc:
++            contender_error = exc
++        finally:
++            contender_finished.set()
++
++    owner_thread = threading.Thread(target=run_owner, daemon=True)
++    contender_thread = threading.Thread(target=run_contender, daemon=True)
++    owner_thread.start()
++    if not paused_adapter.read_paused.wait(timeout=2):
++        paused_adapter.resume_read.set()
++        owner_thread.join(timeout=2)
++        raise AssertionError("owner did not pause under the repository lock")
++    contender_thread.start()
++    try:
++        if not contender_started.wait(timeout=2):
++            raise AssertionError("lock contender did not start")
++        if contender_finished.wait(timeout=0.1):
++            raise AssertionError("lock contender finished before the protected read resumed")
++    finally:
++        paused_adapter.resume_read.set()
++        owner_thread.join(timeout=2)
++        contender_thread.join(timeout=2)
++    if owner_thread.is_alive() or contender_thread.is_alive():
++        raise AssertionError("JSON lock interleaving worker did not terminate")
++    return owner_result, contender_result, owner_error, contender_error
++
++
+ class JsonUsageEvidenceRecoveryTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self._temporary_directory = tempfile.TemporaryDirectory()
+@@ -82,41 +222,39 @@
+                 "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
+             },
+         )
+-        self.repository.save_result(
+-            request.user_id,
+-            request.operation_id,
+-            {
+-                "kind": "chat",
+-                "state": "completed",
+-                "response": {"reply": _PRIVATE_RESPONSE},
+-                "usage": {
+-                    "input_tokens": 3,
+-                    "output_tokens": 2,
+-                    "total_tokens": 5,
+-                    "actual_cost_micro_usd": 17,
+-                },
+-            },
+-        )
++        with mock.patch.dict("os.environ", {"SYNC_RESULT_TTL_SECONDS": "1"}):
++            self.repository.save_result(
++                request.user_id,
++                request.operation_id,
++                {
++                    "kind": "chat",
++                    "state": "completed",
++                    "response": {"reply": _PRIVATE_RESPONSE},
++                    "usage": {
++                        "input_tokens": 3,
++                        "output_tokens": 2,
++                        "total_tokens": 5,
++                        "actual_cost_micro_usd": 17,
++                        "email": "private@example.test",
++                        "article_text": "Article text must stay in the TTL record.",
++                        "provider_token": "provider-access-token",
++                    },
++                },
++            )
+         records = json.loads(self.path.read_text())
+-        write_json_list(
+-            self.path,
+-            [record for record in records if record.get("record_type") != "usage_result"],
++        result_record = next(
++            record for record in records if record.get("record_type") == "usage_result"
+         )
++        result_record["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
++        write_json_list(self.path, records)
++        self.assertIsNone(self.repository.get_result(request.user_id, request.operation_id))
+         first_adapter = JsonUsageRepository(self.path)
+         second_adapter = JsonUsageRepository(self.path)
+-        barrier = threading.Barrier(3)
++        reclaimed = _run_bounded_workers(
++            lambda: first_adapter.reclaim_expired(request.user_id, NOW),
++            lambda: second_adapter.reclaim_expired(request.user_id, NOW),
++        )
+ 
+-        def reclaim(adapter: JsonUsageRepository) -> int:
+-            barrier.wait()
+-            return adapter.reclaim_expired(request.user_id, NOW)
+-
+-        with ThreadPoolExecutor(max_workers=2) as executor:
+-            futures = [
+-                executor.submit(reclaim, adapter) for adapter in (first_adapter, second_adapter)
+-            ]
+-            barrier.wait()
+-            reclaimed = [future.result(timeout=2) for future in futures]
+-
+         operation = self.repository.get_operation(request.user_id, request.operation_id)
+         month = self.repository.get_month(request.user_id, request.month)
+         evidence = _operation_record(json.loads(self.path.read_text()), request.operation_id)
+@@ -126,9 +264,23 @@
+         self.assertEqual(month["committed_cost_micro_usd"], 17)
+         self.assertEqual(month["tokens"], 5)
+         self.assertEqual(evidence["dispatch_evidence_state"], "settled")
+-        self.assertEqual(evidence["dispatch_usage"]["actual_cost_micro_usd"], 17)
+-        self.assertNotIn("response", evidence)
+-        self.assertNotIn(_PRIVATE_RESPONSE, json.dumps(evidence, sort_keys=True))
++        self.assertEqual(
++            evidence["dispatch_usage"],
++            {
++                "actual_cost_micro_usd": 17,
++                "input_tokens": 3,
++                "output_tokens": 2,
++                "total_tokens": 5,
++            },
++        )
++        serialized_evidence = json.dumps(evidence, sort_keys=True)
++        for private_value in (
++            _PRIVATE_RESPONSE,
++            "private@example.test",
++            "Article text must stay in the TTL record.",
++            "provider-access-token",
++        ):
++            self.assertNotIn(private_value, serialized_evidence)
+ 
+     def test_new_no_dispatch_releases_but_unknown_legacy_operation_remains_reserved(self) -> None:
+         new_request = reservation(
+@@ -203,66 +355,100 @@
+         self.assertEqual(operation.dispatch_evidence_state, "completed")
+         self.assertEqual(operation.dispatch_usage["actual_cost_micro_usd"], 17)
+ 
+-    def test_completion_and_reclaim_settle_once_under_concurrent_adapters(self) -> None:
+-        request = reservation(
++    def test_completion_and_reclaim_preserve_each_controlled_winner_outcome(self) -> None:
++        completed_first = reservation(
+             "019b63f8-f600-7000-8000-000000000309",
+             cost_micro_usd=13,
+             expires_at=NOW,
+         )
+-        self.repository.reserve(request)
++        reclaimed_first = reservation(
++            "019b63f8-f600-7000-8000-000000000315",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(completed_first)
+         self.repository.save_result(
+-            request.user_id,
+-            request.operation_id,
++            completed_first.user_id,
++            completed_first.operation_id,
+             {
+                 "kind": "chat",
+                 "state": "dispatching",
+-                "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++                "usage": {"actual_cost_micro_usd": completed_first.cost_micro_usd},
+             },
+         )
+-        completing_adapter = JsonUsageRepository(self.path)
+-        reclaiming_adapter = JsonUsageRepository(self.path)
+-        barrier = threading.Barrier(3)
+-
+-        def complete() -> Exception | None:
+-            barrier.wait()
+-            try:
+-                completing_adapter.save_result(
+-                    request.user_id,
+-                    request.operation_id,
++        completion_adapter = _PausingJsonUsageRepository(self.path)
++        completion_contender = JsonUsageRepository(self.path)
++        _, completion_reclaim_count, completion_error, completion_reclaim_error = (
++            _run_paused_interleaving(
++                completion_adapter,
++                lambda: completion_adapter.save_result(
++                    completed_first.user_id,
++                    completed_first.operation_id,
+                     {
+                         "kind": "chat",
+                         "state": "completed",
+                         "response": {"reply": _PRIVATE_RESPONSE},
+                         "usage": {"actual_cost_micro_usd": 17},
+                     },
+-                )
+-            except Exception as exc:  # The reclaim winner may fence the late completion.
+-                return exc
+-            return None
++                ),
++                lambda: completion_contender.reclaim_expired(_USER_ID, NOW),
++            )
++        )
++        self.assertIsNone(completion_error)
++        self.assertIsNone(completion_reclaim_error)
++        self.assertEqual(completion_reclaim_count, 1)
+ 
+-        def reclaim() -> int:
+-            barrier.wait()
+-            return reclaiming_adapter.reclaim_expired(request.user_id, NOW)
+-
+-        with ThreadPoolExecutor(max_workers=2) as executor:
+-            completion = executor.submit(complete)
+-            reclamation = executor.submit(reclaim)
+-            barrier.wait()
+-            completion_error = completion.result(timeout=2)
+-            reclamation_count = reclamation.result(timeout=2)
+-
+-        operation = self.repository.get_operation(request.user_id, request.operation_id)
+-        month = self.repository.get_month(request.user_id, request.month)
+-        self.assertTrue(
+-            completion_error is None or isinstance(completion_error, UsageOperationStateError)
++        self.repository.reserve(reclaimed_first)
++        self.repository.save_result(
++            reclaimed_first.user_id,
++            reclaimed_first.operation_id,
++            {
++                "kind": "chat",
++                "state": "dispatching",
++                "usage": {"actual_cost_micro_usd": reclaimed_first.cost_micro_usd},
++            },
+         )
+-        self.assertIn(reclamation_count, (0, 1))
+-        self.assertEqual(operation.state, "finalized")
+-        self.assertEqual(operation.dispatch_evidence_state, "settled")
+-        self.assertIn(operation.actual_cost_micro_usd, (request.cost_micro_usd, 17))
+-        self.assertEqual(month["committed_cost_micro_usd"], operation.actual_cost_micro_usd)
++        reclaim_adapter = _PausingJsonUsageRepository(self.path)
++        late_completion_adapter = JsonUsageRepository(self.path)
++        reclaim_count, _, reclaim_error, late_completion_error = _run_paused_interleaving(
++            reclaim_adapter,
++            lambda: reclaim_adapter.reclaim_expired(_USER_ID, NOW),
++            lambda: late_completion_adapter.save_result(
++                reclaimed_first.user_id,
++                reclaimed_first.operation_id,
++                {
++                    "kind": "chat",
++                    "state": "completed",
++                    "response": {"reply": _PRIVATE_RESPONSE},
++                    "usage": {"actual_cost_micro_usd": 17},
++                },
++            ),
++        )
++        self.assertIsNone(reclaim_error)
++        self.assertEqual(reclaim_count, 1)
++        self.assertIsInstance(late_completion_error, UsageOperationStateError)
++
++        completed = self.repository.get_operation(_USER_ID, completed_first.operation_id)
++        reclaimed = self.repository.get_operation(_USER_ID, reclaimed_first.operation_id)
++        month = self.repository.get_month(_USER_ID, completed_first.month)
++        self.assertEqual(completed.state, "finalized")
++        self.assertEqual(completed.dispatch_evidence_state, "settled")
++        self.assertEqual(completed.actual_cost_micro_usd, 17)
++        self.assertEqual(reclaimed.state, "finalized")
++        self.assertEqual(reclaimed.dispatch_evidence_state, "settled")
++        self.assertEqual(reclaimed.actual_cost_micro_usd, reclaimed_first.cost_micro_usd)
++        self.assertEqual(month["committed_cost_micro_usd"], 30)
+         self.assertEqual(month["reserved_cost_micro_usd"], 0)
+ 
++        operation_after_late_completion = self.repository.get_operation(
++            _USER_ID,
++            reclaimed_first.operation_id,
++        )
++        self.assertEqual(
++            operation_after_late_completion.actual_cost_micro_usd,
++            reclaimed_first.cost_micro_usd,
++        )
++
+     def test_private_result_write_failure_keeps_durable_measured_evidence(self) -> None:
+         request = reservation(
+             "019b63f8-f600-7000-8000-000000000310",
+@@ -351,7 +537,79 @@
+         self.assertEqual(settled.actual_cost_micro_usd, 17)
+         self.assertEqual(settled.dispatch_usage["input_tokens"], 3)
+         self.assertEqual(settled.dispatch_usage["total_tokens"], 3)
++        self.assertEqual(settled.input_tokens, 3)
++        self.assertEqual(settled.tokens, 3)
++        month = self.repository.get_month(request.user_id, request.month)
++        self.assertEqual(month["tokens"], 3)
++        finalized_event = next(
++            record
++            for record in json.loads(self.path.read_text())
++            if record.get("record_type") == "usage_event"
++            and record.get("operation_id") == request.operation_id
++            and record.get("transition") == "finalize"
++        )
++        self.assertEqual(finalized_event["input_tokens"], 3)
++        self.assertEqual(finalized_event["tokens"], 3)
+ 
++    def test_incomplete_usage_evidence_keeps_the_known_cost_and_tokens_monotonic(self) -> None:
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000318",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(request)
++        for usage in (
++            {
++                "actual_cost_micro_usd": 17,
++                "input_tokens": 3,
++                "usage_complete": False,
++            },
++            {
++                "actual_cost_micro_usd": 23,
++                "input_tokens": 5,
++                "usage_complete": False,
++            },
++            {
++                "actual_cost_micro_usd": 19,
++                "input_tokens": 4,
++                "total_tokens": 4,
++                "usage_complete": True,
++            },
++        ):
++            self.repository.save_result(
++                request.user_id,
++                request.operation_id,
++                {"kind": "preload", "state": "completed", "usage": usage},
++            )
++            records = json.loads(self.path.read_text())
++            result_record = next(
++                record for record in records if record.get("record_type") == "usage_result"
++            )
++            result_record["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
++            write_json_list(self.path, records)
++            self.assertIsNone(self.repository.get_result(request.user_id, request.operation_id))
++
++        self.assertEqual(self.repository.reclaim_expired(request.user_id, NOW), 1)
++
++        settled = self.repository.get_operation(request.user_id, request.operation_id)
++        month = self.repository.get_month(request.user_id, request.month)
++        finalized_event = next(
++            record
++            for record in json.loads(self.path.read_text())
++            if record.get("record_type") == "usage_event"
++            and record.get("operation_id") == request.operation_id
++            and record.get("transition") == "finalize"
++        )
++        self.assertEqual(settled.dispatch_usage_completeness, "conservative")
++        self.assertEqual(settled.actual_cost_micro_usd, 23)
++        self.assertEqual(settled.input_tokens, 5)
++        self.assertEqual(settled.tokens, 5)
++        self.assertEqual(month["committed_cost_micro_usd"], 23)
++        self.assertEqual(month["tokens"], 5)
++        self.assertEqual(finalized_event["actual_cost_micro_usd"], 23)
++        self.assertEqual(finalized_event["input_tokens"], 5)
++        self.assertEqual(finalized_event["tokens"], 5)
++
+     def test_arbitrary_result_kind_cannot_be_persisted_as_dispatch_evidence(self) -> None:
+         request = reservation("019b63f8-f600-7000-8000-000000000314", cost_micro_usd=13)
+         self.repository.reserve(request)
+@@ -371,57 +629,70 @@
+         self.assertEqual(operation.dispatch_evidence_state, "not_dispatched")
+         self.assertIsNone(operation.dispatch_kind)
+ 
+-    def test_reclaim_and_dispatch_promotion_leave_one_terminal_outcome(self) -> None:
+-        request = reservation(
++    def test_reclaim_and_dispatch_promotion_preserve_each_controlled_winner_outcome(self) -> None:
++        promoted_first = reservation(
+             "019b63f8-f600-7000-8000-000000000311",
+             cost_micro_usd=13,
+             expires_at=NOW,
+         )
+-        self.repository.reserve(request)
+-        promoting_adapter = JsonUsageRepository(self.path)
+-        reclaiming_adapter = JsonUsageRepository(self.path)
+-        barrier = threading.Barrier(3)
++        reclaimed_first = reservation(
++            "019b63f8-f600-7000-8000-000000000316",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
+ 
+-        def promote() -> Exception | None:
+-            barrier.wait()
+-            try:
+-                promoting_adapter.save_result(
+-                    request.user_id,
+-                    request.operation_id,
++        self.repository.reserve(promoted_first)
++        promotion_adapter = _PausingJsonUsageRepository(self.path)
++        promotion_contender = JsonUsageRepository(self.path)
++        _, promoted_reclaim_count, promotion_error, promoted_reclaim_error = (
++            _run_paused_interleaving(
++                promotion_adapter,
++                lambda: promotion_adapter.save_result(
++                    promoted_first.user_id,
++                    promoted_first.operation_id,
+                     {
+                         "kind": "chat",
+                         "state": "dispatching",
+-                        "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++                        "usage": {"actual_cost_micro_usd": promoted_first.cost_micro_usd},
+                     },
+-                )
+-            except Exception as exc:
+-                return exc
+-            return None
+-
+-        def reclaim() -> int:
+-            barrier.wait()
+-            return reclaiming_adapter.reclaim_expired(request.user_id, NOW)
++                ),
++                lambda: promotion_contender.reclaim_expired(_USER_ID, NOW),
++            )
++        )
++        self.assertIsNone(promotion_error)
++        self.assertIsNone(promoted_reclaim_error)
++        self.assertEqual(promoted_reclaim_count, 1)
+ 
+-        with ThreadPoolExecutor(max_workers=2) as executor:
+-            promotion = executor.submit(promote)
+-            reclamation = executor.submit(reclaim)
+-            barrier.wait()
+-            promotion_error = promotion.result(timeout=2)
+-            reclamation_count = reclamation.result(timeout=2)
++        promoted = self.repository.get_operation(_USER_ID, promoted_first.operation_id)
++        self.assertEqual(promoted.state, "finalized")
++        self.assertEqual(promoted.actual_cost_micro_usd, promoted_first.cost_micro_usd)
++        self.assertEqual(promoted.dispatch_evidence_state, "settled")
+ 
+-        operation = self.repository.get_operation(request.user_id, request.operation_id)
+-        month = self.repository.get_month(request.user_id, request.month)
+-        self.assertTrue(
+-            promotion_error is None or isinstance(promotion_error, UsageOperationStateError)
++        self.repository.reserve(reclaimed_first)
++        reclaim_adapter = _PausingJsonUsageRepository(self.path)
++        late_promotion_adapter = JsonUsageRepository(self.path)
++        reclaimed_count, _, reclaim_error, late_promotion_error = _run_paused_interleaving(
++            reclaim_adapter,
++            lambda: reclaim_adapter.reclaim_expired(_USER_ID, NOW),
++            lambda: late_promotion_adapter.save_result(
++                reclaimed_first.user_id,
++                reclaimed_first.operation_id,
++                {
++                    "kind": "chat",
++                    "state": "dispatching",
++                    "usage": {"actual_cost_micro_usd": reclaimed_first.cost_micro_usd},
++                },
++            ),
+         )
+-        self.assertIn(reclamation_count, (0, 1))
+-        self.assertIn(operation.state, ("finalized", "released"))
++        self.assertIsNone(reclaim_error)
++        self.assertEqual(reclaimed_count, 1)
++        self.assertIsInstance(late_promotion_error, UsageOperationStateError)
++
++        reclaimed = self.repository.get_operation(_USER_ID, reclaimed_first.operation_id)
++        month = self.repository.get_month(_USER_ID, reclaimed_first.month)
++        self.assertEqual(reclaimed.state, "released")
++        self.assertEqual(reclaimed.dispatch_evidence_state, "not_dispatched")
+         self.assertEqual(month["reserved_cost_micro_usd"], 0)
+-        if operation.state == "finalized":
+-            self.assertEqual(operation.actual_cost_micro_usd, request.cost_micro_usd)
+-            self.assertEqual(operation.dispatch_evidence_state, "settled")
+-        else:
+-            self.assertEqual(operation.dispatch_evidence_state, "not_dispatched")
+ 
+ 
+ class DynamoUsageEvidenceRecoveryTests(unittest.TestCase):
+@@ -445,19 +716,11 @@
+             },
+         )
+         store.items.pop((user_pk(request.user_id), usage_result_sk(request.operation_id)))
+-        barrier = threading.Barrier(3)
++        reclaimed = [
++            first_adapter.reclaim_expired(request.user_id, NOW),
++            second_adapter.reclaim_expired(request.user_id, NOW),
++        ]
+ 
+-        def reclaim(adapter: DynamoUsageRepository) -> int:
+-            barrier.wait()
+-            return adapter.reclaim_expired(request.user_id, NOW)
+-
+-        with ThreadPoolExecutor(max_workers=2) as executor:
+-            futures = [
+-                executor.submit(reclaim, adapter) for adapter in (first_adapter, second_adapter)
+-            ]
+-            barrier.wait()
+-            reclaimed = [future.result(timeout=2) for future in futures]
+-
+         operation = first_adapter.get_operation(request.user_id, request.operation_id)
+         month = first_adapter.get_month(request.user_id, request.month)
+         evidence = json.loads(
+@@ -613,6 +876,82 @@
+         self.assertTrue(current_execution.any_dispatch_attempted)
+         self.assertFalse(new_execution.any_dispatch_attempted)
+ 
++    def test_active_provider_claim_blocks_duplicate_without_early_settlement(self) -> None:
++        directory = Path(self._temporary_directory.name)
++        meter = UsageMeter(
++            JsonSubscriptionRepository(directory / "active-subscriptions.json"),
++            JsonUsageRepository(directory / "active-usage.json"),
++            _USER_ID,
++            rate=_RATE,
++            now=datetime.now(UTC),
++            plan_loader=lambda _plan_id: _PLAN,
++            reservation_enabled=True,
++        )
++        operation = meter.reserve(
++            "019b63f8-f600-7000-8000-000000000317",
++            "active-provider-claim",
++            "chat",
++            11,
++        )
++        provider_started = threading.Event()
++        allow_provider_completion = threading.Event()
++        owner_errors: list[Exception] = []
++        owner_provider = mock.Mock(return_value="owner response")
+ 
++        def run_owner() -> None:
++            tally = UsageTally(rate=_RATE)
++
++            def dispatch() -> str:
++                tally.mark_dispatch_attempt()
++                provider_started.set()
++                if not allow_provider_completion.wait(timeout=2):
++                    raise TimeoutError("test did not release the active provider")
++                return owner_provider()
++
++            try:
++                with SynchronousExecution(
++                    meter,
++                    operation,
++                    kind="chat",
++                    response_model=ChatResponse,
++                ) as execution:
++                    execution.run(tally, dispatch, lambda reply: ChatResponse(reply=reply))
++            except Exception as exc:
++                owner_errors.append(exc)
++
++        owner = threading.Thread(target=run_owner, daemon=True)
++        owner.start()
++        self.assertTrue(provider_started.wait(timeout=2))
++        duplicate_provider = mock.Mock()
++        try:
++            with mock.patch.dict("os.environ", {"SYNC_EXECUTION_WAIT_SECONDS": "0.1"}):
++                duplicate = SynchronousExecution(
++                    meter,
++                    meter.get_operation(operation.operation_id),
++                    kind="chat",
++                    response_model=ChatResponse,
++                )
++                with self.assertRaises(PipelineError) as context:
++                    with duplicate:
++                        duplicate.run(
++                            UsageTally(rate=_RATE),
++                            duplicate_provider,
++                            lambda reply: ChatResponse(reply=reply),
++                        )
++            self.assertEqual(context.exception.status_code, 409)
++            duplicate_provider.assert_not_called()
++            active = meter.get_operation(operation.operation_id)
++            self.assertEqual(active.state, "reserved")
++            self.assertEqual(active.dispatch_evidence_state, "dispatched")
++        finally:
++            allow_provider_completion.set()
++            owner.join(timeout=2)
++        self.assertFalse(owner.is_alive())
++        self.assertEqual(owner_errors, [])
++        settled = meter.get_operation(operation.operation_id)
++        self.assertEqual(settled.state, "finalized")
++        self.assertEqual(owner_provider.call_count, 1)
++
++
+ if __name__ == "__main__":
+     unittest.main()

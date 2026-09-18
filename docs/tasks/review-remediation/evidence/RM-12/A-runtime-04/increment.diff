@@ -1,0 +1,1482 @@
+--- a/backend/repositories/dynamodb_billing_repositories.py
++++ b/backend/repositories/dynamodb_billing_repositories.py
+@@ -44,6 +44,7 @@
+     _promote_dispatch_evidence,
+     _ratchet_limits,
+     _reconcile_compatibility_counters,
++    _retain_processing_allowance,
+     _shadow_pending_values,
+     _subtract_reserved,
+     _validate_add_amounts,
+@@ -128,26 +129,32 @@
+             ):
+                 raise UsageOperationConflict("Shadow operation identity conflicts")
+             return existing
+-        operation = UsageOperation.reserved(request)
+-        try:
+-            self._store.transact_write(
+-                [
+-                    self._operation_put(operation, create=True),
+-                    self._event_put(operation, "shadow_start"),
+-                ]
+-            )
+-            return operation
+-        except ClientError as exc:
+-            if not _is_transaction_failure(exc):
+-                raise
+-        existing = self.get_operation(request.user_id, request.operation_id)
+-        if existing is not None:
+-            if (
+-                existing.accounting_mode != "shadow"
+-                or existing.payload_hash != request.payload_hash
+-            ):
+-                raise UsageOperationConflict("Shadow operation identity conflicts")
+-            return existing
++        for _attempt in range(4):
++            month = self._load_month(request.user_id, request.month)
++            expected_version = int(month.get("version") or 0)
++            _retain_processing_allowance(month, request)
++            month["version"] = expected_version + 1
++            operation = UsageOperation.reserved(request)
++            try:
++                self._store.transact_write(
++                    [
++                        self._aggregate_put(month, expected_version),
++                        self._operation_put(operation, create=True),
++                        self._event_put(operation, "shadow_start"),
++                    ]
++                )
++                return operation
++            except ClientError as exc:
++                if not _is_transaction_failure(exc):
++                    raise
++            existing = self.get_operation(request.user_id, request.operation_id)
++            if existing is not None:
++                if (
++                    existing.accounting_mode != "shadow"
++                    or existing.payload_hash != request.payload_hash
++                ):
++                    raise UsageOperationConflict("Shadow operation identity conflicts")
++                return existing
+         raise UsageRepositoryError("Shadow operation transaction conflicted")
+ 
+     def prepare_shadow_settlement(
+--- a/backend/repositories/usage_repository.py
++++ b/backend/repositories/usage_repository.py
+@@ -514,6 +514,8 @@
+                 ):
+                     raise UsageOperationConflict("Shadow operation identity conflicts")
+                 return operation
++            month = _get_or_add_month(items, request.user_id, request.month)
++            _retain_processing_allowance(month, request)
+             operation = UsageOperation.reserved(request)
+             items.append(_operation_to_record(operation))
+             items.append(_event_record(operation, "shadow_start"))
+@@ -1293,6 +1295,18 @@
+         month["plan_id"] = request.plan_id
+ 
+ 
++def _retain_processing_allowance(month: dict[str, Any], request: UsageReservationRequest) -> None:
++    """Retain processing-only caps without changing quota or entitlement state."""
++    month["sentences_per_article"] = max(
++        int(month.get("sentences_per_article") or 0),
++        request.sentences_per_article,
++    )
++    month["source_tokens_per_article"] = max(
++        int(month.get("source_tokens_per_article") or 0),
++        request.source_tokens_per_article,
++    )
++
++
+ def _reconcile_compatibility_counters(month: dict[str, Any], *, force: bool = False) -> None:
+     """Keep shadow/rollback totals aligned with reservation admission totals."""
+     if not force and not month.get("plan_id"):
+--- a/backend/services/entitlements.py
++++ b/backend/services/entitlements.py
+@@ -33,6 +33,15 @@
+         super().__init__(message)
+         self.code = code
+         self.status_code = status_code
++
++
++@dataclass(frozen=True)
++class EffectiveProcessingAllowance:
++    """The account-scoped processing caps for one accounting month."""
++
++    month: str
++    sentences_per_article: int
++    source_tokens_per_article: int
+ 
+ 
+ def current_month(now: datetime | None = None) -> str:
+@@ -130,11 +139,36 @@
+     )
+ 
+ 
++def resolve_effective_processing_allowance(
++    guard: EntitlementGuard,
++) -> EffectiveProcessingAllowance:
++    """Keep same-month retained processing caps without changing entitlement."""
++    usage = guard.usage_repository.get_month(guard.user_id, guard.month)
++    retained_plan_id = usage.get("plan_id")
++    retained_plan = get_plan_limits(str(retained_plan_id)) if retained_plan_id else guard.plan
++    return EffectiveProcessingAllowance(
++        month=guard.month,
++        sentences_per_article=max(
++            guard.plan.sentences_per_article,
++            _retained_processing_cap(
++                usage.get("sentences_per_article"), retained_plan.sentences_per_article
++            ),
++        ),
++        source_tokens_per_article=max(
++            guard.plan.source_tokens_per_article,
++            _retained_processing_cap(
++                usage.get("source_tokens_per_article"),
++                retained_plan.source_tokens_per_article,
++            ),
++        ),
++    )
++
++
+ def usage_summary(guard: EntitlementGuard) -> dict[str, Any]:
+     usage = guard.usage_repository.get_month(guard.user_id, guard.month)
++    allowance = resolve_effective_processing_allowance(guard)
+     has_snapshot = bool(usage.get("plan_id"))
+     quota_plan_id = str(usage.get("plan_id") or guard.plan.plan_id)
+-    quota_plan = get_plan_limits(quota_plan_id)
+     articles_used = int(
+         usage.get("committed_articles") if has_snapshot else usage.get("articles") or 0
+     )
+@@ -178,15 +212,17 @@
+         "chats_limit": chats_limit,
+         "chats_remaining": max(0, chats_limit - chats_used - chats_pending),
+         "reset_at": _reset_at(guard.month),
+-        "sentences_per_article": int(
+-            usage.get("sentences_per_article") or quota_plan.sentences_per_article
+-        ),
+-        "source_tokens_per_article": int(
+-            usage.get("source_tokens_per_article") or quota_plan.source_tokens_per_article
+-        ),
++        "sentences_per_article": allowance.sentences_per_article,
++        "source_tokens_per_article": allowance.source_tokens_per_article,
+         "plan_ends_at": plan_ends_at,
+         "warning_codes": warnings,
+     }
++
++
++def _retained_processing_cap(value: Any, fallback: int) -> int:
++    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
++        return value
++    return fallback
+ 
+ 
+ def _at_warning_threshold(used_and_pending: int, limit: int) -> bool:
+--- a/backend/services/preloading.py
++++ b/backend/services/preloading.py
+@@ -49,7 +49,13 @@
+ from storage.preload_content_store import PreloadContentStore
+ 
+ from services.admin_activity import TerminalActivityOutcome, record_terminal_activity
+-from services.entitlements import EntitlementError, EntitlementGuard, build_guard
++from services.entitlements import (
++    EffectiveProcessingAllowance,
++    EntitlementError,
++    EntitlementGuard,
++    build_guard,
++    resolve_effective_processing_allowance,
++)
+ from services.reading_queries import (
+     record_status as _record_status,
+ )
+@@ -99,6 +105,56 @@
+     )
+     durable.pricing_available = usage_meter.pricing_available
+     return durable
++
++
++def _allowance_with_saved_preload_caps(
++    allowance: EffectiveProcessingAllowance,
++    record: dict[str, Any],
++) -> EffectiveProcessingAllowance:
++    """Use positive caps saved with an older preload without changing its month."""
++    sentence_limit = record.get("sentence_limit")
++    source_token_limit = record.get("source_token_limit")
++    return EffectiveProcessingAllowance(
++        month=allowance.month,
++        sentences_per_article=(
++            sentence_limit
++            if isinstance(sentence_limit, int)
++            and not isinstance(sentence_limit, bool)
++            and sentence_limit > 0
++            else allowance.sentences_per_article
++        ),
++        source_tokens_per_article=(
++            source_token_limit
++            if isinstance(source_token_limit, int)
++            and not isinstance(source_token_limit, bool)
++            and source_token_limit > 0
++            else allowance.source_tokens_per_article
++        ),
++    )
++
++
++def _complete_saved_preload_allowance(
++    record: dict[str, Any] | None,
++    month: str,
++) -> EffectiveProcessingAllowance | None:
++    if record is None:
++        return None
++    sentence_limit = record.get("sentence_limit")
++    source_token_limit = record.get("source_token_limit")
++    if (
++        not isinstance(sentence_limit, int)
++        or isinstance(sentence_limit, bool)
++        or sentence_limit <= 0
++        or not isinstance(source_token_limit, int)
++        or isinstance(source_token_limit, bool)
++        or source_token_limit <= 0
++    ):
++        return None
++    return EffectiveProcessingAllowance(
++        month=month,
++        sentences_per_article=sentence_limit,
++        source_tokens_per_article=source_token_limit,
++    )
+ 
+ 
+ # A "processing" record older than this is treated as stale (its worker
+@@ -363,6 +419,10 @@
+                 usage_meter,
+             )
+         )
++    if requested_record and requested_record.get("status") == "ready" and usage_meter:
++        operation = usage_meter.get_operation(request.operation_id)
++        if operation is None or operation.state == "finalized":
++            return _to_status_response(requested_record)
+     existing = repository.get_by_page_url(user_id, request.page_url)
+     if (
+         existing
+@@ -418,9 +478,40 @@
+         page_title=request.page_title,
+     )
+     target, native = _resolve_language_pair(request.target_language, request.native_language)
+-    plan = usage_meter.current_plan() if usage_meter else (guard.plan if guard else None)
+-    sentence_limit = plan.sentences_per_article if plan else None
+-    source_token_limit = plan.source_tokens_per_article if plan else None
++    if usage_meter:
++        persisted_operation = usage_meter.get_operation(request.operation_id)
++        allowance = _complete_saved_preload_allowance(
++            requested_record,
++            persisted_operation.month if persisted_operation is not None else "",
++        )
++        if allowance is None:
++            try:
++                allowance = usage_meter.processing_allowance(request.operation_id)
++            except UsageOperationStateError as exc:
++                raise EntitlementError(
++                    "Saved processing allowance is unavailable.",
++                    code="operation_context_unavailable",
++                    status_code=409,
++                ) from exc
++    elif isinstance(guard, EntitlementGuard):
++        allowance = resolve_effective_processing_allowance(guard)
++    elif guard:
++        # Plan-only guards retain their declared processing caps.
++        allowance = EffectiveProcessingAllowance(
++            month="",
++            sentences_per_article=guard.plan.sentences_per_article,
++            source_tokens_per_article=guard.plan.source_tokens_per_article,
++        )
++    else:
++        allowance = None
++    if (
++        requested_record
++        and allowance
++        and not _complete_saved_preload_allowance(requested_record, allowance.month)
++    ):
++        allowance = _allowance_with_saved_preload_caps(allowance, requested_record)
++    sentence_limit = allowance.sentences_per_article if allowance else None
++    source_token_limit = allowance.source_tokens_per_article if allowance else None
+     prepared = _prepare_article_content(
+         content,
+         sentence_limit=sentence_limit,
+@@ -462,6 +553,7 @@
+                 payload_hash,
+                 "article",
+                 estimated_cost,
++                allowance=allowance,
+             )
+         except EntitlementError as exc:
+             record_terminal_activity(
+@@ -477,6 +569,36 @@
+                 preserve_failure=True,
+             )
+             raise
++        canonical_allowance = _complete_saved_preload_allowance(requested_record, operation.month)
++        if canonical_allowance is None:
++            try:
++                canonical_allowance = usage_meter.processing_allowance(operation.operation_id)
++            except UsageOperationStateError as exc:
++                raise EntitlementError(
++                    "Saved processing allowance is unavailable.",
++                    code="operation_context_unavailable",
++                    status_code=409,
++                ) from exc
++        if requested_record and not _complete_saved_preload_allowance(
++            requested_record, operation.month
++        ):
++            canonical_allowance = _allowance_with_saved_preload_caps(
++                canonical_allowance,
++                requested_record,
++            )
++        if allowance != canonical_allowance:
++            # A concurrent same-operation reservation won after this submit
++            # prepared its input. Its month and caps are immutable, so rebuild
++            # before claiming any page or content state.
++            allowance = canonical_allowance
++            sentence_limit = allowance.sentences_per_article
++            source_token_limit = allowance.source_tokens_per_article
++            prepared = _prepare_article_content(
++                content,
++                sentence_limit=sentence_limit,
++                source_token_limit=source_token_limit,
++            )
++            estimated_cost = estimate() if reservation_enabled else _shadow_estimate(estimate)
+         operation_record = repository.get_by_id(user_id, operation.operation_id)
+         if (
+             reservation_enabled
+--- a/backend/services/usage_meter.py
++++ b/backend/services/usage_meter.py
+@@ -28,9 +28,12 @@
+ )
+ 
+ from services.entitlements import (
++    EffectiveProcessingAllowance,
+     EntitlementError,
++    EntitlementGuard,
+     current_month,
+     normalize_utc,
++    resolve_effective_processing_allowance,
+     resolve_plan_id,
+ )
+ 
+@@ -107,33 +110,43 @@
+         meter: Meter,
+         estimated_cost_micro_usd: int,
+         now: datetime | None = None,
++        *,
++        allowance: EffectiveProcessingAllowance | None = None,
+     ) -> UsageOperation:
+         if meter not in ("article", "chat", "cost"):
+             raise ValueError(f"Unknown usage meter: {meter}")
+         moment = normalize_utc(now or self.now or datetime.now(UTC))
+-        plan = self._current_plan(moment)
+-        request = UsageReservationRequest(
+-            operation_id=operation_id,
+-            user_id=self.user_id,
+-            month=current_month(moment),
+-            meter=meter,
+-            payload_hash=payload_hash,
+-            plan_id=plan.plan_id,
+-            rate_card_version=self.rate.version,
+-            tokenizer_encoding=os.getenv("OPENAI_TOKEN_ENCODING", "o200k_base").strip(),
+-            expires_at=moment + timedelta(seconds=self.reservation_ttl_seconds),
+-            articles=1 if meter == "article" else 0,
+-            chats=1 if meter == "chat" else 0,
+-            cost_micro_usd=estimated_cost_micro_usd,
+-            article_limit=plan.articles_per_month,
+-            chat_limit=plan.chats_per_month,
+-            cost_micro_usd_limit=plan.cost_micro_usd_per_month,
+-            sentences_per_article=plan.sentences_per_article,
+-            source_tokens_per_article=plan.source_tokens_per_article,
+-            model=self.rate.model,
+-            input_micro_usd_per_million=self.rate.input_micro_usd_per_million,
+-            output_micro_usd_per_million=self.rate.output_micro_usd_per_million,
+-        )
++        existing = self.get_operation(operation_id)
++        if existing is not None:
++            request = _replay_reservation_request(existing, payload_hash, meter)
++        else:
++            plan = self._current_plan(moment)
++            if allowance is None:
++                allowance = self.processing_allowance(now=moment)
++            elif allowance.month != current_month(moment):
++                raise ValueError("New operation allowance must use the current accounting month")
++            request = UsageReservationRequest(
++                operation_id=operation_id,
++                user_id=self.user_id,
++                month=allowance.month,
++                meter=meter,
++                payload_hash=payload_hash,
++                plan_id=plan.plan_id,
++                rate_card_version=self.rate.version,
++                tokenizer_encoding=os.getenv("OPENAI_TOKEN_ENCODING", "o200k_base").strip(),
++                expires_at=moment + timedelta(seconds=self.reservation_ttl_seconds),
++                articles=1 if meter == "article" else 0,
++                chats=1 if meter == "chat" else 0,
++                cost_micro_usd=estimated_cost_micro_usd,
++                article_limit=plan.articles_per_month,
++                chat_limit=plan.chats_per_month,
++                cost_micro_usd_limit=plan.cost_micro_usd_per_month,
++                sentences_per_article=allowance.sentences_per_article,
++                source_tokens_per_article=allowance.source_tokens_per_article,
++                model=self.rate.model,
++                input_micro_usd_per_million=self.rate.input_micro_usd_per_million,
++                output_micro_usd_per_million=self.rate.output_micro_usd_per_million,
++            )
+         if self.durable_shadow:
+             operation = self.usage_repository.start_shadow(
+                 replace(
+@@ -152,7 +165,7 @@
+                 "usage_reserved",
+                 operation_id=operation_id,
+                 meter=meter,
+-                plan_id=plan.plan_id,
++                plan_id=request.plan_id,
+                 estimated_cost_micro_usd=estimated_cost_micro_usd,
+                 enforcement="shadow",
+             )
+@@ -180,7 +193,7 @@
+                 "usage_reserved",
+                 operation_id=operation_id,
+                 meter=meter,
+-                plan_id=plan.plan_id,
++                plan_id=request.plan_id,
+                 estimated_cost_micro_usd=estimated_cost_micro_usd,
+                 enforcement="enabled",
+             )
+@@ -190,7 +203,7 @@
+                 "usage_reserve_blocked",
+                 operation_id=operation_id,
+                 meter=meter,
+-                plan_id=plan.plan_id,
++                plan_id=request.plan_id,
+                 reason=type(exc).__name__,
+             )
+             raise _entitlement_error(exc) from exc
+@@ -321,6 +334,50 @@
+     def current_plan(self, now: datetime | None = None) -> PlanLimits:
+         moment = normalize_utc(now or self.now or datetime.now(UTC))
+         return self._current_plan(moment)
++
++    def processing_allowance(
++        self,
++        operation_id: str | None = None,
++        now: datetime | None = None,
++    ) -> EffectiveProcessingAllowance:
++        if operation_id:
++            operation = self.get_operation(operation_id)
++            if operation is not None:
++                if _has_complete_processing_caps(operation):
++                    return EffectiveProcessingAllowance(
++                        month=operation.month,
++                        sentences_per_article=operation.sentences_per_article,
++                        source_tokens_per_article=operation.source_tokens_per_article,
++                    )
++                try:
++                    pinned_plan = self.plan_loader(operation.plan_id)
++                except Exception as exc:  # noqa: BLE001 - safe failure for missing legacy context
++                    raise UsageOperationStateError(
++                        "Legacy operation processing allowance is unavailable"
++                    ) from exc
++                if getattr(pinned_plan, "plan_id", None) != operation.plan_id:
++                    raise UsageOperationStateError(
++                        "Legacy operation processing allowance is unavailable"
++                    )
++                return EffectiveProcessingAllowance(
++                    month=operation.month,
++                    sentences_per_article=_pinned_processing_cap(
++                        operation.sentences_per_article,
++                        pinned_plan.sentences_per_article,
++                    ),
++                    source_tokens_per_article=_pinned_processing_cap(
++                        operation.source_tokens_per_article,
++                        pinned_plan.source_tokens_per_article,
++                    ),
++                )
++        moment = normalize_utc(now or self.now or datetime.now(UTC))
++        guard = EntitlementGuard(
++            plan=self._current_plan(moment),
++            usage_repository=self.usage_repository,
++            user_id=self.user_id,
++            month=current_month(moment),
++        )
++        return resolve_effective_processing_allowance(guard)
+ 
+     def observe_shadow(
+         self,
+@@ -542,6 +599,52 @@
+     )
+ 
+ 
++def _replay_reservation_request(
++    operation: UsageOperation,
++    payload_hash: str,
++    meter: Meter,
++) -> UsageReservationRequest:
++    """Route a replay through repository idempotency using pinned operation context."""
++    return UsageReservationRequest(
++        operation_id=operation.operation_id,
++        user_id=operation.user_id,
++        month=operation.month,
++        meter=meter,
++        payload_hash=payload_hash,
++        plan_id=operation.plan_id,
++        rate_card_version=operation.rate_card_version,
++        tokenizer_encoding=operation.tokenizer_encoding,
++        expires_at=operation.expires_at,
++        articles=operation.reserved_articles,
++        chats=operation.reserved_chats,
++        cost_micro_usd=operation.reserved_cost_micro_usd,
++        article_limit=operation.article_limit,
++        chat_limit=operation.chat_limit,
++        cost_micro_usd_limit=operation.cost_micro_usd_limit,
++        sentences_per_article=operation.sentences_per_article,
++        source_tokens_per_article=operation.source_tokens_per_article,
++        model=operation.model,
++        input_micro_usd_per_million=operation.input_micro_usd_per_million,
++        output_micro_usd_per_million=operation.output_micro_usd_per_million,
++    )
++
++
++def _pinned_processing_cap(value: int, fallback: int) -> int:
++    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
++        return value
++    return fallback
++
++
++def _has_complete_processing_caps(operation: UsageOperation) -> bool:
++    return _is_positive_processing_cap(
++        operation.sentences_per_article
++    ) and _is_positive_processing_cap(operation.source_tokens_per_article)
++
++
++def _is_positive_processing_cap(value: int) -> bool:
++    return isinstance(value, int) and not isinstance(value, bool) and value > 0
++
++
+ def _usage_values(usage: Any) -> dict[str, int]:
+     def value(name: str, fallback: int = 0) -> int:
+         if isinstance(usage, dict):
+--- a/backend/test_billing.py
++++ b/backend/test_billing.py
+@@ -24,7 +24,7 @@
+ )
+ from accounts.testing import build_test_accounts
+ from core.pipeline import UsageTally
+-from core.plans import PLAN_CATALOG, PlanLimits, load_plans
++from core.plans import PLAN_CATALOG, PlanLimits, get_plan_limits, load_plans
+ from core.usage_costs import ModelRate
+ from deps import (
+     get_accounts,
+@@ -769,22 +769,46 @@
+         ):
+             self.assertNotIn(hidden, body)
+ 
+-    def test_billing_me_uses_pinned_sentence_and_source_limits(self):
+-        pinned = PlanLimits("basic", 10, 50, 17, 1_234, 1_000, 200_000)
++    def test_billing_me_uses_current_limits_when_retained_processing_caps_are_lower(self):
++        retained = PlanLimits("basic", 10, 50, 17, 1_234, 1_000, 200_000)
+         meter = UsageMeter(
+             self.subs,
+             self.usage,
+             self.user_id,
+             rate=ModelRate("test", 1, 1, "test-v1"),
+-            plan_loader=lambda _: pinned,
++            plan_loader=lambda _: retained,
+             reservation_enabled=True,
+         )
+         meter.reserve("pinned-limits", "payload", "cost", 1)
+ 
+         body = self.client.get("/billing/me", headers=self.headers).json()
+ 
+-        self.assertEqual(body["sentences_per_article"], 17)
+-        self.assertEqual(body["source_tokens_per_article"], 1_234)
++        basic_allowance = get_plan_limits("basic")
++        self.assertEqual(body["sentences_per_article"], basic_allowance.sentences_per_article)
++        self.assertEqual(
++            body["source_tokens_per_article"],
++            basic_allowance.source_tokens_per_article,
++        )
++
++    def test_billing_me_keeps_higher_retained_processing_caps(self):
++        retained = PlanLimits("basic", 10, 50, 77, 12_345, 1_000, 200_000)
++        meter = UsageMeter(
++            self.subs,
++            self.usage,
++            self.user_id,
++            rate=ModelRate("test", 1, 1, "test-v1"),
++            plan_loader=lambda _: retained,
++            reservation_enabled=True,
++        )
++        meter.reserve("higher-retained-limits", "payload", "cost", 1)
++
++        body = self.client.get("/billing/me", headers=self.headers).json()
++
++        self.assertEqual(body["sentences_per_article"], retained.sentences_per_article)
++        self.assertEqual(
++            body["source_tokens_per_article"],
++            retained.source_tokens_per_article,
++        )
+ 
+     def test_mock_checkout_activates_plan_immediately(self):
+         response = self.client.post("/billing/checkout", json={"plan": "pro"}, headers=self.headers)
+--- a/backend/test_preload_jobs.py
++++ b/backend/test_preload_jobs.py
+@@ -25,7 +25,7 @@
+ import repositories.page_preload_repository as preload_repository_module
+ from accounts.storage import JsonEmailAuthService, JsonSubscriptionRepository
+ from accounts.testing import build_test_accounts
+-from core.plans import PLAN_CATALOG
++from core.plans import PLAN_CATALOG, PlanLimits
+ from deps import (
+     get_accounts,
+     get_entitlement_guard,
+@@ -847,6 +847,240 @@
+         self.assertEqual(stored["usage_state"], "reserved")
+         self.assertGreater(operation.reserved_cost_micro_usd, 0)
+         self.assertEqual(runner.calls[0][4]["operation_id"], request.operation_id)
++
++    def test_reserve_race_rebuilds_preload_using_the_winning_operation_allowance(self):
++        lower = PlanLimits("basic", 10, 10, 1, 100, 1_000, 200_000)
++        upgraded = PlanLimits("basic", 10, 10, 3, 200, 1_000, 200_000)
++        winner = UsageMeter(
++            self.subs,
++            self.usage,
++            "u1",
++            now=datetime(2026, 7, 31, 23, 59, tzinfo=UTC),
++            plan_loader=lambda _: upgraded,
++        )
++        reserve_started = threading.Event()
++        resume_reserve = threading.Event()
++
++        class PausingMeter(UsageMeter):
++            def reserve(self, *args, **kwargs):
++                reserve_started.set()
++                if not resume_reserve.wait(timeout=1):
++                    raise AssertionError("winner reservation did not complete")
++                return super().reserve(*args, **kwargs)
++
++        loser = PausingMeter(
++            self.subs,
++            self.usage,
++            "u1",
++            now=datetime(2026, 8, 1, 0, 1, tzinfo=UTC),
++            plan_loader=lambda _: lower,
++        )
++        request = self._request().model_copy(
++            update={"operation_id": "019b63f8-f600-7000-8000-000000000077"}
++        )
++        runner = _UsageAwareRunner(self.usage)
++        prepared_limits: list[tuple[int | None, int | None]] = []
++        estimate_limits: list[tuple[int | None, int | None]] = []
++        submit_result: dict[str, object] = {}
++        original_prepare = preloading._prepare_article_content
++        original_estimate = preloading.estimate_article_cost_micro_usd
++
++        def prepare(content, *, sentence_limit, source_token_limit):
++            prepared_limits.append((sentence_limit, source_token_limit))
++            return original_prepare(
++                content,
++                sentence_limit=sentence_limit,
++                source_token_limit=source_token_limit,
++            )
++
++        def estimate(prepared, **kwargs):
++            estimate_limits.append((prepared.sentence_limit, prepared.source_token_limit))
++            return original_estimate(prepared, **kwargs)
++
++        def submit_loser() -> None:
++            try:
++                submit_result["response"] = reading.submit_preload(
++                    self.preloads,
++                    runner,
++                    self.content,
++                    "u1",
++                    request,
++                    usage_meter=loser,
++                )
++            except BaseException as exc:  # noqa: BLE001 - propagate thread failure to the test
++                submit_result["error"] = exc
++
++        with (
++            mock.patch.object(preloading, "_prepare_article_content", side_effect=prepare),
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", side_effect=estimate),
++        ):
++            caller = threading.Thread(target=submit_loser)
++            caller.start()
++            try:
++                self.assertTrue(reserve_started.wait(timeout=1))
++                winner_allowance = winner.processing_allowance(request.operation_id)
++                winner.reserve(
++                    request.operation_id,
++                    preloading.canonical_payload_hash(request, exclude={"operation_id"}),
++                    "article",
++                    1,
++                    allowance=winner_allowance,
++                )
++            finally:
++                resume_reserve.set()
++                caller.join(timeout=1)
++
++        self.assertFalse(caller.is_alive())
++        if error := submit_result.get("error"):
++            raise error
++        record = self.preloads.get_by_id("u1", request.operation_id)
++        operation = self.usage.get_operation("u1", request.operation_id)
++        self.assertEqual(submit_result["response"].status, "processing")
++        self.assertEqual(
++            prepared_limits,
++            [
++                (lower.sentences_per_article, lower.source_tokens_per_article),
++                (upgraded.sentences_per_article, upgraded.source_tokens_per_article),
++            ],
++        )
++        self.assertEqual(estimate_limits, prepared_limits)
++        self.assertEqual(
++            (record["usage_month"], record["sentence_limit"], record["source_token_limit"]),
++            (
++                "2026-07",
++                upgraded.sentences_per_article,
++                upgraded.source_tokens_per_article,
++            ),
++        )
++        self.assertEqual(
++            (operation.month, operation.sentences_per_article, operation.source_tokens_per_article),
++            (
++                "2026-07",
++                upgraded.sentences_per_article,
++                upgraded.source_tokens_per_article,
++            ),
++        )
++        self.assertEqual(
++            (runner.calls[0][4]["sentence_limit"], runner.calls[0][4]["source_token_limit"]),
++            (upgraded.sentences_per_article, upgraded.source_tokens_per_article),
++        )
++
++    def test_active_legacy_operation_uses_saved_preload_caps_not_current_plan(self):
++        original = PlanLimits("basic", 10, 10, 1, 100, 1_000, 200_000)
++        request = self._request().model_copy(
++            update={"operation_id": "019b63f8-f600-7000-8000-000000000078"}
++        )
++        runner = _UsageAwareRunner(self.usage)
++        original_meter = UsageMeter(
++            self.subs,
++            self.usage,
++            "u1",
++            plan_loader=lambda _: original,
++        )
++        reading.submit_preload(
++            self.preloads,
++            runner,
++            self.content,
++            "u1",
++            request,
++            usage_meter=original_meter,
++        )
++        records = json.loads(self.usage._path.read_text(encoding="utf-8"))
++        for record in records:
++            if record.get("operation_id") == request.operation_id:
++                record.pop("sentences_per_article", None)
++                record.pop("source_tokens_per_article", None)
++        write_json_list(self.usage._path, records)
++
++        def unavailable_plan_loader(_plan_id: str | None) -> PlanLimits:
++            raise RuntimeError("legacy plan is unavailable")
++
++        current_meter = UsageMeter(
++            self.subs,
++            self.usage,
++            "u1",
++            plan_loader=unavailable_plan_loader,
++        )
++        prepared_limits: list[tuple[int | None, int | None]] = []
++        original_prepare = preloading._prepare_article_content
++
++        def prepare(content, *, sentence_limit, source_token_limit):
++            prepared_limits.append((sentence_limit, source_token_limit))
++            return original_prepare(
++                content,
++                sentence_limit=sentence_limit,
++                source_token_limit=source_token_limit,
++            )
++
++        with mock.patch.object(preloading, "_prepare_article_content", side_effect=prepare):
++            replay = reading.submit_preload(
++                self.preloads,
++                runner,
++                self.content,
++                "u1",
++                request,
++                usage_meter=current_meter,
++            )
++
++        self.assertEqual(replay.status, "processing")
++        self.assertEqual(
++            prepared_limits,
++            [(original.sentences_per_article, original.source_tokens_per_article)],
++        )
++        self.assertEqual(len(runner.calls), 1)
++
++    def test_ready_legacy_operation_replays_before_preparation(self):
++        request = self._request().model_copy(
++            update={"operation_id": "019b63f8-f600-7000-8000-000000000079"}
++        )
++        runner = _UsageAwareRunner(self.usage)
++        meter = self._meter()
++        reading.submit_preload(
++            self.preloads,
++            runner,
++            self.content,
++            "u1",
++            request,
++            usage_meter=meter,
++        )
++        meter.finalize(
++            request.operation_id,
++            {"total_tokens": 1, "actual_cost_micro_usd": 1},
++            result_ref=request.operation_id,
++        )
++        ready = self.preloads.get_by_id("u1", request.operation_id)
++        ready.update({"status": "ready", "summary": "Saved result"})
++        self.preloads.save("u1", ready, make_latest=False)
++        records = json.loads(self.usage._path.read_text(encoding="utf-8"))
++        for record in records:
++            if record.get("operation_id") == request.operation_id:
++                record.pop("sentences_per_article", None)
++                record.pop("source_tokens_per_article", None)
++        write_json_list(self.usage._path, records)
++        upgraded = UsageMeter(
++            self.subs,
++            self.usage,
++            "u1",
++            plan_loader=lambda _: PlanLimits("basic", 10, 10, 300, 72_000, 1_000, 200_000),
++        )
++
++        with mock.patch.object(
++            preloading,
++            "_prepare_article_content",
++            side_effect=AssertionError("ready replay must not prepare content"),
++        ):
++            replay = reading.submit_preload(
++                self.preloads,
++                runner,
++                self.content,
++                "u1",
++                request,
++                usage_meter=upgraded,
++            )
++
++        self.assertTrue(replay.ready)
++        self.assertEqual(replay.preload.summary, "Saved result")
++        self.assertEqual(len(runner.calls), 1)
+ 
+     def test_enqueue_failure_retains_reservation_when_dispatch_is_ambiguous(self):
+         runner = _UsageAwareRunner(self.usage, fail=True)
+--- a/backend/test_processing_allowance.py
++++ b/backend/test_processing_allowance.py
+@@ -0,0 +1,407 @@
++"""Public regressions for one effective monthly processing allowance."""
++
++from __future__ import annotations
++
++import os
++import tempfile
++import types
++import unittest
++from datetime import UTC, datetime
++from pathlib import Path
++from unittest import mock
++
++import core.pipeline as pipeline
++from accounts.storage import JsonSubscriptionRepository
++from core.plans import get_plan_limits
++from core.usage_costs import ModelRate
++from repositories.page_preload_repository import JsonPagePreloadRepository
++from repositories.usage_repository import JsonUsageRepository
++from schemas import PagePreloadRequest
++from services import preloading
++from services.entitlements import (
++    EffectiveProcessingAllowance,
++    build_guard,
++    usage_summary,
++)
++from services.usage_meter import UsageMeter
++from storage.preload_content_store import FilesystemPreloadContentStore
++
++_JULY = datetime(2026, 7, 31, 23, 50, tzinfo=UTC)
++_AUGUST = datetime(2026, 8, 1, 0, 10, tzinfo=UTC)
++_USER_ID = "processing-allowance-user"
++_SECOND_USER_ID = "processing-allowance-other-user"
++_PRO_OPERATION_ID = "019b63f8-f600-7000-8000-000000000701"
++_CURRENT_OPERATION_ID = "019b63f8-f600-7000-8000-000000000702"
++_SOURCE_OPERATION_ID = "019b63f8-f600-7000-8000-000000000703"
++_UPGRADE_OPERATION_ID = "019b63f8-f600-7000-8000-000000000704"
++_SHADOW_OPERATION_ID = "019b63f8-f600-7000-8000-000000000705"
++_SHADOW_CURRENT_OPERATION_ID = "019b63f8-f600-7000-8000-000000000706"
++
++
++class _RecordingRunner:
++    def __init__(self) -> None:
++        self.calls: list[tuple] = []
++
++    def enqueue(
++        self,
++        user_id: str,
++        page_url: str,
++        preload_id: str,
++        learner_profile_fingerprint: str,
++        usage_context: dict | None = None,
++    ) -> None:
++        self.calls.append(
++            (user_id, page_url, preload_id, learner_profile_fingerprint, usage_context)
++        )
++
++
++class ProcessingAllowanceTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++        directory = Path(self._temporary_directory.name)
++        self.preloads = JsonPagePreloadRepository(directory / "preloads.json")
++        self.usage = JsonUsageRepository(directory / "usage.json")
++        self.subscriptions = JsonSubscriptionRepository(directory / "subscriptions.json")
++        self.content = FilesystemPreloadContentStore(directory / "content")
++        self.runner = _RecordingRunner()
++        self._rate_environment = mock.patch.dict(
++            os.environ,
++            {
++                "OPENAI_MODEL": pipeline.OPENAI_MODEL,
++                "OPENAI_RATE_CARD_VERSION": "allowance-test",
++                "OPENAI_MODEL_INPUT_MICRO_USD_PER_MILLION": "1",
++                "OPENAI_MODEL_OUTPUT_MICRO_USD_PER_MILLION": "1",
++            },
++        )
++        self._rate_environment.start()
++        self.basic = get_plan_limits("basic")
++        self.pro = get_plan_limits("pro")
++        self.rate = ModelRate(pipeline.OPENAI_MODEL, 1, 1, "allowance-test")
++
++    def tearDown(self) -> None:
++        self._rate_environment.stop()
++        self._temporary_directory.cleanup()
++
++    @staticmethod
++    def _html(sentence_count: int, *, words_per_sentence: int = 20) -> str:
++        sentence = " ".join(["reading"] * words_per_sentence)
++        paragraphs = [f"<p>Sentence {index} {sentence}.</p>" for index in range(sentence_count)]
++        return "<article>" + "".join(paragraphs) + "</article>"
++
++    @staticmethod
++    def _token_dense_html(sentence_count: int, *, phrase_repetitions: int) -> str:
++        sentence = " ".join(["we go to it"] * phrase_repetitions)
++        paragraphs = [f"<p>Sentence {index} {sentence}.</p>" for index in range(sentence_count)]
++        return "<article>" + "".join(paragraphs) + "</article>"
++
++    @staticmethod
++    def _subscription(plan: str) -> dict:
++        return {
++            "plan": plan,
++            "status": "active",
++            "current_period_end": int(datetime(2026, 12, 1, tzinfo=UTC).timestamp()),
++            "entitlement_provider": "mock",
++        }
++
++    def _meter(
++        self,
++        user_id: str,
++        now: datetime,
++        *,
++        durable_shadow: bool = False,
++    ) -> UsageMeter:
++        return UsageMeter(
++            self.subscriptions,
++            self.usage,
++            user_id,
++            rate=self.rate,
++            now=now,
++            provider_mode="mock",
++            reservation_enabled=not durable_shadow,
++            durable_shadow=durable_shadow,
++        )
++
++    def _guard(self, user_id: str, now: datetime):
++        return build_guard(
++            self.subscriptions,
++            self.usage,
++            user_id,
++            now,
++            provider_mode="mock",
++        )
++
++    def _request(self, operation_id: str, *, page_url: str, html: str) -> PagePreloadRequest:
++        return PagePreloadRequest(
++            operation_id=operation_id,
++            page_url=page_url,
++            page_title="Allowance article",
++            html=html,
++        )
++
++    def _submit(
++        self,
++        user_id: str,
++        request: PagePreloadRequest,
++        meter: UsageMeter,
++    ):
++        return preloading.submit_preload(
++            self.preloads,
++            self.runner,
++            self.content,
++            user_id,
++            request,
++            self._guard(user_id, meter.now),
++            usage_meter=meter,
++        )
++
++    def _run_worker(self, call: tuple) -> None:
++        def analyze(sentences, **kwargs):
++            tally = kwargs["tally"]
++            tally.mark_dispatch_attempt()
++            tally.add_response(
++                types.SimpleNamespace(
++                    model=pipeline.OPENAI_MODEL,
++                    usage=types.SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
++                )
++            )
++            return (
++                "summary",
++                [],
++                [
++                    {
++                        "id": f"analysis-{index}",
++                        "index": index,
++                        "text": sentence,
++                        "analysis": {},
++                    }
++                    for index, sentence in enumerate(sentences)
++                ],
++            )
++
++        with (
++            mock.patch.object(
++                pipeline,
++                "_split_sentences_with_ai",
++                side_effect=RuntimeError("provider splitter unavailable"),
++            ),
++            mock.patch.object(preloading, "_analyze_sentences", side_effect=analyze),
++            mock.patch.object(preloading, "_extract_study_items", return_value=([], {})),
++        ):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *call[:4],
++                billing_provider_mode="mock",
++            )
++
++    def test_same_month_pro_allowance_survives_downgrade_across_submit_estimate_worker_and_summary(
++        self,
++    ) -> None:
++        self.subscriptions.upsert(_USER_ID, self._subscription("pro"))
++        pro_request = self._request(
++            _PRO_OPERATION_ID,
++            page_url="https://example.com/pro-seed",
++            html=self._html(self.basic.sentences_per_article + 30),
++        )
++        self._submit(_USER_ID, pro_request, self._meter(_USER_ID, _JULY))
++
++        self.subscriptions.upsert(_USER_ID, {"plan": "basic", "status": "canceled"})
++        current_meter = self._meter(_USER_ID, _JULY)
++        allowance = current_meter.processing_allowance()
++        self.assertIsInstance(allowance, EffectiveProcessingAllowance)
++        self.assertEqual(allowance.month, "2026-07")
++        self.assertEqual(allowance.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(allowance.source_tokens_per_article, self.pro.source_tokens_per_article)
++
++        estimates: list[tuple[int | None, int | None]] = []
++        original_estimate = preloading.estimate_article_cost_micro_usd
++
++        def estimate(prepared, **kwargs):
++            estimates.append((prepared.sentence_limit, prepared.source_token_limit))
++            return original_estimate(prepared, **kwargs)
++
++        current_request = self._request(
++            _CURRENT_OPERATION_ID,
++            page_url="https://example.com/current-month",
++            html=self._html(self.basic.sentences_per_article + 30),
++        )
++        with mock.patch.object(preloading, "estimate_article_cost_micro_usd", side_effect=estimate):
++            response = self._submit(_USER_ID, current_request, current_meter)
++
++        record = self.preloads.get_by_id(_USER_ID, _CURRENT_OPERATION_ID)
++        operation = self.usage.get_operation(_USER_ID, _CURRENT_OPERATION_ID)
++        context = self.runner.calls[1][4]
++        summary = usage_summary(self._guard(_USER_ID, _JULY))
++        self.assertEqual(response.preload.sentence_limit, self.pro.sentences_per_article)
++        self.assertEqual(response.preload.source_token_limit, self.pro.source_tokens_per_article)
++        self.assertEqual(
++            estimates, [(self.pro.sentences_per_article, self.pro.source_tokens_per_article)]
++        )
++        self.assertEqual(record["sentence_limit"], self.pro.sentences_per_article)
++        self.assertEqual(record["source_token_limit"], self.pro.source_tokens_per_article)
++        self.assertEqual(operation.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(operation.source_tokens_per_article, self.pro.source_tokens_per_article)
++        self.assertEqual(context["sentence_limit"], self.pro.sentences_per_article)
++        self.assertEqual(context["source_token_limit"], self.pro.source_tokens_per_article)
++        self.assertEqual(summary["sentences_per_article"], self.pro.sentences_per_article)
++        self.assertEqual(summary["source_tokens_per_article"], self.pro.source_tokens_per_article)
++
++        self._run_worker(self.runner.calls[1])
++        ready = self.preloads.get_by_id(_USER_ID, _CURRENT_OPERATION_ID)
++        self.assertEqual(ready["status"], "ready")
++        self.assertEqual(len(ready["sentences"]), self.basic.sentences_per_article + 30)
++
++    def test_source_token_boundary_uses_the_same_retained_pro_allowance(self) -> None:
++        self.subscriptions.upsert(_USER_ID, self._subscription("pro"))
++        self._submit(
++            _USER_ID,
++            self._request(
++                _PRO_OPERATION_ID,
++                page_url="https://example.com/pro-source-seed",
++                html=self._html(1),
++            ),
++            self._meter(_USER_ID, _JULY),
++        )
++        self.subscriptions.upsert(_USER_ID, {"plan": "basic", "status": "canceled"})
++        source_html = self._token_dense_html(80, phrase_repetitions=45)
++        extracted_source = pipeline._extract_article_text(
++            html=source_html,
++            page_url="https://example.com/source-boundary",
++            page_title="Allowance article",
++        )
++        self.assertLessEqual(len(extracted_source), pipeline.MAX_PAGE_CONTENT_LENGTH)
++        self.assertGreater(
++            pipeline.estimate_tokens(extracted_source),
++            self.basic.source_tokens_per_article,
++        )
++        source_request = self._request(
++            _SOURCE_OPERATION_ID,
++            page_url="https://example.com/source-boundary",
++            html=source_html,
++        )
++        self._submit(_USER_ID, source_request, self._meter(_USER_ID, _JULY))
++
++        record = self.preloads.get_by_id(_USER_ID, _SOURCE_OPERATION_ID)
++        operation = self.usage.get_operation(_USER_ID, _SOURCE_OPERATION_ID)
++        context = self.runner.calls[1][4]
++        self.assertEqual(record["source_token_limit"], self.pro.source_tokens_per_article)
++        self.assertGreater(record["source_tokens_analyzed"], self.basic.source_tokens_per_article)
++        self.assertLessEqual(record["source_tokens_analyzed"], self.pro.source_tokens_per_article)
++        self.assertEqual(operation.source_tokens_per_article, self.pro.source_tokens_per_article)
++        self.assertEqual(context["source_token_limit"], self.pro.source_tokens_per_article)
++
++    def test_rollover_account_isolation_upgrade_and_existing_retry_keep_correct_allowances(
++        self,
++    ) -> None:
++        self.subscriptions.upsert(_USER_ID, self._subscription("pro"))
++        pro_request = self._request(
++            _PRO_OPERATION_ID,
++            page_url="https://example.com/pinned-operation",
++            html=self._html(self.basic.sentences_per_article + 10),
++        )
++        self._submit(_USER_ID, pro_request, self._meter(_USER_ID, _JULY))
++        self.subscriptions.upsert(_USER_ID, {"plan": "basic", "status": "canceled"})
++
++        august_meter = self._meter(_USER_ID, _AUGUST)
++        self.assertEqual(
++            august_meter.processing_allowance().sentences_per_article,
++            self.basic.sentences_per_article,
++        )
++        pinned = august_meter.processing_allowance(_PRO_OPERATION_ID)
++        self.assertEqual(pinned.month, "2026-07")
++        self.assertEqual(pinned.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(pinned.source_tokens_per_article, self.pro.source_tokens_per_article)
++
++        calls_before_retry = len(self.runner.calls)
++        retry = self._submit(_USER_ID, pro_request, august_meter)
++        retried_record = self.preloads.get_by_id(_USER_ID, _PRO_OPERATION_ID)
++        self.assertEqual(retry.preload.id, _PRO_OPERATION_ID)
++        self.assertEqual(len(self.runner.calls), calls_before_retry)
++        self.assertEqual(retried_record["usage_month"], "2026-07")
++        self.assertEqual(retried_record["sentence_limit"], self.pro.sentences_per_article)
++        self.assertEqual(retried_record["source_token_limit"], self.pro.source_tokens_per_article)
++
++        other_meter = self._meter(_SECOND_USER_ID, _JULY)
++        other_allowance = other_meter.processing_allowance()
++        self.assertEqual(other_allowance.month, "2026-07")
++        self.assertEqual(other_allowance.sentences_per_article, self.basic.sentences_per_article)
++        self.assertEqual(
++            other_allowance.source_tokens_per_article, self.basic.source_tokens_per_article
++        )
++
++        self._submit(
++            _SECOND_USER_ID,
++            self._request(
++                _UPGRADE_OPERATION_ID,
++                page_url="https://example.com/upgrade-basic",
++                html=self._html(1),
++            ),
++            other_meter,
++        )
++        self.subscriptions.upsert(_SECOND_USER_ID, self._subscription("pro"))
++        upgraded = self._meter(_SECOND_USER_ID, _JULY).processing_allowance()
++        self.assertEqual(upgraded.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(upgraded.source_tokens_per_article, self.pro.source_tokens_per_article)
++
++    def test_durable_shadow_retains_processing_caps_without_monthly_admission_effects(
++        self,
++    ) -> None:
++        self.subscriptions.upsert(_USER_ID, self._subscription("pro"))
++        shadow_meter = self._meter(_USER_ID, _JULY, durable_shadow=True)
++        self._submit(
++            _USER_ID,
++            self._request(
++                _SHADOW_OPERATION_ID,
++                page_url="https://example.com/shadow-pro-seed",
++                html=self._html(1),
++            ),
++            shadow_meter,
++        )
++
++        month = self.usage.get_month(_USER_ID, "2026-07")
++        self.assertEqual(month["sentences_per_article"], self.pro.sentences_per_article)
++        self.assertEqual(month["source_tokens_per_article"], self.pro.source_tokens_per_article)
++        self.assertIsNone(month["plan_id"])
++        self.assertEqual(month["article_limit"], 0)
++        self.assertEqual(month["chat_limit"], 0)
++        self.assertEqual(month["cost_micro_usd_limit"], 0)
++        self.assertEqual(month["reserved_articles"], 0)
++        self.assertEqual(month["reserved_chats"], 0)
++        self.assertEqual(month["reserved_cost_micro_usd"], 0)
++
++        self.subscriptions.upsert(_USER_ID, {"plan": "basic", "status": "canceled"})
++        downgraded_shadow_meter = self._meter(_USER_ID, _JULY, durable_shadow=True)
++        retained = downgraded_shadow_meter.processing_allowance()
++        self.assertEqual(retained.sentences_per_article, self.pro.sentences_per_article)
++        self.assertEqual(retained.source_tokens_per_article, self.pro.source_tokens_per_article)
++        self._submit(
++            _USER_ID,
++            self._request(
++                _SHADOW_CURRENT_OPERATION_ID,
++                page_url="https://example.com/shadow-current-month",
++                html=self._html(self.basic.sentences_per_article + 10),
++            ),
++            downgraded_shadow_meter,
++        )
++        record = self.preloads.get_by_id(_USER_ID, _SHADOW_CURRENT_OPERATION_ID)
++        self.assertEqual(record["sentence_limit"], self.pro.sentences_per_article)
++        self.assertEqual(record["source_token_limit"], self.pro.source_tokens_per_article)
++
++        next_month = self._meter(_USER_ID, _AUGUST, durable_shadow=True).processing_allowance()
++        other_account = self._meter(
++            _SECOND_USER_ID,
++            _JULY,
++            durable_shadow=True,
++        ).processing_allowance()
++        self.assertEqual(next_month.sentences_per_article, self.basic.sentences_per_article)
++        self.assertEqual(next_month.source_tokens_per_article, self.basic.source_tokens_per_article)
++        self.assertEqual(other_account.sentences_per_article, self.basic.sentences_per_article)
++        self.assertEqual(
++            other_account.source_tokens_per_article, self.basic.source_tokens_per_article
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/backend/test_usage_meter.py
++++ b/backend/test_usage_meter.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import json
+ import tempfile
+ import unittest
+ from datetime import UTC, datetime, timedelta, timezone
+@@ -7,7 +8,7 @@
+ from unittest.mock import patch
+ 
+ from accounts.storage import JsonSubscriptionRepository
+-from core.plans import PlanLimits
++from core.plans import PlanLimits, get_plan_limits
+ from core.usage_costs import ModelRate
+ from repositories.usage_repository import (
+     JsonUsageRepository,
+@@ -16,6 +17,7 @@
+ )
+ from services.entitlements import EntitlementError, build_guard, usage_summary
+ from services.usage_meter import UsageMeter
++from storage.json_list_store import write_json_list
+ 
+ NOW = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
+ USER_ID = "0190f4c0-0000-7000-8000-000000000001"
+@@ -57,7 +59,8 @@
+     def setUp(self) -> None:
+         self._tmpdir = tempfile.TemporaryDirectory()
+         root = Path(self._tmpdir.name)
+-        self.usage = JsonUsageRepository(root / "usage.json")
++        self.usage_path = root / "usage.json"
++        self.usage = JsonUsageRepository(self.usage_path)
+         self.subscriptions = JsonSubscriptionRepository(root / "subscriptions.json")
+ 
+     def tearDown(self) -> None:
+@@ -526,6 +529,69 @@
+         self.assertEqual(month["sentences_per_article"], 200)
+         self.assertEqual(month["source_tokens_per_article"], 48_000)
+ 
++    def test_processing_allowance_keeps_month_snapshot_and_operation_retry_pinned(self) -> None:
++        pro_meter = self.meter(plan=PRO)
++        original = pro_meter.reserve("pinned-processing", "payload", "article", 1)
++        downgraded = self.meter(plan=BASIC)
++
++        current = downgraded.processing_allowance()
++        pinned = downgraded.processing_allowance("pinned-processing")
++        replay = downgraded.reserve("pinned-processing", "payload", "article", 1)
++
++        self.assertEqual(
++            (current.month, current.sentences_per_article, current.source_tokens_per_article),
++            ("2026-07", PRO.sentences_per_article, PRO.source_tokens_per_article),
++        )
++        self.assertEqual(
++            (pinned.month, pinned.sentences_per_article, pinned.source_tokens_per_article),
++            (original.month, original.sentences_per_article, original.source_tokens_per_article),
++        )
++        self.assertEqual(
++            (replay.month, replay.sentences_per_article, replay.source_tokens_per_article),
++            (original.month, original.sentences_per_article, original.source_tokens_per_article),
++        )
++
++    def test_processing_allowance_uses_complete_persisted_caps_without_plan_loader(self) -> None:
++        original = self.meter(plan=PRO).reserve("persisted-caps", "payload", "article", 1)
++
++        def unavailable_plan_loader(_plan_id: str | None) -> PlanLimits:
++            raise RuntimeError("legacy plan is unavailable")
++
++        meter = UsageMeter(
++            self.subscriptions,
++            self.usage,
++            USER_ID,
++            rate=RATE,
++            now=NOW,
++            plan_loader=unavailable_plan_loader,
++        )
++
++        allowance = meter.processing_allowance("persisted-caps")
++
++        self.assertEqual(
++            (allowance.month, allowance.sentences_per_article, allowance.source_tokens_per_article),
++            (original.month, original.sentences_per_article, original.source_tokens_per_article),
++        )
++
++    def test_reserve_replay_uses_pinned_context_without_current_plan_lookup(self) -> None:
++        original = self.meter(plan=PRO).reserve("replay-without-plan", "payload", "article", 1)
++
++        def unavailable_plan_loader(_plan_id: str | None) -> PlanLimits:
++            raise RuntimeError("current plan is unavailable")
++
++        meter = UsageMeter(
++            self.subscriptions,
++            self.usage,
++            USER_ID,
++            rate=RATE,
++            now=NOW,
++            plan_loader=unavailable_plan_loader,
++        )
++
++        replay = meter.reserve("replay-without-plan", "payload", "article", 999)
++
++        self.assertEqual(replay, original)
++
+     def test_legacy_article_usage_is_enforced_by_first_reservation(self) -> None:
+         self.usage.add(USER_ID, "2026-07", articles=BASIC.articles_per_month)
+         meter = self.meter()
+@@ -542,7 +608,8 @@
+     def setUp(self) -> None:
+         self._tmpdir = tempfile.TemporaryDirectory()
+         root = Path(self._tmpdir.name)
+-        self.usage = JsonUsageRepository(root / "usage.json")
++        self.usage_path = root / "usage.json"
++        self.usage = JsonUsageRepository(self.usage_path)
+         self.subscriptions = JsonSubscriptionRepository(root / "subscriptions.json")
+ 
+     def tearDown(self) -> None:
+@@ -634,6 +701,29 @@
+         self.assertEqual(summary["sentences_per_article"], pinned.sentences_per_article)
+         self.assertEqual(summary["source_tokens_per_article"], pinned.source_tokens_per_article)
+ 
++    def test_summary_uses_legacy_snapshot_plan_when_processing_caps_are_missing(self) -> None:
++        self.usage.add(USER_ID, "2026-07", articles=1)
++        records = json.loads(self.usage_path.read_text(encoding="utf-8"))
++        for record in records:
++            if record.get("record_type") == "usage_month":
++                record.update(
++                    {
++                        "plan_id": "pro",
++                        "sentences_per_article": 0,
++                        "source_tokens_per_article": 0,
++                    }
++                )
++        write_json_list(self.usage_path, records)
++
++        summary = usage_summary(self.guard(BASIC))
++        retained = get_plan_limits("pro")
++
++        self.assertEqual(self.usage.get_month(USER_ID, "2026-07")["plan_id"], "pro")
++        self.assertEqual(
++            (summary["sentences_per_article"], summary["source_tokens_per_article"]),
++            (retained.sentences_per_article, retained.source_tokens_per_article),
++        )
++
+     def test_legacy_or_missing_month_is_safe(self) -> None:
+         summary = usage_summary(self.guard(BASIC))
+ 
+--- a/backend/test_usage_repository.py
++++ b/backend/test_usage_repository.py
+@@ -2125,6 +2125,48 @@
+             return JsonUsageRepository(repository._path)
+         return DynamoUsageRepository(store)
+ 
++    def test_shadow_start_retains_processing_caps_without_paid_quota_mutation(self) -> None:
++        for name, repository, _store in self._repositories():
++            with self.subTest(adapter=name):
++                high = self._request(
++                    f"shadow-processing-high-{name}",
++                    articles=1,
++                    sentence_limit=300,
++                    source_token_limit=72_000,
++                    plan_id="max",
++                )
++                lower = self._request(
++                    f"shadow-processing-lower-{name}",
++                    articles=1,
++                    sentence_limit=50,
++                    source_token_limit=12_000,
++                )
++                repository.start_shadow(high)
++                repository.start_shadow(lower)
++                replay = repository.start_shadow(
++                    replace(high, sentences_per_article=999, source_tokens_per_article=999_000)
++                )
++
++                month = repository.get_month(high.user_id, high.month)
++                self.assertEqual(
++                    (month["sentences_per_article"], month["source_tokens_per_article"]),
++                    (300, 72_000),
++                )
++                self.assertEqual(
++                    (
++                        month["plan_id"],
++                        month["article_limit"],
++                        month["chat_limit"],
++                        month["cost_micro_usd_limit"],
++                        month["reserved_articles"],
++                    ),
++                    (None, 0, 0, 0, 0),
++                )
++                self.assertEqual(
++                    (replay.sentences_per_article, replay.source_tokens_per_article),
++                    (300, 72_000),
++                )
++
+     def test_failed_before_pending_rejects_first_dispatch_without_effects(self) -> None:
+         for name, repository, _store in self._repositories():
+             with self.subTest(adapter=name):

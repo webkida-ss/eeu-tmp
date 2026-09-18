@@ -1,0 +1,12 @@
+properties:
+  url:
+    type: string
+    title: Url
+  activated:
+    type: boolean
+    title: Activated
+    default: false
+type: object
+required:
+- url
+title: CheckoutResponse

@@ -1,0 +1,287 @@
+diff --git a/.github/workflows/agent-intake.yml b/.github/workflows/agent-intake.yml
+index 4903172..9481da1 100644
+--- a/.github/workflows/agent-intake.yml
++++ b/.github/workflows/agent-intake.yml
+@@ -42,20 +42,29 @@ jobs:
+         env:
+           GITHUB_TOKEN: ${{ github.token }}
+           TRUSTED_AGENT_ACTOR_IDS: ${{ vars.TRUSTED_AGENT_ACTOR_IDS }}
++          POLICY_ACTOR_ID: ${{ github.actor_id }}
++          POLICY_REPOSITORY: ${{ github.repository }}
++          POLICY_GIT_REF: ${{ github.ref }}
++          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
++          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
++          POLICY_RUN_ID: ${{ github.run_id }}
++          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
++          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
++          ISSUE_NUMBER: ${{ inputs.issue_number }}
+         run: |
+           python scripts/online_agent_policy.py intake \
+             --output _agent-intake/raw.json \
+             --trusted-actor-ids "${TRUSTED_AGENT_ACTOR_IDS}" \
+-            --actor-id "${{ github.actor_id }}" \
+-            --repository "${{ github.repository }}" \
+-            --issue-number "${{ inputs.issue_number }}" \
+-            --git-ref "${{ github.ref }}" \
+-            --workflow-ref "${{ github.workflow_ref }}" \
++            --actor-id "${POLICY_ACTOR_ID}" \
++            --repository "${POLICY_REPOSITORY}" \
++            --issue-number "${ISSUE_NUMBER}" \
++            --git-ref "${POLICY_GIT_REF}" \
++            --workflow-ref "${POLICY_WORKFLOW_REF}" \
+             --workflow-path ".github/workflows/agent-intake.yml" \
+-            --checked-out-sha "${{ steps.checkout.outputs.sha }}" \
+-            --run-id "${{ github.run_id }}" \
+-            --run-attempt "${{ github.run_attempt }}" \
+-            --ref-protected "${{ github.ref_protected }}"
++            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
++            --run-id "${POLICY_RUN_ID}" \
++            --run-attempt "${POLICY_RUN_ATTEMPT}" \
++            --ref-protected "${POLICY_REF_PROTECTED}"
+ 
+       - name: Sanitize selected untrusted issue fields
+         run: |
+diff --git a/.github/workflows/deploy-reading-assistant.yml b/.github/workflows/deploy-reading-assistant.yml
+index 5d4e2d7..ce3ae72 100644
+--- a/.github/workflows/deploy-reading-assistant.yml
++++ b/.github/workflows/deploy-reading-assistant.yml
+@@ -99,20 +99,31 @@ jobs:
+           AWS_APPLY_ROLE_ARN: ${{ vars.AWS_APPLY_ROLE_ARN_DEV }}
+           TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+           TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
++          POLICY_ACTOR_ID: ${{ github.actor_id }}
++          POLICY_REPOSITORY: ${{ github.repository }}
++          POLICY_GIT_REF: ${{ github.ref }}
++          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
++          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
++          POLICY_RUN_ID: ${{ github.run_id }}
++          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
++          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
++          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
++          DEPLOY_OPERATION: ${{ inputs.operation }}
++          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+         run: |
+           python scripts/exact_plan_policy.py gate-deploy \
+             --trusted-actor-ids "${TRUSTED_DEPLOY_ACTOR_IDS}" \
+-            --actor-id "${{ github.actor_id }}" \
+-            --repository "${{ github.repository }}" \
+-            --git-ref "${{ github.ref }}" \
+-            --workflow-ref "${{ github.workflow_ref }}" \
+-            --checked-out-sha "${{ steps.checkout.outputs.sha }}" \
+-            --run-id "${{ github.run_id }}" \
+-            --run-attempt "${{ github.run_attempt }}" \
+-            --ref-protected "${{ github.ref_protected }}" \
+-            --environment "${{ inputs.environment }}" \
+-            --operation "${{ inputs.operation }}" \
+-            --production-confirmation "${{ inputs.production_confirmation }}" \
++            --actor-id "${POLICY_ACTOR_ID}" \
++            --repository "${POLICY_REPOSITORY}" \
++            --git-ref "${POLICY_GIT_REF}" \
++            --workflow-ref "${POLICY_WORKFLOW_REF}" \
++            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
++            --run-id "${POLICY_RUN_ID}" \
++            --run-attempt "${POLICY_RUN_ATTEMPT}" \
++            --ref-protected "${POLICY_REF_PROTECTED}" \
++            --environment "${DEPLOY_ENVIRONMENT}" \
++            --operation "${DEPLOY_OPERATION}" \
++            --production-confirmation "${PRODUCTION_CONFIRMATION}" \
+             --plan-role-arn "${AWS_PLAN_ROLE_ARN}" \
+             --apply-role-arn "${AWS_APPLY_ROLE_ARN}" \
+             --bucket "${TERRAFORM_PLAN_BUCKET}" \
+@@ -130,20 +141,31 @@ jobs:
+           AWS_APPLY_ROLE_ARN: ${{ vars.AWS_APPLY_ROLE_ARN_PROD }}
+           TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+           TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
++          POLICY_ACTOR_ID: ${{ github.actor_id }}
++          POLICY_REPOSITORY: ${{ github.repository }}
++          POLICY_GIT_REF: ${{ github.ref }}
++          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
++          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
++          POLICY_RUN_ID: ${{ github.run_id }}
++          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
++          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
++          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
++          DEPLOY_OPERATION: ${{ inputs.operation }}
++          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+         run: |
+           python scripts/exact_plan_policy.py gate-deploy \
+             --trusted-actor-ids "${TRUSTED_DEPLOY_ACTOR_IDS}" \
+-            --actor-id "${{ github.actor_id }}" \
+-            --repository "${{ github.repository }}" \
+-            --git-ref "${{ github.ref }}" \
+-            --workflow-ref "${{ github.workflow_ref }}" \
+-            --checked-out-sha "${{ steps.checkout.outputs.sha }}" \
+-            --run-id "${{ github.run_id }}" \
+-            --run-attempt "${{ github.run_attempt }}" \
+-            --ref-protected "${{ github.ref_protected }}" \
+-            --environment "${{ inputs.environment }}" \
+-            --operation "${{ inputs.operation }}" \
+-            --production-confirmation "${{ inputs.production_confirmation }}" \
++            --actor-id "${POLICY_ACTOR_ID}" \
++            --repository "${POLICY_REPOSITORY}" \
++            --git-ref "${POLICY_GIT_REF}" \
++            --workflow-ref "${POLICY_WORKFLOW_REF}" \
++            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
++            --run-id "${POLICY_RUN_ID}" \
++            --run-attempt "${POLICY_RUN_ATTEMPT}" \
++            --ref-protected "${POLICY_REF_PROTECTED}" \
++            --environment "${DEPLOY_ENVIRONMENT}" \
++            --operation "${DEPLOY_OPERATION}" \
++            --production-confirmation "${PRODUCTION_CONFIRMATION}" \
+             --plan-role-arn "${AWS_PLAN_ROLE_ARN}" \
+             --apply-role-arn "${AWS_APPLY_ROLE_ARN}" \
+             --bucket "${TERRAFORM_PLAN_BUCKET}" \
+diff --git a/backend/test_github_automation.py b/backend/test_github_automation.py
+index 6ba74d1..46eb183 100644
+--- a/backend/test_github_automation.py
++++ b/backend/test_github_automation.py
+@@ -13,6 +13,8 @@ CI = WORKFLOW_DIR / "reading-assistant-ci.yml"
+ NIGHTLY = WORKFLOW_DIR / "nightly-automation.yml"
+ OPTIONAL = WORKFLOW_DIR / "optional-pr-browser-smoke.yml"
+ CODEQL = WORKFLOW_DIR / "codeql.yml"
++INTAKE = WORKFLOW_DIR / "agent-intake.yml"
++DEPLOY = WORKFLOW_DIR / "deploy-reading-assistant.yml"
+ DYNAMODB_DIGEST = (
+     "amazon/dynamodb-local@sha256:d89f8fcc6b1a39cb35976c248ed42a28c66ae00dc043099210f5571e42648ab4"
+ )
+@@ -120,6 +122,30 @@ def test_every_checkout_disables_persisted_credentials() -> None:
+             assert "persist-credentials: false" in block, workflow.name
+ 
+ 
++def test_dispatch_inputs_enter_actor_gates_through_quoted_environment_variables() -> None:
++    intake = workflow_text(INTAKE)
++    deploy = workflow_text(DEPLOY)
++
++    assert 'ISSUE_NUMBER: ${{ inputs.issue_number }}' in intake
++    assert '--issue-number "${ISSUE_NUMBER}"' in intake
++
++    for input_name, environment_name, option_name in (
++        ("environment", "DEPLOY_ENVIRONMENT", "environment"),
++        ("operation", "DEPLOY_OPERATION", "operation"),
++        ("production_confirmation", "PRODUCTION_CONFIRMATION", "production-confirmation"),
++    ):
++        assert f"{environment_name}: ${{{{ inputs.{input_name} }}}}" in deploy
++        assert f'--{option_name} "${{{environment_name}}}"' in deploy
++
++    for workflow in (intake, deploy):
++        gate_scripts = re.findall(
++            r"(?ms)^      - name: Gate .*?^        run: \|\n(.*?)(?=^      - |\Z)",
++            workflow,
++        )
++        assert gate_scripts
++        assert all("${{" not in script for script in gate_scripts)
++
++
+ def test_required_ci_uses_tasks_and_retains_lambda_artifact() -> None:
+     text = workflow_text(CI)
+     for task in (
+diff --git a/backend/test_online_agent_operations.py b/backend/test_online_agent_operations.py
+index 13d6540..75dd7e0 100644
+--- a/backend/test_online_agent_operations.py
++++ b/backend/test_online_agent_operations.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import re
++import subprocess
+ from pathlib import Path
+ 
+ import yaml
+@@ -30,6 +32,64 @@ def workflow_text(path: Path) -> str:
+     return path.read_text(encoding="utf-8")
+ 
+ 
++def workflow_step(workflow: Path, step_name: str) -> dict:
++    parsed = yaml.safe_load(workflow_text(workflow))
++    for job in parsed["jobs"].values():
++        for step in job.get("steps", []):
++            if step.get("name") == step_name:
++                return step
++    raise AssertionError(f"Missing workflow step: {step_name}")
++
++
++def assert_rejected_actor_cannot_execute_dispatch_input(
++    workflow: Path,
++    step_name: str,
++    input_environment_name: str,
++    temp_path: Path,
++) -> None:
++    step = workflow_step(workflow, step_name)
++    environment = step["env"]
++    sentinel = temp_path / f"{workflow.stem}-{input_environment_name}-sentinel"
++    hostile_input = (
++        f'$(touch "{sentinel}") "quoted"\n'
++        f'; touch "{sentinel}"; `touch "{sentinel}"` && :'
++    )
++    command_environment = {
++        **os.environ,
++        **environment,
++        "GITHUB_TOKEN": "",
++        "GITHUB_OUTPUT": str(temp_path / "github-output"),
++        "TRUSTED_AGENT_ACTOR_IDS": "456",
++        "TRUSTED_DEPLOY_ACTOR_IDS": "456",
++        "POLICY_ACTOR_ID": "999",
++        "POLICY_REPOSITORY": "owner/repository",
++        "POLICY_GIT_REF": "refs/heads/main",
++        "POLICY_WORKFLOW_REF": (
++            f"owner/repository/.github/workflows/{workflow.name}@refs/heads/main"
++        ),
++        "POLICY_CHECKED_OUT_SHA": "a" * 40,
++        "POLICY_RUN_ID": "100",
++        "POLICY_RUN_ATTEMPT": "1",
++        "POLICY_REF_PROTECTED": "true",
++        "DEPLOY_ENVIRONMENT": "dev",
++        "DEPLOY_OPERATION": "plan",
++        input_environment_name: hostile_input,
++    }
++
++    result = subprocess.run(
++        ["bash", "-euo", "pipefail", "-c", step["run"]],
++        cwd=ROOT,
++        env=command_environment,
++        capture_output=True,
++        text=True,
++        check=False,
++        timeout=10,
++    )
++
++    assert result.returncode != 0
++    assert not sentinel.exists()
++
++
+ def test_shared_roles_have_least_authority_and_separation_contracts() -> None:
+     source_dir = ROOT / ".rulesync" / "subagents"
+     assert {path.stem for path in source_dir.glob("*.md")} == ROLE_NAMES
+@@ -135,6 +195,30 @@ def test_manual_intake_workflow_is_read_only_pinned_and_never_checks_out_issue_r
+         assert comment and re.search(r"\bv\d", comment)
+ 
+ 
++def test_rejected_actor_keeps_all_dispatch_inputs_literal(tmp_path: Path) -> None:
++    assert_rejected_actor_cannot_execute_dispatch_input(
++        INTAKE_WORKFLOW,
++        "Gate identity and fetch minimal issue metadata",
++        "ISSUE_NUMBER",
++        tmp_path,
++    )
++    for input_environment_name in (
++        "DEPLOY_ENVIRONMENT",
++        "DEPLOY_OPERATION",
++        "PRODUCTION_CONFIRMATION",
++    ):
++        for step_name in (
++            "Gate dev actor, branch, roles, storage, and operation",
++            "Gate prod actor, branch, roles, storage, and operation",
++        ):
++            assert_rejected_actor_cannot_execute_dispatch_input(
++                DEPLOY_WORKFLOW,
++                step_name,
++                input_environment_name,
++                tmp_path,
++            )
++
++
+ def test_deploy_defaults_to_plan_and_production_apply_is_explicit_and_gated() -> None:
+     text = workflow_text(DEPLOY_WORKFLOW)
+     parsed = yaml.safe_load(text)

@@ -1,0 +1,1325 @@
+#readingPanelRoot[hidden] {
+  display: none !important;
+}
+
+.era-reading-panel-root {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The era color tokens are also defined on the document root (keyed by
+   data-theme, set in panel-ui.js / reading-panel.js) so views outside
+   #readingPanelRoot — the word book reuses .era-* components — resolve the
+   same palette. The #readingPanelRoot blocks below re-declare the same
+   values keyed by data-era-theme, which the in-page iframe shell and the
+   mounted reading panel still rely on. Keep the two in sync. */
+:root {
+  --era-bg: #ffffff;
+  --era-bg-subtle: #fafaf9;
+  --era-bg-muted: #f5f5f4;
+  --era-bg-surface: #ffffff;
+  --era-bg-hover: rgba(224, 242, 254, 0.65);
+  --era-bg-active: rgba(186, 230, 253, 0.55);
+  --era-bg-active-hover: rgba(186, 230, 253, 0.35);
+  --era-bg-accent: #f0f9ff;
+  --era-bg-accent-strong: #e0f2fe;
+  --era-bg-inverse: #1c1917;
+  --era-text: #292524;
+  --era-text-strong: #1c1917;
+  --era-text-muted: #78716c;
+  --era-text-subtle: #57534e;
+  --era-text-faint: #a8a29e;
+  --era-text-accent: #0369a1;
+  --era-text-accent-strong: #0c4a6e;
+  --era-text-active: #075985;
+  --era-border: #e7e5e4;
+  --era-border-strong: #d6d3d1;
+  --era-border-input: #d6d3d1;
+  --era-border-button: #e7e5e4;
+  --era-border-accent: #7dd3fc;
+  --era-border-accent-light: #bae6fd;
+  --era-accent-bar: #0284c7;
+  --era-resizer-hover: #38bdf8;
+  --era-shadow: rgba(28, 25, 23, 0.08);
+  --era-item-border: #f5f5f4;
+  --era-chip-bg: #e7e5e4;
+  --era-chip-text: #44403c;
+  --era-code-bg: #f5f5f4;
+  --era-input-text: #1c1917;
+}
+
+:root[data-theme='dark'] {
+  --era-bg: #0c0a09;
+  --era-bg-subtle: #1c1917;
+  --era-bg-muted: #292524;
+  --era-bg-surface: #1c1917;
+  --era-bg-hover: rgba(56, 189, 248, 0.12);
+  --era-bg-active: rgba(14, 165, 233, 0.22);
+  --era-bg-active-hover: rgba(14, 165, 233, 0.14);
+  --era-bg-accent: rgba(12, 74, 110, 0.45);
+  --era-bg-accent-strong: rgba(3, 105, 161, 0.35);
+  --era-bg-inverse: #fafaf9;
+  --era-text: #e7e5e4;
+  --era-text-strong: #fafaf9;
+  --era-text-muted: #a8a29e;
+  --era-text-subtle: #d6d3d1;
+  --era-text-faint: #78716c;
+  --era-text-accent: #7dd3fc;
+  --era-text-accent-strong: #bae6fd;
+  --era-text-active: #e0f2fe;
+  --era-border: #292524;
+  --era-border-strong: #44403c;
+  --era-border-input: #44403c;
+  --era-border-button: #44403c;
+  --era-border-accent: #0284c7;
+  --era-border-accent-light: #0369a1;
+  --era-accent-bar: #38bdf8;
+  --era-resizer-hover: #0ea5e9;
+  --era-shadow: rgba(0, 0, 0, 0.35);
+  --era-item-border: #292524;
+  --era-chip-bg: #44403c;
+  --era-chip-text: #e7e5e4;
+  --era-code-bg: #292524;
+  --era-input-text: #fafaf9;
+}
+
+#readingPanelRoot {
+  --era-bg: #ffffff;
+  --era-bg-subtle: #fafaf9;
+  --era-bg-muted: #f5f5f4;
+  --era-bg-surface: #ffffff;
+  --era-bg-hover: rgba(224, 242, 254, 0.65);
+  --era-bg-active: rgba(186, 230, 253, 0.55);
+  --era-bg-active-hover: rgba(186, 230, 253, 0.35);
+  --era-bg-accent: #f0f9ff;
+  --era-bg-accent-strong: #e0f2fe;
+  --era-bg-inverse: #1c1917;
+  --era-text: #292524;
+  --era-text-strong: #1c1917;
+  --era-text-muted: #78716c;
+  --era-text-subtle: #57534e;
+  --era-text-faint: #a8a29e;
+  --era-text-accent: #0369a1;
+  --era-text-accent-strong: #0c4a6e;
+  --era-text-active: #075985;
+  --era-border: #e7e5e4;
+  --era-border-strong: #d6d3d1;
+  --era-border-input: #d6d3d1;
+  --era-border-button: #e7e5e4;
+  --era-border-accent: #7dd3fc;
+  --era-border-accent-light: #bae6fd;
+  --era-accent-bar: #0284c7;
+  --era-resizer-hover: #38bdf8;
+  --era-shadow: rgba(28, 25, 23, 0.08);
+  --era-item-border: #f5f5f4;
+  --era-chip-bg: #e7e5e4;
+  --era-chip-text: #44403c;
+  --era-code-bg: #f5f5f4;
+  --era-input-text: #1c1917;
+  --era-radius-sm: 8px;
+  --era-radius-md: 12px;
+  --era-radius-lg: 16px;
+  --era-radius-pill: 999px;
+  --era-shadow-sm: 0 1px 2px rgba(28, 25, 23, 0.05);
+  --era-shadow-md: 0 4px 16px rgba(28, 25, 23, 0.07);
+  --era-duration: 160ms;
+  --era-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --era-ring: 0 0 0 3px rgba(3, 105, 161, 0.28);
+
+  background: var(--era-bg);
+  border-top: 1px solid var(--era-border);
+  box-sizing: border-box;
+  color: var(--era-text);
+  display: flex;
+  flex-direction: column;
+  font-family:
+    'Inter',
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  font-size: 14px;
+  min-height: 0;
+  line-height: 1.5;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  width: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+#readingPanelRoot[data-era-theme='dark'] {
+  --era-bg: #0c0a09;
+  --era-bg-subtle: #1c1917;
+  --era-bg-muted: #292524;
+  --era-bg-surface: #1c1917;
+  --era-bg-hover: rgba(56, 189, 248, 0.12);
+  --era-bg-active: rgba(14, 165, 233, 0.22);
+  --era-bg-active-hover: rgba(14, 165, 233, 0.14);
+  --era-bg-accent: rgba(12, 74, 110, 0.45);
+  --era-bg-accent-strong: rgba(3, 105, 161, 0.35);
+  --era-bg-inverse: #fafaf9;
+  --era-text: #e7e5e4;
+  --era-text-strong: #fafaf9;
+  --era-text-muted: #a8a29e;
+  --era-text-subtle: #d6d3d1;
+  --era-text-faint: #78716c;
+  --era-text-accent: #7dd3fc;
+  --era-text-accent-strong: #bae6fd;
+  --era-text-active: #e0f2fe;
+  --era-border: #292524;
+  --era-border-strong: #44403c;
+  --era-border-input: #44403c;
+  --era-border-button: #44403c;
+  --era-border-accent: #0284c7;
+  --era-border-accent-light: #0369a1;
+  --era-accent-bar: #38bdf8;
+  --era-resizer-hover: #0ea5e9;
+  --era-shadow: rgba(0, 0, 0, 0.35);
+  --era-item-border: #292524;
+  --era-chip-bg: #44403c;
+  --era-chip-text: #e7e5e4;
+  --era-code-bg: #292524;
+  --era-input-text: #fafaf9;
+  --era-ring: 0 0 0 3px rgba(56, 189, 248, 0.35);
+}
+
+#readingPanelRoot * {
+  box-sizing: border-box;
+}
+
+.era-panel-header {
+  align-items: flex-start;
+  border-bottom: 1px solid var(--era-border);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 16px;
+}
+
+.era-panel-header-actions {
+  align-items: center;
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.era-panel-label {
+  color: var(--era-text-accent);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  margin: 0 0 4px;
+  text-transform: uppercase;
+}
+
+.era-panel-title {
+  color: var(--era-text-strong);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.era-panel-close {
+  align-items: center;
+  background: var(--era-bg-muted);
+  border: 1px solid var(--era-border);
+  border-radius: var(--era-radius-pill);
+  color: var(--era-text-subtle);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 600;
+  height: 32px;
+  justify-content: center;
+  line-height: 1;
+  min-width: 32px;
+  padding: 0 8px;
+  transition:
+    background var(--era-duration) var(--era-ease),
+    border-color var(--era-duration) var(--era-ease),
+    color var(--era-duration) var(--era-ease);
+}
+
+.era-theme-icon {
+  display: block;
+  height: 16px;
+  width: 16px;
+}
+
+.era-panel-close {
+  font-size: 18px;
+  padding: 0;
+  width: 32px;
+}
+
+.era-panel-close:hover {
+  background: var(--era-bg-hover);
+  border-color: var(--era-border-accent-light);
+  color: var(--era-text-strong);
+}
+
+.era-panel-close:focus-visible,
+.era-panel-back-button:focus-visible,
+.era-panel-nav-button:focus-visible,
+.era-sentence-button:focus-visible,
+.era-sentence-speak-button:focus-visible,
+.era-learning-point-button:focus-visible,
+.era-context-chat-quick-action:focus-visible,
+.era-context-chat-send:focus-visible,
+.era-context-chat-input:focus-visible {
+  box-shadow: var(--era-ring);
+  outline: none;
+}
+
+.era-panel-summary-accordion {
+  margin: 0;
+  padding: 0 16px;
+}
+
+.era-panel-summary-toggle {
+  color: var(--era-text-subtle);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+  padding: 12px 0 0;
+  user-select: none;
+}
+
+.era-panel-summary-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.era-panel-summary-toggle::before {
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  content: '';
+  display: inline-block;
+  margin-right: 8px;
+  transition: transform var(--era-duration) var(--era-ease);
+  vertical-align: middle;
+}
+
+.era-panel-summary-accordion[open] .era-panel-summary-toggle::before {
+  transform: rotate(90deg);
+}
+
+.era-panel-summary {
+  color: var(--era-text-subtle);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+  padding: 0 0 12px 16px;
+  transition:
+    height 220ms ease,
+    opacity 220ms ease,
+    transform 220ms ease;
+  transform: translateY(0);
+}
+
+.era-panel-summary-accordion.era-accordion-animating .era-panel-summary {
+  overflow: hidden;
+  will-change: height, opacity, transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .era-panel-summary-accordion.era-accordion-animating .era-panel-summary {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.era-panel-meta {
+  border-bottom: 1px solid var(--era-border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin: 8px 0 0;
+  padding: 0 16px 12px;
+}
+
+/* Each stat sits in its own pill so the row reads as distinct facts and wraps
+   to a second line on a narrow panel instead of crowding into one dense line. */
+.era-panel-meta-item {
+  background: var(--era-bg-surface);
+  border: 1px solid var(--era-border);
+  border-radius: var(--era-radius-pill);
+  color: var(--era-text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  padding: 2px 8px;
+}
+
+.era-audio-bar {
+  align-items: center;
+  border-bottom: 1px solid var(--era-border);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 8px 16px;
+}
+
+/* Left cluster: audio controls (play + speed). The current position sits
+   on the right as a progress readout. Sentence stepping is done by tapping
+   a sentence in the list or with the arrow keys — no on-screen step
+   buttons, since every sentence is already a click target here. */
+.era-audio-playback {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.era-audio-play {
+  align-items: center;
+  background: var(--era-text-accent);
+  border: 0;
+  border-radius: 50%;
+  /* Icon inverts against the accent disc in both themes: white on the dark
+     blue (light theme), near-black on the pale blue (dark theme). */
+  color: var(--era-bg);
+  cursor: pointer;
+  display: inline-flex;
+  flex: none;
+  height: 36px;
+  justify-content: center;
+  padding: 0;
+  transition: opacity var(--era-duration) var(--era-ease);
+  width: 36px;
+}
+
+.era-audio-play:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.era-audio-play:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.era-audio-svg {
+  height: 18px;
+  width: 18px;
+}
+
+.era-audio-position {
+  color: var(--era-text-muted);
+  flex: none;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* The audio speed picker shares the enhanced listbox semantics but uses the
+   reading panel's compact visual language and tokens. */
+.era-audio-playback .era-select-control {
+  margin-top: 0;
+}
+
+.era-audio-playback .era-select-trigger {
+  background: var(--era-bg-surface);
+  border-color: var(--era-border-input);
+  border-radius: var(--era-radius-pill);
+  color: var(--era-text-strong);
+  font-size: 11px;
+  font-weight: 600;
+  min-height: 36px;
+  padding: 4px 10px;
+}
+
+.era-audio-playback .era-select-trigger[aria-expanded='true'] {
+  border-color: var(--era-text-accent);
+  box-shadow: var(--era-ring);
+}
+
+.era-audio-playback .era-select-trigger-icon {
+  height: 6px;
+  margin-left: 8px;
+  width: 6px;
+}
+
+.era-audio-playback .era-select-popover {
+  background: var(--era-bg-surface);
+  border-color: var(--era-border-input);
+  min-width: 94px;
+  right: auto;
+}
+
+.era-audio-playback .era-select-option {
+  color: var(--era-text-strong);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 7px 8px;
+}
+
+.era-audio-playback .era-select-option:hover:not(:disabled),
+.era-audio-playback .era-select-option:focus-visible {
+  background: var(--era-bg-hover);
+  color: var(--era-text-accent-strong);
+}
+
+.era-audio-playback .era-select-option-selected::after {
+  color: var(--era-text-accent);
+}
+
+@media (forced-colors: active) {
+  .era-audio-playback .era-select-trigger:focus-visible,
+  .era-audio-playback .era-select-option:focus-visible {
+    box-shadow: none;
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+}
+
+.era-panel-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.era-panel-body .era-panel-detail {
+  flex: 1;
+}
+
+.era-panel-sentence-detail-mode .era-panel-summary-accordion,
+.era-panel-sentence-detail-mode .era-panel-meta,
+.era-panel-sentence-detail-mode .era-audio-bar {
+  display: none;
+}
+
+.era-panel-sentence-detail-mode .era-panel-detail {
+  background: var(--era-bg);
+}
+
+.era-panel-detail-toolbar {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.era-panel-back-button {
+  background: transparent;
+  border: 0;
+  color: var(--era-text-accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  margin: 0;
+  padding: 0;
+}
+
+.era-panel-detail-position {
+  color: var(--era-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  min-width: 4.5em;
+  text-align: center;
+}
+
+.era-panel-detail-nav {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.era-panel-nav-button {
+  align-items: center;
+  background: var(--era-bg-surface);
+  border: 1px solid var(--era-border-input);
+  border-radius: var(--era-radius-pill);
+  color: var(--era-text-strong);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  gap: 4px;
+  min-height: 32px;
+  padding: 6px 12px;
+  transition:
+    background var(--era-duration) var(--era-ease),
+    border-color var(--era-duration) var(--era-ease);
+  white-space: nowrap;
+}
+
+.era-chevron {
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  display: inline-block;
+  height: 6px;
+  width: 6px;
+}
+
+.era-chevron-left {
+  transform: rotate(135deg);
+}
+
+.era-chevron-right {
+  transform: rotate(-45deg);
+}
+
+.era-panel-nav-button:hover:not(:disabled) {
+  background: var(--era-bg-hover);
+}
+
+.era-panel-nav-button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.era-panel-reading-hint {
+  color: var(--era-text-muted);
+  font-size: 12px;
+  margin: 0;
+  padding: 12px 16px 0;
+}
+
+.era-sentence-reading-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px 16px;
+}
+
+.era-sentence-item {
+  border-bottom: none;
+  border-radius: var(--era-radius-md);
+  overflow: hidden;
+}
+
+.era-sentence-item-active {
+  background: var(--era-bg-accent);
+  box-shadow: inset 3px 0 0 var(--era-accent-bar);
+}
+
+.era-sentence-button {
+  align-items: flex-start;
+  background: var(--era-bg-surface);
+  border: 1px solid var(--era-border);
+  border-radius: var(--era-radius-md);
+  color: var(--era-text-strong);
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  line-height: 1.6;
+  padding: 12px;
+  text-align: left;
+  transition:
+    background var(--era-duration) var(--era-ease),
+    border-color var(--era-duration) var(--era-ease),
+    box-shadow var(--era-duration) var(--era-ease);
+  width: 100%;
+}
+
+.era-sentence-speak-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--era-radius-sm);
+  color: var(--era-text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font: inherit;
+  justify-content: center;
+  min-height: 18px;
+  min-width: 18px;
+  padding: 0;
+  position: relative;
+  transition:
+    background var(--era-duration) var(--era-ease),
+    color var(--era-duration) var(--era-ease);
+}
+
+.era-sentence-speak-button::before {
+  content: '';
+  inset: -10px;
+  position: absolute;
+}
+
+.era-sentence-speak-button:hover:not(:disabled),
+.era-sentence-speak-button.era-sentence-speaking {
+  background: var(--era-bg-accent);
+  color: var(--era-text-accent-strong);
+}
+
+.era-speak-icon {
+  align-items: center;
+  display: inline-flex;
+  height: 12px;
+  justify-content: center;
+  width: 12px;
+}
+
+.era-speak-svg {
+  display: block;
+  height: 12px;
+  width: 12px;
+}
+
+.era-sentence-speak-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.era-sentence-item-active .era-sentence-button {
+  background: transparent;
+  border-color: var(--era-border-accent-light);
+}
+
+.era-sentence-button:hover,
+.era-sentence-button.era-sentence-hover,
+.era-sentence-item-hover .era-sentence-button {
+  background: var(--era-bg-hover);
+}
+
+.era-sentence-button.era-sentence-active,
+.era-sentence-item-active .era-sentence-button {
+  background: transparent;
+}
+
+.era-sentence-button.era-sentence-active .era-sentence-text,
+.era-sentence-item-active .era-sentence-text {
+  color: var(--era-text-active);
+  font-weight: 600;
+}
+
+.era-sentence-button.era-sentence-active .era-sentence-index,
+.era-sentence-item-active .era-sentence-index {
+  color: var(--era-text-accent-strong);
+}
+
+.era-sentence-item-active .era-sentence-button:hover,
+.era-sentence-button.era-sentence-active:hover {
+  background: var(--era-bg-active-hover);
+}
+
+.era-sentence-index {
+  color: var(--era-text-faint);
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 20px;
+  padding-top: 3px;
+}
+
+.era-sentence-text {
+  flex: 1;
+  font-size: 13px;
+  min-width: 0;
+}
+
+.era-sentence-link-icon {
+  border-radius: var(--era-radius-sm);
+  flex: 0 0 auto;
+  height: 18px;
+  margin-top: 2px;
+  position: relative;
+  width: 18px;
+}
+
+.era-sentence-link-icon.is-linked::before {
+  border: solid var(--era-text-accent);
+  border-width: 0 1.5px 1.5px 0;
+  content: '';
+  display: block;
+  height: 7px;
+  left: 5px;
+  position: absolute;
+  top: 4px;
+  transform: rotate(-45deg);
+  width: 7px;
+}
+
+.era-sentence-link-icon.is-unlinked::before {
+  background: var(--era-border-strong);
+  content: '';
+  display: block;
+  height: 1.5px;
+  left: 3px;
+  position: absolute;
+  top: 8px;
+  width: 12px;
+}
+
+.era-sentence-button.era-sentence-unlinked {
+  opacity: 0.78;
+}
+
+.era-page-anchor-block {
+  background-color: rgba(59, 130, 246, 0.12) !important;
+  border-left: 3px solid #3b82f6 !important;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  padding-left: 0.55rem !important;
+}
+
+html.era-page-anchors-on-dark .era-page-anchor-block {
+  background-color: rgba(96, 165, 250, 0.22) !important;
+  border-left-color: #60a5fa !important;
+}
+
+mark.era-sentence-mark {
+  background: rgba(59, 130, 246, 0.14) !important;
+  border-radius: 2px;
+  box-decoration-break: slice;
+  -webkit-box-decoration-break: slice;
+  color: inherit;
+  padding: 0;
+}
+
+html.era-page-anchors-on-dark mark.era-sentence-mark {
+  background: rgba(96, 165, 250, 0.28) !important;
+}
+
+mark.era-sentence-mark.era-page-anchor-interactive {
+  cursor: pointer;
+}
+
+mark.era-sentence-mark.era-page-anchor-hover {
+  background: rgba(59, 130, 246, 0.22) !important;
+}
+
+html.era-page-anchors-on-dark mark.era-sentence-mark.era-page-anchor-hover {
+  background: rgba(96, 165, 250, 0.38) !important;
+}
+
+mark.era-sentence-mark.era-page-anchor-active {
+  background: rgba(147, 197, 253, 0.55) !important;
+}
+
+html.era-page-anchors-on-dark mark.era-sentence-mark.era-page-anchor-active {
+  background: rgba(147, 197, 253, 0.42) !important;
+}
+
+.era-page-anchor {
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.era-page-anchor-block.era-page-anchor-interactive {
+  cursor: pointer;
+}
+
+.era-page-anchor-interactive:hover,
+.era-page-anchor-interactive:focus-visible {
+  outline: none;
+}
+
+.era-page-anchor-block.era-page-anchor-hover {
+  border-left-color: #2563eb !important;
+  border-left-width: 4px !important;
+}
+
+html.era-page-anchors-on-dark .era-page-anchor-block.era-page-anchor-hover {
+  border-left-color: #93c5fd !important;
+}
+
+.era-page-anchor-block.era-page-anchor-active {
+  background-color: rgba(147, 197, 253, 0.45) !important;
+  border-left-color: #1d4ed8 !important;
+  border-left-width: 4px !important;
+}
+
+html.era-page-anchors-on-dark .era-page-anchor-block.era-page-anchor-active {
+  background-color: rgba(96, 165, 250, 0.4) !important;
+  border-left-color: #93c5fd !important;
+}
+
+mark.era-vocabulary-mark {
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  position: relative;
+  text-decoration: underline;
+  text-decoration-color: #facc15;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+  z-index: 1;
+}
+
+mark.era-vocabulary-mark:hover {
+  background: rgba(254, 240, 138, 0.35);
+  text-decoration-color: #eab308;
+}
+
+mark.era-vocabulary-mark-active {
+  background: rgba(254, 240, 138, 0.45);
+  border-radius: 2px;
+  text-decoration-color: #ca8a04;
+  text-decoration-thickness: 3px;
+}
+
+.era-panel-detail {
+  background: var(--era-bg-subtle);
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px;
+}
+
+.era-panel-detail-empty {
+  align-items: center;
+  color: var(--era-text-muted);
+  display: flex;
+  font-size: 13px;
+  height: 100%;
+  justify-content: center;
+  min-height: 120px;
+  text-align: center;
+}
+
+.era-panel-detail-empty p {
+  margin: 0;
+}
+
+#readingPanelRoot .era-panel-detail .era-grid {
+  display: block;
+}
+
+#readingPanelRoot .era-panel-detail .era-section {
+  background: var(--era-bg-surface);
+  border: 1px solid var(--era-border);
+  border-radius: var(--era-radius-md);
+  box-shadow: var(--era-shadow-sm);
+  color: var(--era-text);
+  margin-bottom: 10px;
+  padding: 12px 14px;
+}
+
+#readingPanelRoot .era-panel-detail .era-section h3 {
+  color: var(--era-text-accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin: 0 0 6px;
+  text-transform: uppercase;
+}
+
+#readingPanelRoot .era-panel-detail .era-section-head {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+#readingPanelRoot .era-panel-detail .era-section-head h3 {
+  margin: 0;
+}
+
+#readingPanelRoot .era-panel-detail .era-section-original p {
+  color: var(--era-text-strong);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+#readingPanelRoot .era-panel-detail .era-section p,
+#readingPanelRoot .era-panel-detail .era-section ul {
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+}
+
+#readingPanelRoot .era-panel-detail .era-section ul {
+  list-style: none;
+  padding-left: 0;
+}
+
+#readingPanelRoot .era-panel-detail .era-section li + li {
+  margin-top: 6px;
+}
+
+#readingPanelRoot .era-panel-detail .era-vocab-line {
+  align-items: flex-start;
+  display: flex;
+  gap: 6px;
+}
+
+#readingPanelRoot .era-panel-detail .era-vocab-line-body {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Speak button standing in for the list bullet: nudged down to sit on the
+   first text line. */
+.era-vocab-speak {
+  margin-top: 2px;
+}
+
+#readingPanelRoot .era-panel-detail .era-tip {
+  background: var(--era-bg-accent);
+  border-left: 4px solid var(--era-border-accent);
+  border-radius: 10px;
+  color: var(--era-text-active);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.era-learning-points-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Glossary row: one card holds the tappable word + meaning and a separate
+   speaker column, so the two actions never look like the same control. */
+.era-vocab-card {
+  align-items: stretch;
+  background: var(--era-bg-surface);
+  border: 1px solid var(--era-border);
+  border-radius: var(--era-radius-md);
+  box-shadow: var(--era-shadow-sm);
+  display: flex;
+  overflow: hidden;
+  transition:
+    border-color var(--era-duration) var(--era-ease),
+    box-shadow var(--era-duration) var(--era-ease);
+}
+
+.era-vocab-card:hover,
+.era-vocab-card.era-vocab-card-active {
+  border-color: var(--era-border-accent);
+  box-shadow: var(--era-shadow-md);
+}
+
+.era-learning-point-button {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 44px;
+  min-width: 0;
+  padding: 11px 6px 11px 14px;
+  text-align: left;
+  transition: background var(--era-duration) var(--era-ease);
+}
+
+.era-vocab-card:hover .era-learning-point-button,
+.era-vocab-card.era-vocab-card-active .era-learning-point-button {
+  background: var(--era-bg-accent);
+}
+
+.era-vocab-card-head {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.era-vocab-term {
+  color: var(--era-text-strong);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.era-vocab-meaning {
+  color: var(--era-text-muted);
+  display: -webkit-box;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+/* Speaker as a full-height column with its own divider: reads as a distinct
+   affordance, not a stray icon floated to the right. */
+.era-vocab-card-speak {
+  align-self: stretch;
+  border-radius: 0;
+  border-left: 1px solid var(--era-border);
+  color: var(--era-text-subtle);
+  flex: 0 0 auto;
+  width: 46px;
+}
+
+.era-vocab-card:hover .era-vocab-card-speak,
+.era-vocab-card.era-vocab-card-active .era-vocab-card-speak {
+  border-left-color: var(--era-border-accent);
+}
+
+.era-vocab-pos {
+  background: var(--era-bg-muted);
+  border-radius: 999px;
+  color: var(--era-text-subtle);
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 2px 7px;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+/* Example sentence reads as a quotation, distinct from the meaning block. */
+#readingPanelRoot .era-panel-detail .era-vocab-example {
+  background: var(--era-bg-subtle);
+}
+
+#readingPanelRoot .era-panel-detail .era-vocab-example p {
+  font-style: italic;
+}
+
+.era-learning-point-back {
+  background: transparent;
+  border: 0;
+  color: var(--era-text-accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  margin: 0 0 10px;
+  padding: 0;
+}
+
+.era-context-chat {
+  border-top: 1px solid var(--era-border);
+  margin-top: 16px;
+  padding-top: 14px;
+}
+
+.era-context-chat-title {
+  color: var(--era-text-accent);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  margin: 0 0 10px;
+  text-transform: uppercase;
+}
+
+.era-context-chat-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.era-context-chat-quick-action {
+  background: var(--era-bg-accent, #eff6ff);
+  border: 1px solid var(--era-border-accent-light, #bfdbfe);
+  border-radius: 999px;
+  color: var(--era-text-accent-strong, #1d4ed8);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 12px;
+}
+
+.era-context-chat-quick-action:hover:not(:disabled) {
+  background: var(--era-bg-accent-strong, #dbeafe);
+}
+
+.era-context-chat-quick-action:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.era-context-chat-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.era-context-chat-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.era-context-chat-empty {
+  color: var(--era-text-faint, #94a3b8);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.era-chat-message {
+  border-radius: var(--era-radius-md);
+  padding: 10px 12px;
+}
+
+.era-chat-message-user {
+  background: var(--era-bg-accent);
+  border: 1px solid var(--era-border-accent-light);
+}
+
+.era-chat-message-assistant {
+  background: var(--era-bg-surface);
+  border: 1px solid var(--era-border);
+  box-shadow: var(--era-shadow-sm);
+}
+
+.era-chat-message-role {
+  color: var(--era-text-muted, #64748b);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  margin: 0 0 4px;
+  text-transform: uppercase;
+}
+
+.era-chat-message-text {
+  color: var(--era-text-strong, #0f172a);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.era-chat-message-body {
+  color: var(--era-text-strong, #0f172a);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.era-chat-message-body > :first-child {
+  margin-top: 0;
+}
+
+.era-chat-message-body > :last-child {
+  margin-bottom: 0;
+}
+
+.era-chat-message-body p {
+  margin: 0 0 8px;
+}
+
+.era-chat-message-body h1,
+.era-chat-message-body h2,
+.era-chat-message-body h3 {
+  font-weight: 700;
+  line-height: 1.35;
+  margin: 12px 0 6px;
+}
+
+.era-chat-message-body h1 {
+  font-size: 16px;
+}
+
+.era-chat-message-body h2 {
+  font-size: 15px;
+}
+
+.era-chat-message-body h3 {
+  font-size: 14px;
+}
+
+.era-chat-message-body ul,
+.era-chat-message-body ol {
+  margin: 0 0 8px;
+  padding-left: 20px;
+}
+
+.era-chat-message-body li {
+  margin-bottom: 4px;
+}
+
+.era-chat-message-body hr {
+  border: none;
+  border-top: 1px solid var(--era-border, #e2e8f0);
+  margin: 10px 0;
+}
+
+.era-chat-message-body strong {
+  font-weight: 700;
+}
+
+.era-chat-message-body code {
+  background: var(--era-code-bg, #f1f5f9);
+  border-radius: 4px;
+  color: var(--era-text-strong, #0f172a);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  padding: 1px 4px;
+}
+
+.era-context-chat-input {
+  background: var(--era-bg-surface, #ffffff);
+  border: 1px solid var(--era-border-input, #d6d3d1);
+  border-radius: var(--era-radius-md);
+  color: var(--era-input-text, #1c1917);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 48px;
+  max-height: 96px;
+  padding: 10px 12px;
+  resize: vertical;
+  transition:
+    border-color var(--era-duration) var(--era-ease),
+    box-shadow var(--era-duration) var(--era-ease);
+  width: 100%;
+}
+
+.era-context-chat-send {
+  align-self: flex-end;
+  background: var(--era-bg-inverse, #1c1917);
+  border: 0;
+  border-radius: var(--era-radius-pill);
+  color: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  min-height: 36px;
+  padding: 8px 16px;
+  transition:
+    background var(--era-duration) var(--era-ease),
+    opacity var(--era-duration) var(--era-ease),
+    transform var(--era-duration) var(--era-ease);
+}
+
+.era-context-chat-send:hover:not(:disabled) {
+  opacity: 0.92;
+}
+
+.era-context-chat-send:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.era-context-chat-send:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.era-context-chat-input:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+/* In dark mode --era-bg-inverse turns light, so the send button switches to
+   a solid accent instead. The :root variant covers the word book, which
+   renders the chat outside #readingPanelRoot. */
+:root[data-theme='dark'] .era-context-chat-send,
+#readingPanelRoot[data-era-theme='dark'] .era-context-chat-send {
+  background: #0284c7;
+}
+
+.era-sentence-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}

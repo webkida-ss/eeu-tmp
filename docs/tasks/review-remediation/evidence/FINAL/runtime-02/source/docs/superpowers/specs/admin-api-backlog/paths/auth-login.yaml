@@ -1,0 +1,27 @@
+# Historical design proposal; not a supported runtime contract.
+post:
+  operationId: login
+  summary: Exchange a verified identity credential for a bearer session
+  security: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../admin-openapi.yaml#/components/schemas/SsoLoginRequest
+  responses:
+    "200":
+      description: Authenticated session.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/AuthSessionResponse
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "422":
+      $ref: ../admin-openapi.yaml#/components/responses/ValidationError
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

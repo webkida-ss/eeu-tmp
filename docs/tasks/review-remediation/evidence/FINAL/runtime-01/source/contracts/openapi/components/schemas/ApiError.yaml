@@ -1,0 +1,12 @@
+properties:
+  detail:
+    title: Detail
+  code:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Code
+type: object
+required:
+- detail
+title: ApiError

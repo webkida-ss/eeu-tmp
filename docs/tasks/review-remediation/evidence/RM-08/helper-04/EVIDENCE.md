@@ -1,0 +1,3 @@
+# RM-08 final helper correction checkpoint
+
+Base 3c4fae5d2c03e6592ebd1f51debf5c798294a476. Helper-04 supersedes helper-03 for canonical test formatting only. Two source files are frozen; other RM08 source remains source-02. Private generated filesystem-only configuration binds canonical mirror path; inherited CLI configuration is ignored. Missing AWS content fails before init. Path fixtures cover backslash,quotes,template markers and unsupported controls. Final canonical backend lint/format/unit is running; prior iteration passed844tests. Native schemas and infra validation remain blocked. RM09A source is being implemented in the host working tree but is absent from this frozen container snapshot and outside this review.

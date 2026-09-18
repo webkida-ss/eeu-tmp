@@ -1,0 +1,14 @@
+properties:
+  items:
+    items:
+      $ref: ./VocabularyBookItem.yaml
+    type: array
+    title: Items
+  preload_count:
+    type: integer
+    title: Preload Count
+type: object
+required:
+- items
+- preload_count
+title: VocabularyBookResponse

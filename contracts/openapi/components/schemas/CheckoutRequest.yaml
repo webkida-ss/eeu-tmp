@@ -1,0 +1,10 @@
+properties:
+  plan:
+    type: string
+    minLength: 1
+    maxLength: 64
+    title: Plan
+type: object
+required:
+- plan
+title: CheckoutRequest

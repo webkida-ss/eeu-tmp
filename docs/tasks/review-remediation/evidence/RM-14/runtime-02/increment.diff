@@ -1,0 +1,545 @@
+--- a/backend/repositories/admin_activity.py
++++ b/backend/repositories/admin_activity.py
+@@ -47,7 +47,7 @@
+ 
+ class AdminActivityRepository(Protocol):
+     def append(self, event: ActivityEvent) -> ActivityEvent:
+-        """Persist an event, returning the original event for duplicate sources."""
++        """Persist an event, returning the original for a duplicate account/source pair."""
+ 
+     def query(
+         self,
+--- a/backend/repositories/json_admin_activity.py
++++ b/backend/repositories/json_admin_activity.py
+@@ -85,7 +85,7 @@
+             records = read_json_list(self._path)
+             for record in records:
+                 existing = _event_from_record(record)
+-                if existing.source_id == event.source_id:
++                if existing.user_id == event.user_id and existing.source_id == event.source_id:
+                     return existing
+             records.append(_event_to_record(event))
+             write_json_list(self._path, records)
+--- a/backend/repositories/memory_admin_activity.py
++++ b/backend/repositories/memory_admin_activity.py
+@@ -13,15 +13,16 @@
+ 
+ class MemoryAdminActivityRepository:
+     def __init__(self) -> None:
+-        self._events_by_source: dict[str, ActivityEvent] = {}
++        self._events_by_account_source: dict[tuple[str, str], ActivityEvent] = {}
+         self._lock = threading.RLock()
+ 
+     def append(self, event: ActivityEvent) -> ActivityEvent:
+         with self._lock:
+-            existing = self._events_by_source.get(event.source_id)
++            key = (event.user_id, event.source_id)
++            existing = self._events_by_account_source.get(key)
+             if existing is not None:
+                 return existing
+-            self._events_by_source[event.source_id] = event
++            self._events_by_account_source[key] = event
+             return event
+ 
+     def query(
+@@ -38,7 +39,7 @@
+         with self._lock:
+             events = [
+                 event
+-                for event in self._events_by_source.values()
++                for event in self._events_by_account_source.values()
+                 if event.user_id == user_id
+                 and start <= event.recorded_at < end
+                 and (operation is None or event.operation == operation)
+--- a/backend/repositories/phrase_repository.py
++++ b/backend/repositories/phrase_repository.py
+@@ -3,7 +3,7 @@
+ from pathlib import Path
+ from typing import Any, Protocol
+ 
+-from storage.json_list_store import read_json_list, write_json_list
++from storage.json_list_store import json_list_lock, read_json_list, write_json_list
+ 
+ 
+ class PhraseRepository(Protocol):
+@@ -14,7 +14,7 @@
+ 
+ class JsonPhraseRepository:
+     def __init__(self, path: Path) -> None:
+-        self._path = path
++        self._path = path.resolve()
+ 
+     def list_for_user(self, user_id: str) -> list[dict[str, Any]]:
+         return [item for item in read_json_list(self._path) if item.get("user_id") == user_id]
+@@ -22,7 +22,8 @@
+     def create(self, user_id: str, record: dict[str, Any]) -> dict[str, Any]:
+         stored = dict(record)
+         stored["user_id"] = user_id
+-        phrases = read_json_list(self._path)
+-        phrases.insert(0, stored)
+-        write_json_list(self._path, phrases)
++        with json_list_lock(self._path):
++            phrases = read_json_list(self._path)
++            phrases.insert(0, stored)
++            write_json_list(self._path, phrases)
+         return stored
+--- a/backend/test_admin_activity_repository.py
++++ b/backend/test_admin_activity_repository.py
+@@ -42,12 +42,11 @@
+     def create_repository(self):
+         raise NotImplementedError
+ 
+-    def test_append_is_idempotent_by_source_id(self) -> None:
++    def test_append_is_idempotent_by_account_and_source_id(self) -> None:
+         repository = self.create_repository()
+         original = _event()
+         replacement = _event(
+             event_id="different-id",
+-            user_id="different-user",
+             status="failed",
+         )
+ 
+@@ -60,6 +59,30 @@
+                 end=datetime(2026, 7, 20, tzinfo=UTC),
+             ),
+             [original],
++        )
++
++    def test_append_isolated_by_account_for_the_same_source_id(self) -> None:
++        repository = self.create_repository()
++        first = _event(event_id="first", user_id="user-1")
++        second = _event(event_id="second", user_id="user-2")
++
++        self.assertEqual(repository.append(first), first)
++        self.assertEqual(repository.append(second), second)
++        self.assertEqual(
++            repository.query(
++                user_id="user-1",
++                start=datetime(2026, 7, 19, tzinfo=UTC),
++                end=datetime(2026, 7, 20, tzinfo=UTC),
++            ),
++            [first],
++        )
++        self.assertEqual(
++            repository.query(
++                user_id="user-2",
++                start=datetime(2026, 7, 19, tzinfo=UTC),
++                end=datetime(2026, 7, 20, tzinfo=UTC),
++            ),
++            [second],
+         )
+ 
+     def test_query_filters_user_time_operation_and_status(self) -> None:
+@@ -184,6 +207,38 @@
+                 end=datetime(2026, 7, 20, tzinfo=UTC),
+             )
+ 
++    def test_reopened_legacy_events_are_deduplicated_per_account(self) -> None:
++        legacy = _event(event_id="legacy", source_id="legacy-source", user_id="user-1")
++        self.path.write_text(
++            json.dumps(
++                [
++                    {
++                        "id": legacy.id,
++                        "source_id": legacy.source_id,
++                        "user_id": legacy.user_id,
++                        "operation": legacy.operation,
++                        "status": legacy.status,
++                        "recorded_at": legacy.recorded_at.isoformat(),
++                        "error_code": legacy.error_code,
++                        "input_tokens": legacy.input_tokens,
++                        "output_tokens": legacy.output_tokens,
++                        "tokens": legacy.tokens,
++                        "actual_cost_micro_usd": legacy.actual_cost_micro_usd,
++                        "model": legacy.model,
++                    }
++                ]
++            ),
++            encoding="utf-8",
++        )
++
++        reopened = JsonAdminActivityRepository(self.path)
++        self.assertEqual(
++            reopened.append(_event(event_id="replay", source_id="legacy-source")), legacy
++        )
++        second = _event(event_id="second", source_id="legacy-source", user_id="user-2")
++        self.assertEqual(reopened.append(second), second)
++        self.assertEqual(len(json.loads(self.path.read_text(encoding="utf-8"))), 2)
++
+     def test_concurrent_duplicate_append_persists_one_record(self) -> None:
+         barrier = threading.Barrier(2)
+         results: list[ActivityEvent] = []
+--- a/backend/test_admin_activity_service.py
++++ b/backend/test_admin_activity_service.py
+@@ -51,7 +51,7 @@
+         self.assertIsNotNone(event.recorded_at.tzinfo)
+         self.assertEqual(event.recorded_at.utcoffset(), timedelta(0))
+ 
+-    def test_recording_same_source_returns_original_event(self) -> None:
++    def test_recording_same_account_source_returns_original_event(self) -> None:
+         first = self.service.record_activity(
+             source_id="request-1",
+             user_id="user-1",
+@@ -60,12 +60,21 @@
+         )
+         second = self.service.record_activity(
+             source_id="request-1",
+-            user_id="user-2",
++            user_id="user-1",
+             operation="chat",
+             status="failed",
+         )
+ 
+         self.assertEqual(second, first)
++        other_account = self.service.record_activity(
++            source_id="request-1",
++            user_id="user-2",
++            operation="article",
++            status="success",
++        )
++        self.assertNotEqual(other_account.id, first.id)
++        self.assertEqual(other_account.user_id, "user-2")
++        self.assertEqual(other_account.source_id, first.source_id)
+ 
+     def test_rejects_naive_datetime(self) -> None:
+         with self.assertRaisesRegex(ValueError, "timezone-aware"):
+--- a/backend/test_phrase_repository.py
++++ b/backend/test_phrase_repository.py
+@@ -0,0 +1,246 @@
++"""Regression coverage for atomic JSON phrase persistence."""
++
++from __future__ import annotations
++
++import json
++import tempfile
++import threading
++import unittest
++import uuid
++from contextlib import contextmanager
++from pathlib import Path
++from unittest import mock
++
++from core.ids import generate_uuid7
++from repositories import phrase_repository
++from repositories.phrase_repository import JsonPhraseRepository
++from schemas import AnalyzeResponse, PhraseCreateRequest, PhraseRecord
++from services import reading
++
++
++def _request(label: str) -> PhraseCreateRequest:
++    original_text = f"{label} sentence for phrase persistence."
++    return PhraseCreateRequest(
++        original_text=original_text,
++        analysis=AnalyzeResponse(
++            original_text=original_text,
++            translation=f"{label} translation",
++        ),
++        page_url=f"https://example.test/{label}",
++        page_title=f"{label} article",
++    )
++
++
++def _assert_uuid7(test_case: unittest.TestCase, value: str) -> None:
++    parsed = uuid.UUID(value)
++    test_case.assertEqual(parsed.version, 7)
++    test_case.assertEqual(parsed.variant, uuid.RFC_4122)
++
++
++class JsonPhraseRepositoryTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++        self._directory = Path(self._temporary_directory.name)
++
++    def tearDown(self) -> None:
++        self._temporary_directory.cleanup()
++
++    def test_create_uses_trusted_owner_and_preserves_prepend_order(self) -> None:
++        repository = JsonPhraseRepository(self._directory / "phrases.json")
++        trusted_owner = "trusted-owner"
++        caller_owner = "caller-supplied-owner"
++        preexisting = PhraseRecord(
++            id=generate_uuid7(),
++            created_at="2026-09-15T00:00:00+00:00",
++            **_request("preexisting").model_dump(),
++        )
++        latest = PhraseRecord(
++            id=generate_uuid7(),
++            created_at="2026-09-15T00:00:01+00:00",
++            **_request("latest").model_dump(),
++        )
++
++        first = repository.create(
++            trusted_owner,
++            {**preexisting.model_dump(), "user_id": caller_owner},
++        )
++        second = repository.create(
++            trusted_owner,
++            {**latest.model_dump(), "user_id": caller_owner},
++        )
++
++        self.assertEqual(first["user_id"], trusted_owner)
++        self.assertEqual(second["user_id"], trusted_owner)
++        self.assertEqual(
++            [record["id"] for record in repository.list_for_user(trusted_owner)],
++            [latest.id, preexisting.id],
++        )
++        self.assertEqual(repository.list_for_user(caller_owner), [])
++
++    def test_reading_create_phrase_persists_a_uuid7_record_for_the_service_owner(self) -> None:
++        repository = JsonPhraseRepository(self._directory / "phrases.json")
++
++        phrase = reading.create_phrase(repository, "learner-1", _request("service"))
++
++        _assert_uuid7(self, phrase.id)
++        self.assertEqual(
++            repository.list_for_user("learner-1"),
++            [{**phrase.model_dump(), "user_id": "learner-1"}],
++        )
++        self.assertEqual(repository.list_for_user("learner-2"), [])
++
++    def test_two_instance_creates_hold_the_lock_across_read_prepend_and_write(self) -> None:
++        cases = (
++            ("same owner", "learner-1", "learner-1", False),
++            ("cross owner", "learner-1", "learner-2", False),
++            ("symlink aliases", "learner-1", "learner-1", True),
++        )
++        for label, first_owner, second_owner, use_symlink in cases:
++            with self.subTest(label=label):
++                self._assert_serialized_creates(
++                    label.replace(" ", "-"),
++                    first_owner,
++                    second_owner,
++                    use_symlink=use_symlink,
++                )
++
++    def _assert_serialized_creates(
++        self,
++        label: str,
++        first_owner: str,
++        second_owner: str,
++        *,
++        use_symlink: bool,
++    ) -> None:
++        case_directory = self._directory / label
++        case_directory.mkdir()
++        path = case_directory / "phrases.json"
++        alias = case_directory / "phrases-alias.json"
++        if use_symlink:
++            alias.symlink_to(path)
++
++        first_repository = JsonPhraseRepository(path)
++        second_repository = JsonPhraseRepository(alias if use_symlink else path)
++        self.assertEqual(first_repository._path, path.resolve())
++        self.assertEqual(second_repository._path, path.resolve())
++
++        preexisting = reading.create_phrase(first_repository, first_owner, _request("preexisting"))
++        acknowledgements: dict[str, PhraseRecord] = {}
++        errors: list[BaseException] = []
++        first_read = threading.Event()
++        release_first = threading.Event()
++        second_lock_attempted = threading.Event()
++        second_acknowledged = threading.Event()
++        read_guard = threading.Lock()
++        paused = False
++        lock_entries = 0
++        original_read = phrase_repository.read_json_list
++        original_lock = phrase_repository.json_list_lock
++
++        def pause_first_protected_read(read_path: Path) -> list[dict]:
++            nonlocal paused
++            phrases = original_read(read_path)
++            with read_guard:
++                should_pause = not paused
++                if should_pause:
++                    paused = True
++            if should_pause:
++                first_read.set()
++                if not release_first.wait(timeout=2):
++                    raise TimeoutError("test did not release the first phrase save")
++            return phrases
++
++        @contextmanager
++        def observe_lock_attempt(lock_path: Path):
++            nonlocal lock_entries
++            with read_guard:
++                lock_entries += 1
++                is_second_attempt = lock_entries == 2
++            if is_second_attempt:
++                second_lock_attempted.set()
++            with original_lock(lock_path):
++                yield
++
++        def save_first() -> None:
++            try:
++                acknowledgements["first"] = reading.create_phrase(
++                    first_repository,
++                    first_owner,
++                    _request("first"),
++                )
++            except BaseException as error:
++                errors.append(error)
++
++        def save_second() -> None:
++            try:
++                acknowledgements["second"] = reading.create_phrase(
++                    second_repository,
++                    second_owner,
++                    _request("second"),
++                )
++            except BaseException as error:
++                errors.append(error)
++            finally:
++                second_acknowledged.set()
++
++        first_thread = threading.Thread(target=save_first, daemon=True)
++        second_thread = threading.Thread(target=save_second, daemon=True)
++        first_started = False
++        second_started = False
++        with (
++            mock.patch.object(
++                phrase_repository,
++                "read_json_list",
++                side_effect=pause_first_protected_read,
++            ),
++            mock.patch.object(
++                phrase_repository,
++                "json_list_lock",
++                side_effect=observe_lock_attempt,
++            ),
++        ):
++            first_thread.start()
++            first_started = True
++            try:
++                self.assertTrue(first_read.wait(timeout=2))
++                second_thread.start()
++                second_started = True
++                self.assertTrue(second_lock_attempted.wait(timeout=2))
++                self.assertFalse(second_acknowledged.wait(timeout=0.1))
++            finally:
++                release_first.set()
++                if first_started:
++                    first_thread.join(timeout=2)
++                if second_started:
++                    second_thread.join(timeout=2)
++
++        self.assertFalse(first_thread.is_alive())
++        self.assertFalse(second_thread.is_alive())
++        self.assertEqual(errors, [])
++        self.assertEqual(set(acknowledgements), {"first", "second"})
++        first_phrase = acknowledgements["first"]
++        second_phrase = acknowledgements["second"]
++        _assert_uuid7(self, first_phrase.id)
++        _assert_uuid7(self, second_phrase.id)
++
++        raw = json.loads(path.read_text(encoding="utf-8"))
++        raw_ids = [record["id"] for record in raw]
++        self.assertEqual(raw_ids.count(preexisting.id), 1)
++        self.assertEqual(raw_ids.count(first_phrase.id), 1)
++        self.assertEqual(raw_ids.count(second_phrase.id), 1)
++        self.assertEqual(raw_ids, [second_phrase.id, first_phrase.id, preexisting.id])
++        self.assertEqual(
++            {record["id"] for record in first_repository.list_for_user(first_owner)},
++            {
++                preexisting.id,
++                first_phrase.id,
++                *({second_phrase.id} if first_owner == second_owner else set()),
++            },
++        )
++        self.assertEqual(
++            {record["id"] for record in second_repository.list_for_user(second_owner)},
++            {
++                second_phrase.id,
++                *({preexisting.id, first_phrase.id} if first_owner == second_owner else set()),
++            },
++        )
+--- a/backend/test_terminal_activity.py
++++ b/backend/test_terminal_activity.py
+@@ -271,7 +271,7 @@
+ 
+         log_exception.assert_called_once()
+ 
+-    def test_first_write_replay_returns_original_event_for_memory_and_json(self) -> None:
++    def test_terminal_activity_replay_is_scoped_to_the_account_for_memory_and_json(self) -> None:
+         with TemporaryDirectory() as directory:
+             repositories: list[AdminActivityRepository] = [
+                 MemoryAdminActivityRepository(),
+@@ -282,12 +282,18 @@
+                     first = _outcome(operation_id=_OPERATION_ID, user_id=_USER_ID)
+                     replay = _outcome(
+                         operation_id=_OPERATION_ID,
++                        user_id=_USER_ID,
++                        status="success",
++                        error=ValueError("later error"),
++                    )
++                    other_account = _outcome(
++                        operation_id=_OPERATION_ID,
+                         user_id=_SECOND_USER_ID,
+                         status="success",
+-                        error=ValueError("later error"),
+                     )
+                     record_terminal_activity(repository, first)
+                     record_terminal_activity(repository, replay)
++                    record_terminal_activity(repository, other_account)
+ 
+                     events = repository.query(
+                         user_id=_USER_ID,
+@@ -297,13 +303,54 @@
+                     self.assertEqual(len(events), 1)
+                     self.assertEqual(events[0].status, "success")
+                     self.assertIsNone(events[0].error_code)
+-                    self.assertEqual(
+-                        repository.query(
+-                            user_id=_SECOND_USER_ID,
++                    other_events = repository.query(
++                        user_id=_SECOND_USER_ID,
++                        start=datetime.min.replace(tzinfo=UTC),
++                        end=datetime.max.replace(tzinfo=UTC),
++                    )
++                    self.assertEqual(len(other_events), 1)
++                    self.assertEqual(other_events[0].source_id, other_account.source_id)
++                    self.assertEqual(other_events[0].user_id, _SECOND_USER_ID)
++                    self.assertEqual(other_events[0].status, "success")
++
++    def test_quota_blocked_terminal_activity_is_scoped_to_the_account(self) -> None:
++        with TemporaryDirectory() as directory:
++            repositories: list[AdminActivityRepository] = [
++                MemoryAdminActivityRepository(),
++                JsonAdminActivityRepository(Path(directory) / "activity.json"),
++            ]
++            for repository in repositories:
++                with self.subTest(repository=type(repository).__name__):
++                    first = _outcome(operation="article", status="quota_blocked")
++                    same_account_replay = _outcome(
++                        operation="article",
++                        status="quota_blocked",
++                        error=ValueError("later error"),
++                    )
++                    second = _outcome(
++                        operation="article",
++                        user_id=_SECOND_USER_ID,
++                        status="quota_blocked",
++                    )
++
++                    record_terminal_activity(repository, first, preserve_failure=True)
++                    record_terminal_activity(repository, same_account_replay, preserve_failure=True)
++                    record_terminal_activity(repository, second, preserve_failure=True)
++
++                    for user_id in (_USER_ID, _SECOND_USER_ID):
++                        events = repository.query(
++                            user_id=user_id,
+                             start=datetime.min.replace(tzinfo=UTC),
+                             end=datetime.max.replace(tzinfo=UTC),
+-                        ),
+-                        [],
++                        )
++                        self.assertEqual(len(events), 1)
++                        self.assertEqual(events[0].status, "quota_blocked")
++                    self.assertIsNone(
++                        repository.query(
++                            user_id=_USER_ID,
++                            start=datetime.min.replace(tzinfo=UTC),
++                            end=datetime.max.replace(tzinfo=UTC),
++                        )[0].error_code
+                     )
+ 
+ 

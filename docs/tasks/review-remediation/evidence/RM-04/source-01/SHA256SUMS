@@ -1,0 +1,11 @@
+5bff8567b7aa459afde020a4ab85d7a4aea2a57120c2d298617bf4d725d47323  extension/content.js
+16c363efaa614303d56c284a11b30f5821a171aadd041370781fec0337d3807a  extension/panel-ui.js
+0dd71c6f6ba50a8520b767a2964fcd9f5933e5c4a9939a8f73f71bc62202b544  extension/reading-panel.js
+e138fa271b265dd695f2543d5d93e68a372c268708e698d4355e4d75487d5cf3  extension/test/content-parsing.test.mjs
+51b5fdbc54d86946af0fe4fa858b4258e2ac39762c076c6a3e92cdb638d12bec  extension/test/smoke.mjs
+2b131cb95884f4d5a88c4ec11272585afae24e6a43fbff5eb5906f2c46c4db67  docs/tasks/review-remediation/evidence/RM-04/source-01/increment.diff
+5bff8567b7aa459afde020a4ab85d7a4aea2a57120c2d298617bf4d725d47323  docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/content.js
+16c363efaa614303d56c284a11b30f5821a171aadd041370781fec0337d3807a  docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/panel-ui.js
+0dd71c6f6ba50a8520b767a2964fcd9f5933e5c4a9939a8f73f71bc62202b544  docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/reading-panel.js
+e138fa271b265dd695f2543d5d93e68a372c268708e698d4355e4d75487d5cf3  docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/test/content-parsing.test.mjs
+51b5fdbc54d86946af0fe4fa858b4258e2ac39762c076c6a3e92cdb638d12bec  docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/test/smoke.mjs

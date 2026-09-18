@@ -1,0 +1,53 @@
+# Operating systems and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Logs, caches, and temporary files
+*.log
+.cache/
+.tmp/
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Node.js
+node_modules/
+*.tsbuildinfo
+
+# Build and test output
+build/
+dist/
+coverage/
+output/
+
+# Terraform local state (provider locks remain tracked)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+override.tf
+override.tf.json
+
+# Local tool logs
+.cursor/logs/
+.cursor/chat/
+.claude/logs/
+.codex/logs/

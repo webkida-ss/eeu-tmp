@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyVersionedDevPlanObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObjectVersion",
+        "s3:GetObjectVersionAttributes"
+      ],
+      "Resource": [
+        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
+        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
+      ]
+    },
+    {
+      "Sid": "DecryptOnlyDevPlanObjects",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "PLAN_KMS_KEY_ARN",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.REGION.amazonaws.com"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:s3:arn": [
+            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
+            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,1951 @@
+--- a/backend/core/pipeline.py
++++ b/backend/core/pipeline.py
+@@ -422,6 +422,7 @@
+     total_tokens: int
+     cost_micro_usd: int
+     missing_usage: bool
++    incurred_call_uncertainty: bool = False
+ 
+     @property
+     def actual_cost_micro_usd(self) -> int:
+@@ -447,6 +448,7 @@
+         self.output_tokens = 0
+         self.total_tokens = 0
+         self.missing_usage = False
++        self.incurred_call_uncertainty = False
+ 
+     def set_dispatch_callback(self, callback: Callable[[], None] | None) -> None:
+         self._dispatch_callback = callback
+@@ -457,6 +459,12 @@
+             callback()
+         with self._lock:
+             self._any_dispatch_attempted = True
++
++    def mark_incurred_call_uncertainty(self) -> None:
++        """Record an actual provider-call failure without discarding known usage."""
++        with self._lock:
++            self.incurred_call_uncertainty = True
++            self.missing_usage = True
+ 
+     @property
+     def any_dispatch_attempted(self) -> bool:
+@@ -531,6 +539,7 @@
+             output_tokens = self.output_tokens
+             total_tokens = self.total_tokens
+             missing_usage = self.missing_usage
++            incurred_call_uncertainty = self.incurred_call_uncertainty
+         rate = rate or load_model_rate(OPENAI_MODEL)
+         return UsageSnapshot(
+             model=rate.model,
+@@ -541,6 +550,7 @@
+             total_tokens=total_tokens,
+             cost_micro_usd=calculate_cost_micro_usd(input_tokens, output_tokens, rate),
+             missing_usage=missing_usage,
++            incurred_call_uncertainty=incurred_call_uncertainty,
+         )
+ 
+ 
+@@ -551,11 +561,14 @@
+     **request: Any,
+ ) -> Any:
+     with _openai_call_slots:
++        create = client.chat.completions.create
+         if tally:
+             tally.mark_dispatch_attempt()
+         try:
+-            return client.chat.completions.create(**request)
++            return create(**request)
+         except Exception as exc:
++            if tally:
++                tally.mark_incurred_call_uncertainty()
+             raise PipelineError(
+                 f"OpenAI API request failed: {exc}",
+                 status_code=502,
+--- a/backend/repositories/dynamodb_billing_repositories.py
++++ b/backend/repositories/dynamodb_billing_repositories.py
+@@ -35,6 +35,7 @@
+     _apply_amounts,
+     _check_admission,
+     _conservative_finalize_request,
++    _dispatch_usage_result,
+     _event_record,
+     _finalize_request_from_evidence,
+     _finalize_request_from_result,
+@@ -391,6 +392,24 @@
+         record = json.loads(item[DOCUMENT_ATTRIBUTE])
+         return _operation_from_record(record) if record is not None else None
+ 
++    def record_dispatch_usage(
++        self,
++        user_id: str,
++        operation_id: str,
++        kind: str,
++        usage: dict[str, Any],
++    ) -> UsageOperation:
++        """Persist normalized numeric evidence without creating a TTL result."""
++        operation = self._persist_dispatch_evidence(
++            user_id,
++            operation_id,
++            _dispatch_usage_result(kind, usage),
++            require_operation=True,
++        )
++        if operation is None:
++            raise UsageOperationNotFound(operation_id)
++        return operation
++
+     def save_result(
+         self, user_id: str, operation_id: str, result: dict[str, Any]
+     ) -> dict[str, Any]:
+@@ -442,18 +461,25 @@
+         return result
+ 
+     def _persist_dispatch_evidence(
+-        self, user_id: str, operation_id: str, result: dict[str, Any]
+-    ) -> None:
++        self,
++        user_id: str,
++        operation_id: str,
++        result: dict[str, Any],
++        *,
++        require_operation: bool = False,
++    ) -> UsageOperation | None:
+         """Persist safe dispatch evidence before writing a TTL-private result."""
+         for _attempt in range(4):
+             operation = self.get_operation(user_id, operation_id)
+             if operation is None:
+                 # Compatibility callers may use result storage without a quota
+                 # operation. Those records have no durable reservation to fence.
+-                return
++                if require_operation:
++                    raise UsageOperationNotFound(operation_id)
++                return None
+             promoted = _promote_dispatch_evidence(operation, result)
+             if promoted == operation:
+-                return
++                return operation
+             try:
+                 self._store.transact_write(
+                     [
+@@ -470,7 +496,7 @@
+                         )
+                     ]
+                 )
+-                return
++                return promoted
+             except ClientError as exc:
+                 if not _is_transaction_failure(exc):
+                     raise
+@@ -478,10 +504,12 @@
+         # validation instead of rebasing a whole stale operation snapshot.
+         operation = self.get_operation(user_id, operation_id)
+         if operation is None:
+-            return
++            if require_operation:
++                raise UsageOperationNotFound(operation_id)
++            return None
+         promoted = _promote_dispatch_evidence(operation, result)
+         if promoted == operation:
+-            return
++            return operation
+         raise UsageRepositoryError("Dispatch evidence transaction conflicted")
+ 
+     def get_result(self, user_id: str, operation_id: str) -> dict[str, Any] | None:
+--- a/backend/repositories/usage_repository.py
++++ b/backend/repositories/usage_repository.py
+@@ -374,6 +374,14 @@
+ 
+     def get_operation(self, user_id: str, operation_id: str) -> UsageOperation | None: ...
+ 
++    def record_dispatch_usage(
++        self,
++        user_id: str,
++        operation_id: str,
++        kind: str,
++        usage: dict[str, Any],
++    ) -> UsageOperation: ...
++
+     def save_result(
+         self, user_id: str, operation_id: str, result: dict[str, Any]
+     ) -> dict[str, Any]: ...
+@@ -621,6 +629,29 @@
+         with self._lock, json_list_lock(self._path):
+             record = _find_operation(self._load_items_with_cleanup(), user_id, operation_id)
+             return _operation_from_record(record) if record is not None else None
++
++    def record_dispatch_usage(
++        self,
++        user_id: str,
++        operation_id: str,
++        kind: str,
++        usage: dict[str, Any],
++    ) -> UsageOperation:
++        """Persist normalized numeric evidence without retaining a private result."""
++        result = _dispatch_usage_result(kind, usage)
++        with self._lock, json_list_lock(self._path):
++            items = self._load_items_with_cleanup()
++            record = _find_operation(items, user_id, operation_id)
++            if record is None:
++                raise UsageOperationNotFound(operation_id)
++            operation = _operation_from_record(record)
++            promoted = _promote_dispatch_evidence(operation, result)
++            if promoted == operation:
++                return operation
++            record.clear()
++            record.update(_operation_to_record(promoted))
++            write_json_list(self._path, items)
++            return promoted
+ 
+     def save_result(
+         self, user_id: str, operation_id: str, result: dict[str, Any]
+@@ -1096,6 +1127,15 @@
+     )
+ 
+ 
++def _dispatch_usage_result(kind: str, usage: dict[str, Any]) -> dict[str, Any]:
++    """Build the only result shape accepted by the non-private evidence port."""
++    if kind not in {"analyze", "chat", "preload"}:
++        raise UsageOperationConflict("Dispatch evidence kind is invalid")
++    if not isinstance(usage, dict):
++        raise ValueError("Dispatch usage must be an object")
++    return {"kind": kind, "state": "completed", "usage": usage}
++
++
+ def _conservative_finalize_request(operation: UsageOperation) -> UsageFinalizeRequest:
+     usage = operation.dispatch_usage or {}
+     known_cost = int(usage.get("actual_cost_micro_usd") or 0)
+--- a/backend/services/preloading.py
++++ b/backend/services/preloading.py
+@@ -182,14 +182,29 @@
+     operation: Any,
+     *,
+     result_ref: str,
++    fallback_usage: dict[str, Any] | None = None,
+ ) -> str:
+-    """Settle durable provider evidence without relying on private results."""
+-    usage = operation.dispatch_usage or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd}
+-    completeness = (
+-        "measured" if operation.dispatch_usage_completeness == "measured" else "conservative"
+-    )
++    """Settle canonical evidence, retaining local usage after a failed promotion."""
++    latest = meter.get_operation(operation.operation_id) or operation
++    if latest.state == "finalized":
++        return (
++            "finalized"
++            if latest.dispatch_usage_completeness == "measured"
++            else "finalized_conservative"
++        )
++    if latest.dispatch_evidence_state == "completed":
++        usage = latest.dispatch_usage or {"actual_cost_micro_usd": latest.reserved_cost_micro_usd}
++        completeness = (
++            "measured" if latest.dispatch_usage_completeness == "measured" else "conservative"
++        )
++    elif fallback_usage is not None:
++        usage = fallback_usage
++        completeness = "measured" if usage.get("usage_complete") is True else "conservative"
++    else:
++        usage = {"actual_cost_micro_usd": latest.reserved_cost_micro_usd}
++        completeness = "conservative"
+     meter.finalize(
+-        operation.operation_id,
++        latest.operation_id,
+         usage,
+         result_ref=result_ref,
+         evidence_completeness=completeness,
+@@ -1085,16 +1100,37 @@
+ def _durable_shadow_usage(tally: UsageTally, operation: Any) -> dict[str, Any]:
+     """Use exact measured cost, preserving a floor only for uncertain usage."""
+     usage = _settlement_usage(tally, operation)
+-    snapshot = tally.snapshot()
+-    if snapshot.missing_usage or operation.pricing_available is not True:
++    if not usage["usage_complete"] or operation.pricing_available is not True:
+         usage["actual_cost_micro_usd"] = max(
+             int(usage.get("actual_cost_micro_usd") or 0),
+-            int(snapshot.cost_micro_usd or 0),
++            int(usage.get("cost_micro_usd") or 0),
+             int(operation.reserved_cost_micro_usd),
+         )
+-    else:
+-        usage["actual_cost_micro_usd"] = int(snapshot.cost_micro_usd or 0)
+     return usage
++
++
++def _promote_durable_shadow_usage(
++    meter: UsageMeter,
++    operation_id: str,
++    usage: dict[str, Any],
++) -> bool:
++    """Retry numeric evidence before a shadow outcome can become immutable."""
++    result = {
++        "kind": "preload",
++        "state": "completed",
++        "usage": usage,
++    }
++    for _ in range(2):
++        try:
++            meter.save_result(operation_id, result)
++            return True
++        except Exception:  # noqa: BLE001 - preserve only canonical numeric evidence
++            try:
++                meter.record_dispatch_usage(operation_id, "preload", usage)
++                return True
++            except Exception:  # noqa: BLE001 - retry the fenced canonical promotion
++                continue
++    return False
+ 
+ 
+ def _valid_shadow_ready_payload(result: dict[str, Any] | None) -> dict[str, Any] | None:
+@@ -1342,6 +1378,46 @@
+ 
+     status = str(record.get("status") or "")
+     if status in ("ready_pending_usage", "failed_pending_usage"):
++        canonical_operation = meter.get_operation(operation_id)
++        if canonical_operation is not None and (
++            canonical_operation.state == "finalized" or canonical_operation.shadow_pending_outcome
++        ):
++            try:
++                canonical_operation = _settle_durable_shadow(meter, operation_id)
++            except Exception:  # noqa: BLE001 - leave the page record retryable
++                logger.exception(
++                    "durable shadow canonical settlement recovery failed operation_id=%s",
++                    operation_id,
++                )
++                return
++            _finish_durable_shadow_publication(
++                repository,
++                content_store,
++                meter,
++                user_id,
++                preload_id,
++                learner_profile_fingerprint,
++                record,
++                canonical_operation,
++                expected_status=status,
++                lease_id=None,
++                admin_activity_repository=admin_activity_repository,
++            )
++            return
++        retry_usage = record.get("shadow_evidence_retry_usage")
++        if isinstance(retry_usage, dict) and not _promote_durable_shadow_usage(
++            meter,
++            operation_id,
++            retry_usage,
++        ):
++            logger.warning(
++                "durable shadow numeric evidence remains retryable operation_id=%s",
++                operation_id,
++            )
++            return
++        if isinstance(retry_usage, dict):
++            record = dict(record)
++            record.pop("shadow_evidence_retry_usage", None)
+         intended_outcome = record.get("shadow_pending_outcome")
+         if intended_outcome not in (
+             "success",
+@@ -1533,9 +1609,7 @@
+                 vocabulary_coverage=vocabulary_coverage,
+             )
+             repository.validate_publication(user_id, _shadow_ready_record(record, payload))
+-            snapshot = tally.snapshot()
+             usage = _durable_shadow_usage(tally, operation)
+-            usage["usage_complete"] = bool(not snapshot.missing_usage and snapshot.total_tokens > 0)
+             meter.save_result(
+                 operation_id,
+                 {
+@@ -1557,22 +1631,54 @@
+             owns_publication = heartbeat.stop_and_verify()
+ 
+         if provider_error is not None and _dispatch_was_attempted(tally, provider_error):
+-            try:
+-                partial_usage = _durable_shadow_usage(tally, operation)
+-                partial_usage["usage_complete"] = False
+-                meter.save_result(
++            partial_usage = _durable_shadow_usage(tally, operation)
++            if not _promote_durable_shadow_usage(meter, operation_id, partial_usage):
++                canonical_operation = meter.get_operation(operation_id)
++                if canonical_operation is not None and (
++                    canonical_operation.state == "finalized"
++                    or canonical_operation.shadow_pending_outcome
++                ):
++                    try:
++                        canonical_operation = _settle_durable_shadow(meter, operation_id)
++                    except Exception:  # noqa: BLE001 - retain the page record for recovery
++                        logger.exception(
++                            "durable shadow canonical settlement recovery failed operation_id=%s",
++                            operation_id,
++                        )
++                        return
++                    _finish_durable_shadow_publication(
++                        repository,
++                        content_store,
++                        meter,
++                        user_id,
++                        preload_id,
++                        learner_profile_fingerprint,
++                        record,
++                        canonical_operation,
++                        expected_status="running",
++                        lease_id=lease_id,
++                        admin_activity_repository=admin_activity_repository,
++                    )
++                    return
++                pending = dict(record)
++                pending["status"] = "failed_pending_usage"
++                pending["shadow_pending_outcome"] = desired_outcome
++                pending["shadow_pending_result_ref"] = preload_id
++                pending["shadow_evidence_retry_usage"] = partial_usage
++                pending["content_retirement_pending"] = True
++                pending.pop("_claimed_from_unstarted_processing", None)
++                repository.finish_processing(
++                    user_id,
++                    preload_id,
++                    learner_profile_fingerprint,
++                    pending,
++                    lease_id=lease_id,
++                )
++                logger.warning(
++                    "durable shadow numeric evidence remains retryable operation_id=%s",
+                     operation_id,
+-                    {
+-                        "kind": "preload",
+-                        "state": "completed",
+-                        "usage": partial_usage,
+-                    },
+-                )
+-            except Exception:  # noqa: BLE001 - retain the already-persisted dispatch marker
+-                logger.warning(
+-                    "durable shadow partial evidence could not be saved operation_id=%s",
+-                    operation_id,
+-                )
++                )
++                return
+ 
+         try:
+             operation = _settle_durable_shadow(
+@@ -1929,7 +2035,12 @@
+             and record.get("usage_tally")
+         ):
+             if operation.dispatch_evidence_state in ("dispatched", "completed"):
+-                _finalize_dispatch_evidence(meter, operation, result_ref=preload_id)
++                _finalize_dispatch_evidence(
++                    meter,
++                    operation,
++                    result_ref=preload_id,
++                    fallback_usage=record["usage_tally"],
++                )
+             else:
+                 meter.finalize(
+                     operation_id,
+@@ -1968,6 +2079,7 @@
+                     meter,
+                     operation,
+                     result_ref=preload_id,
++                    fallback_usage=record.get("failure_usage"),
+                 )
+             elif record.get("failure_settlement") == "finalize_conservative":
+                 meter.finalize(
+@@ -2107,6 +2219,7 @@
+                     meter,
+                     latest_operation,
+                     result_ref=preload_id,
++                    fallback_usage=durable_result.get("usage") if durable_result else None,
+                 )
+                 interrupted = dict(record)
+                 interrupted["status"] = "failed"
+@@ -2314,6 +2427,7 @@
+     )
+     started = time.perf_counter()
+     provider_error = None
++    durable_usage: dict[str, Any] | None = None
+     heartbeat.start()
+     try:
+         sentences = _split_sentences(
+@@ -2341,21 +2455,7 @@
+     finally:
+         try:
+             if meter and (provider_error is None or _dispatch_was_attempted(tally, provider_error)):
+-                durable_usage = (
+-                    _settlement_usage(tally, operation)
+-                    if provider_error is None
+-                    else {"actual_cost_micro_usd": (operation.reserved_cost_micro_usd)}
+-                )
+-                if provider_error is None:
+-                    snapshot = tally.snapshot()
+-                    durable_usage["usage_complete"] = bool(
+-                        not snapshot.missing_usage and snapshot.total_tokens > 0
+-                    )
+-                else:
+-                    # A dispatch-attempted provider error has no complete
+-                    # provider tally, even when its empty snapshot reports no
+-                    # missing fields. Preserve the reservation floor instead.
+-                    durable_usage["usage_complete"] = False
++                durable_usage = _settlement_usage(tally, operation)
+                 meter.save_result(
+                     operation_id,
+                     {
+@@ -2390,14 +2490,12 @@
+         failed["error"] = str(exc) or "Article analysis failed. Please try again."
+         if meter:
+             if _dispatch_was_attempted(tally, exc):
++                failed["failure_usage"] = durable_usage or _settlement_usage(tally, operation)
+                 latest_operation = meter.get_operation(operation_id) or operation
+                 if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
+                     failed["failure_settlement"] = "finalize_evidence"
+                 else:
+                     failed["failure_settlement"] = "finalize_conservative"
+-                    failed["failure_usage"] = {
+-                        "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-                    }
+             else:
+                 failed["failure_settlement"] = "release"
+                 failed["failure_reason"] = "analysis_failed_before_dispatch"
+@@ -2415,6 +2513,7 @@
+                     meter,
+                     meter.get_operation(operation_id) or operation,
+                     result_ref=preload_id,
++                    fallback_usage=failed.get("failure_usage"),
+                 )
+             elif failed["failure_settlement"] == "finalize_conservative":
+                 meter.finalize(
+@@ -2516,14 +2615,12 @@
+         failed["error"] = str(exc)
+         failed["content_retirement_pending"] = True
+         if meter:
++            failed["failure_usage"] = ready["usage_tally"]
+             latest_operation = meter.get_operation(operation_id) or operation
+             if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
+                 failed["failure_settlement"] = "finalize_evidence"
+             else:
+                 failed["failure_settlement"] = "finalize_conservative"
+-                failed["failure_usage"] = {
+-                    "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-                }
+             failed["usage_state"] = "reserved"
+         published = repository.finish_processing(
+             user_id,
+@@ -2538,6 +2635,7 @@
+                     meter,
+                     meter.get_operation(operation_id) or operation,
+                     result_ref=preload_id,
++                    fallback_usage=failed.get("failure_usage"),
+                 )
+             else:
+                 meter.finalize(
+@@ -2591,6 +2689,7 @@
+                 meter,
+                 latest_operation,
+                 result_ref=preload_id,
++                fallback_usage=ready["usage_tally"],
+             )
+         else:
+             meter.finalize(operation_id, ready["usage_tally"], result_ref=preload_id)
+--- a/backend/services/reading_support.py
++++ b/backend/services/reading_support.py
+@@ -47,9 +47,22 @@
+ 
+ 
+ def _settlement_usage(tally: UsageTally, operation: Any) -> dict[str, Any]:
++    """Build one durable usage snapshot without replacing known partial usage.
++
++    Complete provider usage settles at its measured cost. Any missing or
++    incurred-call uncertainty retains every known counter and applies only the
++    reservation floor, rather than adding that floor on top of known cost.
++    """
+     snapshot = asdict(tally.snapshot())
+-    if snapshot.get("missing_usage") or snapshot.get("total_tokens") == 0:
+-        snapshot["actual_cost_micro_usd"] = operation.reserved_cost_micro_usd
++    complete = not snapshot["missing_usage"] and snapshot["total_tokens"] > 0
++    snapshot["usage_complete"] = complete
++    if complete:
++        snapshot["actual_cost_micro_usd"] = int(snapshot["cost_micro_usd"])
++    else:
++        snapshot["actual_cost_micro_usd"] = max(
++            int(snapshot["cost_micro_usd"]),
++            int(operation.reserved_cost_micro_usd),
++        )
+     return snapshot
+ 
+ 
+--- a/backend/services/synchronous_execution.py
++++ b/backend/services/synchronous_execution.py
+@@ -49,7 +49,14 @@
+         return None
+     if stored.get("state") == "dispatching":
+         return None
+-    response = model(**stored["response"])
++    response_document = stored.get("response")
++    if not isinstance(response_document, dict):
++        _settle_durable_dispatch_evidence(meter, operation)
++        raise PipelineError(
++            "The previous provider dispatch had an uncertain result.",
++            status_code=502,
++        )
++    response = model(**response_document)
+     if operation.state == "reserved":
+         meter.finalize(
+             operation.operation_id,
+@@ -70,18 +77,42 @@
+     return response
+ 
+ 
++def _finalize_synchronous_evidence(
++    meter: UsageMeter,
++    operation: Any,
++    *,
++    fallback_usage: dict[str, Any] | None = None,
++    result_ref: str | None = None,
++) -> None:
++    """Finalize the canonical evidence, retaining local usage after a failed promotion."""
++    latest = meter.get_operation(operation.operation_id) or operation
++    if latest.state == "finalized":
++        return
++    if latest.dispatch_evidence_state == "completed":
++        usage = latest.dispatch_usage or {"actual_cost_micro_usd": latest.reserved_cost_micro_usd}
++        completeness = (
++            "measured" if latest.dispatch_usage_completeness == "measured" else "conservative"
++        )
++    elif fallback_usage is not None:
++        usage = fallback_usage
++        completeness = "measured" if usage.get("usage_complete") is True else "conservative"
++    elif latest.dispatch_evidence_state == "dispatched":
++        usage = {"actual_cost_micro_usd": latest.reserved_cost_micro_usd}
++        completeness = "conservative"
++    else:
++        return
++    meter.finalize(
++        latest.operation_id,
++        usage,
++        result_ref=result_ref or f"usage-evidence:{latest.operation_id}",
++        evidence_completeness=completeness,
++    )
++
++
+ def _settle_durable_dispatch_evidence(meter: UsageMeter, operation: Any) -> None:
+     if operation.dispatch_evidence_state not in ("dispatched", "completed"):
+         return
+-    usage = operation.dispatch_usage or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd}
+-    meter.finalize(
+-        operation.operation_id,
+-        usage,
+-        result_ref=f"usage-evidence:{operation.operation_id}",
+-        evidence_completeness=(
+-            "measured" if operation.dispatch_usage_completeness == "measured" else "conservative"
+-        ),
+-    )
++    _finalize_synchronous_evidence(meter, operation)
+     raise PipelineError(
+         "The previous provider dispatch had an uncertain result.",
+         status_code=502,
+@@ -229,21 +260,33 @@
+     operation: Any,
+     error: Exception,
+     *,
++    tally: UsageTally,
++    kind: str,
+     dispatch_attempted: bool,
+ ) -> None:
+     if dispatch_attempted:
++        usage = _settlement_usage(tally, operation)
++        try:
++            meter.save_result(
++                operation.operation_id,
++                {
++                    "kind": kind,
++                    "state": "completed",
++                    "usage": usage,
++                },
++            )
++        except Exception:  # noqa: BLE001 - preserve the prior durable marker for settlement
++            logger.warning(
++                "synchronous partial evidence could not be saved operation_id=%s",
++                operation.operation_id,
++            )
+         latest = meter.get_operation(operation.operation_id)
+         if latest and latest.dispatch_evidence_state in ("dispatched", "completed"):
+-            meter.finalize(
+-                operation.operation_id,
+-                latest.dispatch_usage
+-                or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
++            _finalize_synchronous_evidence(
++                meter,
++                latest,
++                fallback_usage=usage,
+                 result_ref=f"usage-evidence:{operation.operation_id}",
+-                evidence_completeness=(
+-                    "measured"
+-                    if latest.dispatch_usage_completeness == "measured"
+-                    else "conservative"
+-                ),
+             )
+             return
+         pending = meter.get_result(operation.operation_id)
+@@ -385,16 +428,14 @@
+                 self.meter,
+                 self.operation,
+                 provider_error,
++                tally=tally,
++                kind=self.kind,
+                 dispatch_attempted=_dispatch_was_attempted(tally, provider_error),
+             )
+             raise provider_error
+         try:
+             response = build_response(provider_result)
+             self.usage = _settlement_usage(tally, self.operation)
+-            snapshot = tally.snapshot()
+-            self.usage["usage_complete"] = bool(
+-                not snapshot.missing_usage and snapshot.total_tokens > 0
+-            )
+             self.meter.save_result(
+                 self.operation.operation_id,
+                 {
+@@ -404,16 +445,14 @@
+                     "usage": self.usage,
+                 },
+             )
+-            latest = self.meter.get_operation(self.operation.operation_id) or self.operation
+-            self.meter.finalize(
+-                self.operation.operation_id,
+-                latest.dispatch_usage or self.usage,
++            latest_operation = (
++                self.meter.get_operation(self.operation.operation_id) or self.operation
++            )
++            _finalize_synchronous_evidence(
++                self.meter,
++                latest_operation,
++                fallback_usage=self.usage,
+                 result_ref=f"usage-result:{self.operation.operation_id}",
+-                evidence_completeness=(
+-                    "measured"
+-                    if latest.dispatch_usage_completeness == "measured"
+-                    else "conservative"
+-                ),
+             )
+         except Exception as error:
+             if on_failure:
+@@ -422,6 +461,8 @@
+                 self.meter,
+                 self.operation,
+                 error,
++                tally=tally,
++                kind=self.kind,
+                 dispatch_attempted=True,
+             )
+             raise
+--- a/backend/services/usage_meter.py
++++ b/backend/services/usage_meter.py
+@@ -448,6 +448,22 @@
+             return result
+         return self.usage_repository.save_result(self.user_id, operation_id, result)
+ 
++    def record_dispatch_usage(
++        self,
++        operation_id: str,
++        kind: str,
++        usage: dict[str, Any],
++    ) -> UsageOperation:
++        """Persist canonical numeric dispatch evidence without a private result."""
++        if not self.reservation_enabled and not self.durable_shadow:
++            raise UsageOperationStateError("Disabled metering has no durable dispatch operation")
++        return self.usage_repository.record_dispatch_usage(
++            self.user_id,
++            operation_id,
++            kind,
++            usage,
++        )
++
+     def dispatch_authorizer(self, operation_id: str, marker: dict[str, Any]) -> Callable[[], None]:
+         """Authorize one execution's first provider call after durable persistence."""
+         lock = threading.Lock()
+--- a/backend/test_dispatch_usage_persistence.py
++++ b/backend/test_dispatch_usage_persistence.py
+@@ -0,0 +1,202 @@
++"""Parity regressions for canonical numeric dispatch-usage promotion."""
++
++from __future__ import annotations
++
++import json
++import tempfile
++import unittest
++from dataclasses import asdict, replace
++from datetime import timedelta
++from pathlib import Path
++from typing import Any
++
++from repositories.dynamodb_billing_repositories import DynamoUsageRepository
++from repositories.usage_repository import (
++    JsonUsageRepository,
++    UsageOperationConflict,
++    UsageOperationNotFound,
++    UsageOperationStateError,
++)
++from storage.json_list_store import read_json_list
++from test_usage_repository import NOW, _MemoryDynamoStore, reservation
++
++_USER_ID = "0190f4c0-0000-7000-8000-000000000001"
++_PRIVATE_SENTINEL = "private provider response must never be durable evidence"
++_NUMERIC_USAGE = {
++    "actual_cost_micro_usd": 17,
++    "input_tokens": 17,
++    "output_tokens": 0,
++    "total_tokens": 17,
++}
++_COMPLETE_USAGE = {**_NUMERIC_USAGE, "usage_complete": True}
++
++
++class DispatchUsagePersistenceTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++
++    def tearDown(self) -> None:
++        self._temporary_directory.cleanup()
++
++    def _repositories(self) -> list[tuple[str, Any, Path | None]]:
++        path = Path(self._temporary_directory.name) / "usage.json"
++        return [
++            ("json", JsonUsageRepository(path), path),
++            ("dynamo", DynamoUsageRepository(_MemoryDynamoStore()), None),
++        ]
++
++    @staticmethod
++    def _shadow_request(operation_id: str, *, expires_at=NOW):
++        return replace(
++            reservation(
++                operation_id,
++                articles=1,
++                cost_micro_usd=13,
++                expires_at=expires_at,
++            ),
++            accounting_mode="shadow",
++            pricing_available=True,
++        )
++
++    @staticmethod
++    def _numeric_usage_with_private_fields() -> dict[str, Any]:
++        return {
++            **_COMPLETE_USAGE,
++            "response": {"reply": _PRIVATE_SENTINEL},
++            "private_result": _PRIVATE_SENTINEL,
++            "model": "untrusted-provider-model",
++        }
++
++    def test_canonical_numeric_promotion_survives_reclaim_without_ttl_result(self) -> None:
++        for name, repository, path in self._repositories():
++            with self.subTest(adapter=name):
++                request = self._shadow_request(f"dispatch-usage-promote-{name}")
++                repository.start_shadow(request)
++
++                promoted = repository.record_dispatch_usage(
++                    request.user_id,
++                    request.operation_id,
++                    "preload",
++                    self._numeric_usage_with_private_fields(),
++                )
++
++                self.assertEqual(promoted.state, "reserved")
++                self.assertEqual(promoted.dispatch_evidence_state, "completed")
++                self.assertEqual(promoted.dispatch_kind, "preload")
++                self.assertEqual(promoted.dispatch_usage_completeness, "measured")
++                self.assertEqual(promoted.dispatch_usage, _NUMERIC_USAGE)
++                self.assertIsNone(repository.get_result(request.user_id, request.operation_id))
++                self.assertNotIn(
++                    _PRIVATE_SENTINEL, json.dumps(asdict(promoted), sort_keys=True, default=str)
++                )
++                self.assertEqual(
++                    repository.record_dispatch_usage(
++                        request.user_id,
++                        request.operation_id,
++                        "preload",
++                        _NUMERIC_USAGE,
++                    ),
++                    promoted,
++                )
++                with self.assertRaises((UsageOperationConflict, UsageOperationStateError)):
++                    repository.record_dispatch_usage(
++                        request.user_id,
++                        request.operation_id,
++                        "chat",
++                        _NUMERIC_USAGE,
++                    )
++                with self.assertRaises((UsageOperationConflict, UsageOperationStateError)):
++                    repository.record_dispatch_usage(
++                        request.user_id,
++                        request.operation_id,
++                        "preload",
++                        {**_NUMERIC_USAGE, "actual_cost_micro_usd": 18},
++                    )
++                if path is not None:
++                    serialized = json.dumps(read_json_list(path), sort_keys=True)
++                    self.assertNotIn(_PRIVATE_SENTINEL, serialized)
++
++                reclaimed = repository.reclaim_expired(
++                    request.user_id,
++                    NOW + timedelta(seconds=1),
++                )
++                finalized = repository.get_operation(request.user_id, request.operation_id)
++                month = repository.get_month(request.user_id, request.month)
++                self.assertEqual(reclaimed, 1)
++                self.assertEqual(finalized.state, "finalized")
++                self.assertEqual(finalized.actual_cost_micro_usd, 17)
++                self.assertEqual(finalized.tokens, 17)
++                self.assertEqual(finalized.shadow_outcome, "failed_after_dispatch")
++                self.assertEqual(month["shadow_cost_micro_usd"], 17)
++                self.assertEqual(month["tokens"], 17)
++                self.assertEqual(month["articles"], 0)
++
++    def test_canonical_promotion_rejects_missing_prepared_and_settled_winners(self) -> None:
++        for name, repository, _path in self._repositories():
++            with self.subTest(adapter=name, state="missing"):
++                with self.assertRaises(UsageOperationNotFound):
++                    repository.record_dispatch_usage(
++                        _USER_ID,
++                        f"missing-dispatch-usage-{name}",
++                        "preload",
++                        _NUMERIC_USAGE,
++                    )
++
++            with self.subTest(adapter=name, state="prepared"):
++                prepared_request = self._shadow_request(
++                    f"dispatch-usage-prepared-{name}",
++                    expires_at=NOW + timedelta(days=1),
++                )
++                repository.start_shadow(prepared_request)
++                repository.record_dispatch_usage(
++                    prepared_request.user_id,
++                    prepared_request.operation_id,
++                    "preload",
++                    _NUMERIC_USAGE,
++                )
++                repository.prepare_shadow_settlement(
++                    prepared_request.user_id,
++                    prepared_request.operation_id,
++                    "failed_after_dispatch",
++                )
++                with self.assertRaises((UsageOperationConflict, UsageOperationStateError)):
++                    repository.record_dispatch_usage(
++                        prepared_request.user_id,
++                        prepared_request.operation_id,
++                        "preload",
++                        _NUMERIC_USAGE,
++                    )
++
++            with self.subTest(adapter=name, state="reclaimed"):
++                request = self._shadow_request(f"dispatch-usage-reclaim-{name}")
++                repository.start_shadow(request)
++                repository.save_result(
++                    request.user_id,
++                    request.operation_id,
++                    {
++                        "kind": "preload",
++                        "state": "dispatching",
++                        "usage": {"actual_cost_micro_usd": 13},
++                    },
++                )
++                self.assertEqual(
++                    repository.reclaim_expired(request.user_id, NOW + timedelta(seconds=1)),
++                    1,
++                )
++                winner = repository.get_operation(request.user_id, request.operation_id)
++                with self.assertRaises((UsageOperationConflict, UsageOperationStateError)):
++                    repository.record_dispatch_usage(
++                        request.user_id,
++                        request.operation_id,
++                        "preload",
++                        _NUMERIC_USAGE,
++                    )
++                current = repository.get_operation(request.user_id, request.operation_id)
++                self.assertEqual(current, winner)
++                self.assertEqual(current.actual_cost_micro_usd, 13)
++                self.assertEqual(current.tokens, 0)
++                self.assertEqual(current.shadow_outcome, "failed_after_dispatch")
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/backend/test_incurred_usage.py
++++ b/backend/test_incurred_usage.py
+@@ -0,0 +1,726 @@
++"""Workflow regressions for usage retained after an incurred provider call."""
++
++from __future__ import annotations
++
++import json
++import os
++import tempfile
++import types
++import unittest
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from typing import Any
++from unittest import mock
++
++import core.pipeline as pipeline
++from accounts.storage import JsonSubscriptionRepository
++from core.usage_costs import ModelRate
++from pydantic import ValidationError
++from repositories.page_preload_repository import JsonPagePreloadRepository
++from repositories.usage_repository import JsonUsageRepository
++from schemas import AnalyzeRequest, PagePreloadRequest
++from services import preloading, reading
++from services.usage_meter import UsageMeter
++from storage.json_list_store import read_json_list, write_json_list
++from storage.preload_content_store import FilesystemPreloadContentStore
++
++_USER_ID = "incurred-usage-user"
++_OPERATION_ID = "019b63f8-f600-7000-8000-000000000901"
++_PAGE_URL = "https://example.com/incurred-usage"
++_ARTICLE_SENTENCE = (
++    "The first complete sentence provides enough article content for the preload worker "
++    "to extract and analyze a realistic study unit."
++)
++_HTML = (
++    f"<article><p>{_ARTICLE_SENTENCE}</p>"
++    "<p>The second complete sentence keeps the fixture above the synchronous "
++    "extraction threshold without relying on a private provider response.</p></article>"
++)
++
++
++class _RecordingRunner:
++    def __init__(self) -> None:
++        self.calls: list[tuple] = []
++
++    def enqueue(
++        self,
++        user_id: str,
++        page_url: str,
++        preload_id: str,
++        learner_profile_fingerprint: str,
++        usage_context: dict | None = None,
++    ) -> None:
++        self.calls.append(
++            (user_id, page_url, preload_id, learner_profile_fingerprint, usage_context)
++        )
++
++
++class _SequencedClient:
++    def __init__(self, responses: list[object]) -> None:
++        self._responses = list(responses)
++        self.calls: list[dict] = []
++        self.chat = types.SimpleNamespace(
++            completions=types.SimpleNamespace(create=self.create),
++        )
++
++    def create(self, **kwargs):
++        self.calls.append(kwargs)
++        if not self._responses:
++            raise AssertionError("The provider stub received an unexpected extra call.")
++        response = self._responses.pop(0)
++        if isinstance(response, Exception):
++            raise response
++        return response
++
++
++class _FailFirstCompletedResultRepository(JsonUsageRepository):
++    """Simulate a completed private-result write failing before promotion."""
++
++    def __init__(self, path: Path) -> None:
++        super().__init__(path)
++        self.completed_write_failures = 0
++
++    def save_result(
++        self,
++        user_id: str,
++        operation_id: str,
++        result: dict[str, Any],
++    ) -> dict[str, Any]:
++        if self.completed_write_failures == 0 and result.get("state") == "completed":
++            self.completed_write_failures += 1
++            raise OSError("completed evidence write failed before promotion")
++        return super().save_result(user_id, operation_id, result)
++
++
++class _FailCompletedPromotionRepository(JsonUsageRepository):
++    """Keep completed evidence retryable while permitting the dispatch marker."""
++
++    def __init__(self, path: Path) -> None:
++        super().__init__(path)
++        self.reject_completed_promotions = True
++        self.completed_write_attempts = 0
++
++    def save_result(
++        self,
++        user_id: str,
++        operation_id: str,
++        result: dict[str, Any],
++    ) -> dict[str, Any]:
++        if self.reject_completed_promotions and result.get("state") == "completed":
++            self.completed_write_attempts += 1
++            raise OSError("completed evidence promotion remains unavailable")
++        return super().save_result(user_id, operation_id, result)
++
++
++def _response(payload: dict, *, input_tokens: int, output_tokens: int = 0) -> object:
++    return types.SimpleNamespace(
++        model=pipeline.OPENAI_MODEL,
++        usage=types.SimpleNamespace(
++            input_tokens=input_tokens,
++            output_tokens=output_tokens,
++            total_tokens=input_tokens + output_tokens,
++        ),
++        choices=[
++            types.SimpleNamespace(
++                message=types.SimpleNamespace(content=json.dumps(payload), tool_calls=None),
++            )
++        ],
++    )
++
++
++def _tool_response(name: str, arguments: dict, *, call_id: str) -> object:
++    return types.SimpleNamespace(
++        model=pipeline.OPENAI_MODEL,
++        usage=types.SimpleNamespace(input_tokens=0, output_tokens=0, total_tokens=0),
++        choices=[
++            types.SimpleNamespace(
++                message=types.SimpleNamespace(
++                    content=None,
++                    tool_calls=[
++                        types.SimpleNamespace(
++                            id=call_id,
++                            type="function",
++                            function=types.SimpleNamespace(
++                                name=name,
++                                arguments=json.dumps(arguments),
++                            ),
++                        )
++                    ],
++                )
++            )
++        ],
++    )
++
++
++class IncurredUsageWorkflowTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++        directory = Path(self._temporary_directory.name)
++        self.preloads = JsonPagePreloadRepository(directory / "preloads.json")
++        self.usage = JsonUsageRepository(directory / "usage.json")
++        self.subscriptions = JsonSubscriptionRepository(directory / "subscriptions.json")
++        self.content = FilesystemPreloadContentStore(directory / "content")
++        self.runner = _RecordingRunner()
++        self._usage_path = directory / "usage.json"
++        self._rate_environment = mock.patch.dict(
++            os.environ,
++            {
++                "OPENAI_MODEL": pipeline.OPENAI_MODEL,
++                "OPENAI_RATE_CARD_VERSION": "incurred-usage-test",
++                "OPENAI_MODEL_INPUT_MICRO_USD_PER_MILLION": "1000000",
++                "OPENAI_MODEL_OUTPUT_MICRO_USD_PER_MILLION": "1000000",
++            },
++        )
++        self._rate_environment.start()
++
++    def tearDown(self) -> None:
++        self._rate_environment.stop()
++        self._temporary_directory.cleanup()
++
++    def _meter(self, *, durable_shadow: bool) -> UsageMeter:
++        return UsageMeter(
++            self.subscriptions,
++            self.usage,
++            _USER_ID,
++            rate=ModelRate(
++                pipeline.OPENAI_MODEL,
++                1_000_000,
++                1_000_000,
++                "incurred-usage-test",
++            ),
++            reservation_enabled=not durable_shadow,
++            durable_shadow=durable_shadow,
++            provider_mode="mock",
++        )
++
++    def _fail_first_completed_write(self) -> _FailFirstCompletedResultRepository:
++        failing_repository = _FailFirstCompletedResultRepository(self._usage_path)
++        self.usage = failing_repository
++        return failing_repository
++
++    def _fail_completed_promotions(self) -> _FailCompletedPromotionRepository:
++        failing_repository = _FailCompletedPromotionRepository(self._usage_path)
++        self.usage = failing_repository
++        return failing_repository
++
++    @staticmethod
++    def _request(
++        operation_id: str = _OPERATION_ID,
++        *,
++        page_url: str = _PAGE_URL,
++    ) -> PagePreloadRequest:
++        return PagePreloadRequest(
++            operation_id=operation_id,
++            page_url=page_url,
++            page_title="Incurred usage article",
++            html=_HTML,
++        )
++
++    def _submit(
++        self,
++        meter: UsageMeter,
++        *,
++        operation_id: str = _OPERATION_ID,
++        page_url: str = _PAGE_URL,
++    ) -> None:
++        preloading.submit_preload(
++            self.preloads,
++            self.runner,
++            self.content,
++            _USER_ID,
++            self._request(operation_id, page_url=page_url),
++            usage_meter=meter,
++        )
++
++    def _run_worker(self, *, call_index: int = 0) -> None:
++        preloading.run_preload_job(
++            self.preloads,
++            self.subscriptions,
++            self.usage,
++            self.content,
++            *self.runner.calls[call_index],
++            billing_provider_mode="mock",
++        )
++
++    @staticmethod
++    def _fallback_client(*, analysis_input_tokens: int) -> _SequencedClient:
++        return _SequencedClient(
++            [
++                RuntimeError("timeout after dispatch"),
++                _tool_response("get_coarse_sentence_split", {}, call_id="coarse"),
++                _tool_response(
++                    "submit_sentence_split",
++                    {"sentences": [_ARTICLE_SENTENCE]},
++                    call_id="submit",
++                ),
++                _response(
++                    IncurredUsageWorkflowTests._analysis_payload(),
++                    input_tokens=analysis_input_tokens,
++                ),
++            ]
++        )
++
++    @staticmethod
++    def _analysis_payload() -> dict:
++        return {
++            "summary": "A durable summary.",
++            "topics": ["usage"],
++            "sentences": [
++                {
++                    "index": 0,
++                    "translation": "A translation.",
++                    "grammar": "A grammar note.",
++                    "nuance": "",
++                    "vocabulary": [],
++                    "examples": [],
++                    "study_tip": "",
++                }
++            ],
++        }
++
++    def _assert_single_settlement(
++        self,
++        *,
++        operation_id: str,
++        expected_cost: int,
++        expected_tokens: int,
++        expected_articles: int,
++    ) -> None:
++        operation = self.usage.get_operation(_USER_ID, operation_id)
++        self.assertIsNotNone(operation)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.actual_cost_micro_usd, expected_cost)
++        self.assertEqual(operation.tokens, expected_tokens)
++        if operation.accounting_mode == "shadow":
++            cost_field = "shadow_cost_micro_usd"
++            transition = "shadow_settle"
++        else:
++            cost_field = "committed_cost_micro_usd"
++            transition = "finalize"
++        self.assertEqual(month[cost_field], expected_cost)
++        self.assertEqual(month["tokens"], expected_tokens)
++        self.assertEqual(month["articles"], expected_articles)
++        events = [
++            item
++            for item in read_json_list(self._usage_path)
++            if item.get("record_type") == "usage_event"
++            and item.get("operation_id") == operation_id
++            and item.get("transition") == transition
++        ]
++        self.assertEqual(len(events), 1)
++        self.assertEqual(events[0]["actual_cost_micro_usd"], expected_cost)
++        self.assertEqual(events[0]["tokens"], expected_tokens)
++
++    def test_shadow_timeout_then_tool_fallback_retains_known_usage_once_after_ttl(
++        self,
++    ) -> None:
++        meter = self._meter(durable_shadow=True)
++        client = self._fallback_client(analysis_input_tokens=17)
++        with (
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13),
++            mock.patch.object(pipeline, "_client", return_value=client),
++        ):
++            self._submit(meter)
++            self._run_worker()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(operation.shadow_outcome, "success")
++        self.assertEqual(operation.dispatch_usage_completeness, "conservative")
++        self.assertEqual(operation.dispatch_usage["input_tokens"], 17)
++        self.assertEqual(operation.dispatch_usage["actual_cost_micro_usd"], 17)
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(record["status"], "ready")
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=1,
++        )
++        self.assertEqual(len(client.calls), 4)
++
++        records = read_json_list(self._usage_path)
++        for record in records:
++            if record.get("record_type") == "usage_result":
++                record["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
++        write_json_list(self._usage_path, records)
++        self.assertIsNone(self.usage.get_result(_USER_ID, _OPERATION_ID))
++        with mock.patch.object(
++            pipeline,
++            "_client",
++            side_effect=AssertionError("TTL replay must not redispatch a provider"),
++        ):
++            self._run_worker()
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=1,
++        )
++
++    def test_shadow_timeout_below_reservation_keeps_one_conservative_floor(self) -> None:
++        meter = self._meter(durable_shadow=True)
++        client = self._fallback_client(analysis_input_tokens=5)
++        with (
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13),
++            mock.patch.object(pipeline, "_client", return_value=client),
++        ):
++            self._submit(meter)
++            self._run_worker()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(operation.dispatch_usage_completeness, "conservative")
++        self.assertEqual(operation.dispatch_usage["input_tokens"], 5)
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=13,
++            expected_tokens=5,
++            expected_articles=1,
++        )
++        self.assertEqual(len(client.calls), 4)
++
++    def test_shadow_complete_measured_cost_below_reservation_remains_exact(self) -> None:
++        meter = self._meter(durable_shadow=True)
++        client = _SequencedClient(
++            [
++                _response({"sentences": [_ARTICLE_SENTENCE]}, input_tokens=5),
++                _response(self._analysis_payload(), input_tokens=0),
++            ]
++        )
++        with (
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13),
++            mock.patch.object(pipeline, "_client", return_value=client),
++        ):
++            self._submit(meter)
++            self._run_worker()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(operation.dispatch_usage_completeness, "measured")
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(record["status"], "ready")
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=5,
++            expected_tokens=5,
++            expected_articles=1,
++        )
++        self.assertEqual(len(client.calls), 2)
++
++    def test_shadow_canonical_numeric_promotion_survives_expiry_before_worker_retry(
++        self,
++    ) -> None:
++        failed_promotions = self._fail_completed_promotions()
++        meter = self._meter(durable_shadow=True)
++        client = _SequencedClient(
++            [
++                _response({"sentences": [_ARTICLE_SENTENCE]}, input_tokens=17),
++                _response(self._analysis_payload(), input_tokens=0),
++            ]
++        )
++        with (
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13),
++            mock.patch.object(pipeline, "_client", return_value=client),
++            mock.patch.object(
++                UsageMeter,
++                "prepare_shadow_settlement",
++                side_effect=OSError("delay shadow settlement after numeric promotion"),
++            ),
++        ):
++            self._submit(meter)
++            self._run_worker()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        pending = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertGreaterEqual(failed_promotions.completed_write_attempts, 2)
++        self.assertEqual(operation.state, "reserved")
++        self.assertIsNone(operation.shadow_pending_outcome)
++        self.assertEqual(operation.dispatch_evidence_state, "completed")
++        self.assertEqual(operation.dispatch_usage_completeness, "measured")
++        self.assertEqual(
++            operation.dispatch_usage,
++            {
++                "actual_cost_micro_usd": 17,
++                "input_tokens": 17,
++                "output_tokens": 0,
++                "total_tokens": 17,
++            },
++        )
++        self.assertEqual(operation.actual_cost_micro_usd, 0)
++        self.assertEqual(month["shadow_cost_micro_usd"], 0)
++        self.assertEqual(month["tokens"], 0)
++        self.assertEqual(month["articles"], 0)
++        self.assertEqual(pending["status"], "failed_pending_usage")
++        self.assertEqual(pending["shadow_pending_outcome"], "failed_after_dispatch")
++        self.assertNotIn("shadow_evidence_retry_usage", pending)
++        self.assertEqual(len(client.calls), 2)
++
++        self.assertEqual(
++            self.usage.reclaim_expired(
++                _USER_ID,
++                datetime.now(UTC) + timedelta(days=1),
++            ),
++            1,
++        )
++        reclaimed = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        still_pending = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(reclaimed.state, "finalized")
++        self.assertEqual(reclaimed.actual_cost_micro_usd, 17)
++        self.assertEqual(reclaimed.tokens, 17)
++        self.assertEqual(reclaimed.shadow_outcome, "failed_after_dispatch")
++        self.assertEqual(still_pending["status"], "failed_pending_usage")
++        with mock.patch.object(
++            pipeline,
++            "_client",
++            side_effect=AssertionError("reclaim recovery must not redispatch"),
++        ):
++            self._run_worker()
++
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(record["status"], "failed")
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=0,
++        )
++
++    def test_shadow_page_retry_context_defers_to_prepared_or_finalized_canonical_winner(
++        self,
++    ) -> None:
++        for index, winner_state in enumerate(("prepared", "finalized"), start=3):
++            with self.subTest(winner_state=winner_state):
++                operation_id = f"019b63f8-f600-7000-8000-0000000009{index:02d}"
++                meter = self._meter(durable_shadow=True)
++                self._submit(
++                    meter,
++                    operation_id=operation_id,
++                    page_url=f"{_PAGE_URL}/{winner_state}",
++                )
++                operation = meter.record_dispatch_usage(
++                    operation_id,
++                    "preload",
++                    {
++                        "actual_cost_micro_usd": 17,
++                        "input_tokens": 17,
++                        "output_tokens": 0,
++                        "total_tokens": 17,
++                        "usage_complete": True,
++                    },
++                )
++                prepared = meter.prepare_shadow_settlement(
++                    operation_id,
++                    outcome="failed_after_dispatch",
++                    result_ref=operation_id,
++                )
++                if winner_state == "finalized":
++                    operation = meter.settle_shadow(operation_id)
++                else:
++                    operation = prepared
++
++                pending = self.preloads.get_by_id(_USER_ID, operation_id)
++                pending.update(
++                    {
++                        "status": "failed_pending_usage",
++                        "shadow_pending_outcome": "failed_after_dispatch",
++                        "shadow_pending_result_ref": operation_id,
++                        "shadow_evidence_retry_usage": {
++                            "actual_cost_micro_usd": 17,
++                            "input_tokens": 17,
++                            "output_tokens": 0,
++                            "total_tokens": 17,
++                            "usage_complete": True,
++                        },
++                        "content_retirement_pending": True,
++                    }
++                )
++                self.preloads.save(_USER_ID, pending, make_latest=False)
++
++                with (
++                    mock.patch.object(
++                        UsageMeter,
++                        "record_dispatch_usage",
++                        side_effect=AssertionError("canonical winner must suppress late promotion"),
++                    ),
++                    mock.patch.object(
++                        UsageMeter,
++                        "save_result",
++                        side_effect=AssertionError(
++                            "canonical winner must not write a private result"
++                        ),
++                    ),
++                    mock.patch.object(
++                        pipeline,
++                        "_client",
++                        side_effect=AssertionError("canonical winner replay must not redispatch"),
++                    ),
++                ):
++                    self._run_worker(call_index=index - 3)
++
++                current = self.usage.get_operation(_USER_ID, operation_id)
++                record = self.preloads.get_by_id(_USER_ID, operation_id)
++                self.assertEqual(record["status"], "failed")
++                self.assertEqual(current.state, "finalized")
++                self.assertEqual(current.dispatch_usage, operation.dispatch_usage)
++                self.assertEqual(current.actual_cost_micro_usd, 17)
++                self.assertEqual(current.tokens, 17)
++                self.assertEqual(current.shadow_outcome, "failed_after_dispatch")
++                self._assert_single_settlement(
++                    operation_id=operation_id,
++                    expected_cost=17,
++                    expected_tokens=17,
++                    expected_articles=0,
++                )
++
++    def test_shadow_failed_preload_preserves_known_response_usage_without_article(self) -> None:
++        failed_write = self._fail_first_completed_write()
++        meter = self._meter(durable_shadow=True)
++        client = _SequencedClient([_response({"sentences": [_ARTICLE_SENTENCE]}, input_tokens=17)])
++        with (
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13),
++            mock.patch.object(pipeline, "_client", return_value=client),
++            mock.patch.object(
++                preloading,
++                "_analyze_sentences",
++                side_effect=RuntimeError("analysis construction failed"),
++            ),
++        ):
++            self._submit(meter)
++            self._run_worker()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(operation.shadow_outcome, "failed_after_dispatch")
++        self.assertEqual(failed_write.completed_write_failures, 1)
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=0,
++        )
++        with mock.patch.object(
++            pipeline,
++            "_client",
++            side_effect=AssertionError("replay must not redispatch after an incurred failure"),
++        ):
++            self._run_worker()
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=0,
++        )
++
++    def test_enforced_timeout_then_tool_fallback_retains_incurred_usage_once(self) -> None:
++        meter = self._meter(durable_shadow=False)
++        client = self._fallback_client(analysis_input_tokens=17)
++        with (
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13),
++            mock.patch.object(pipeline, "_client", return_value=client),
++        ):
++            self._submit(meter)
++            self._run_worker()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(record["status"], "ready")
++        self.assertEqual(operation.dispatch_usage_completeness, "conservative")
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=1,
++        )
++        self.assertEqual(len(client.calls), 4)
++
++    def test_enforced_failed_preload_keeps_known_response_usage_and_reserved_article(self) -> None:
++        failed_write = self._fail_first_completed_write()
++        meter = self._meter(durable_shadow=False)
++        client = _SequencedClient([_response({"sentences": [_ARTICLE_SENTENCE]}, input_tokens=17)])
++        with (
++            mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13),
++            mock.patch.object(pipeline, "_client", return_value=client),
++            mock.patch.object(
++                preloading,
++                "_analyze_sentences",
++                side_effect=RuntimeError("analysis construction failed"),
++            ),
++        ):
++            self._submit(meter)
++            self._run_worker()
++
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(record["status"], "failed")
++        self.assertEqual(failed_write.completed_write_failures, 1)
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=1,
++        )
++        with mock.patch.object(
++            pipeline,
++            "_client",
++            side_effect=AssertionError("replay must not redispatch after an incurred failure"),
++        ):
++            self._run_worker()
++        self._assert_single_settlement(
++            operation_id=_OPERATION_ID,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=1,
++        )
++
++    def test_enforced_response_build_failure_retains_known_provider_usage_before_result_write(
++        self,
++    ) -> None:
++        failed_write = self._fail_first_completed_write()
++        meter = self._meter(durable_shadow=False)
++        request = AnalyzeRequest(
++            operation_id="019b63f8-f600-7000-8000-000000000902",
++            text="A selection whose response model rejects the provider payload.",
++        )
++
++        def invalid_provider(*_args, **kwargs):
++            tally = kwargs["tally"]
++            tally.mark_dispatch_attempt()
++            tally.add_response(
++                types.SimpleNamespace(
++                    model=pipeline.OPENAI_MODEL,
++                    usage=types.SimpleNamespace(
++                        input_tokens=17,
++                        output_tokens=0,
++                        total_tokens=17,
++                    ),
++                )
++            )
++            return {"translation": ["not a string"]}
++
++        with (
++            mock.patch.object(reading, "estimate_openai_call_cost_micro_usd", return_value=13),
++            mock.patch.object(reading, "_call_openai_json", side_effect=invalid_provider),
++            self.assertRaises(ValidationError),
++        ):
++            reading.analyze_selection(self.preloads, _USER_ID, request, usage_meter=meter)
++
++        self.assertEqual(failed_write.completed_write_failures, 1)
++        self._assert_single_settlement(
++            operation_id=request.operation_id,
++            expected_cost=17,
++            expected_tokens=17,
++            expected_articles=0,
++        )
++        stored = self.usage.get_result(_USER_ID, request.operation_id)
++        if stored is not None:
++            self.assertNotIn("response", stored)
++            self.assertNotIn(request.text, json.dumps(stored, sort_keys=True))
++        with mock.patch.object(
++            reading,
++            "_call_openai_json",
++            side_effect=AssertionError("replay must not redispatch a provider"),
++        ):
++            with self.assertRaises(pipeline.PipelineError):
++                reading.analyze_selection(self.preloads, _USER_ID, request, usage_meter=meter)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/backend/test_pipeline_usage.py
++++ b/backend/test_pipeline_usage.py
+@@ -9,6 +9,7 @@
+ import core.pipeline as pipeline
+ from core.plans import get_plan_limits
+ from core.usage_costs import ModelRate, UnknownModelRateError
++from services.reading_support import _settlement_usage
+ 
+ 
+ class _WordEncoding:
+@@ -124,6 +125,75 @@
+         self.assertEqual(
+             (snapshot.input_tokens, snapshot.output_tokens, snapshot.total_tokens), (100, 200, 300)
+         )
++
++    def test_incurred_call_uncertainty_is_sticky_across_concurrent_responses(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        client = mock.Mock()
++        client.chat.completions.create.side_effect = TimeoutError("provider timeout")
++
++        with self.assertRaises(pipeline.PipelineError):
++            pipeline._create_chat_completion_at_dispatch_boundary(
++                client,
++                tally=tally,
++                model="priced-model",
++                messages=[],
++            )
++
++        usage = types.SimpleNamespace(input_tokens=1, output_tokens=2, total_tokens=3)
++        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++            list(pool.map(lambda _: tally.add_response(_response(usage=usage)), range(100)))
++
++        snapshot = tally.snapshot()
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertTrue(snapshot.incurred_call_uncertainty)
++        self.assertTrue(snapshot.missing_usage)
++        self.assertEqual(
++            (snapshot.input_tokens, snapshot.output_tokens, snapshot.total_tokens),
++            (100, 200, 300),
++        )
++        self.assertFalse(settlement["usage_complete"])
++        self.assertEqual(settlement["actual_cost_micro_usd"], 800)
++
++    def test_uncertain_settlement_keeps_the_reservation_floor_without_losing_tokens(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        tally.add_response(
++            _response(usage=types.SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1))
++        )
++        tally.mark_incurred_call_uncertainty()
++
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertFalse(settlement["usage_complete"])
++        self.assertEqual(
++            (
++                settlement["input_tokens"],
++                settlement["output_tokens"],
++                settlement["total_tokens"],
++                settlement["actual_cost_micro_usd"],
++            ),
++            (1, 0, 1, 13),
++        )
++
++    def test_complete_settlement_keeps_exact_cost_below_the_reservation_floor(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        tally.add_response(
++            _response(usage=types.SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1))
++        )
++
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertTrue(settlement["usage_complete"])
++        self.assertEqual(settlement["actual_cost_micro_usd"], 2)
+ 
+     def test_rejects_inconsistent_response_models(self):
+         tally = pipeline.UsageTally()
+@@ -348,6 +418,24 @@
+ 
+         dispatch_callback.assert_not_called()
+         self.assertFalse(tally.any_dispatch_attempted)
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
++
++    def test_dispatch_marker_failure_does_not_mark_incurred_call_uncertainty(self):
++        tally = pipeline.UsageTally(rate=ModelRate(pipeline.OPENAI_MODEL, 1, 1, "test"))
++        tally.set_dispatch_callback(mock.Mock(side_effect=RuntimeError("marker failed")))
++        client = mock.Mock()
++
++        with self.assertRaisesRegex(RuntimeError, "marker failed"):
++            pipeline._create_chat_completion_at_dispatch_boundary(
++                client,
++                tally=tally,
++                model=pipeline.OPENAI_MODEL,
++                messages=[],
++            )
++
++        client.chat.completions.create.assert_not_called()
++        self.assertFalse(tally.any_dispatch_attempted)
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
+ 
+     def test_split_agent_local_post_boundary_failure_is_classified_dispatched(self):
+         tally = pipeline.UsageTally()
+@@ -448,6 +536,7 @@
+ 
+     def test_preflight_rejects_before_provider_dispatch(self):
+         client = mock.Mock()
++        tally = pipeline.UsageTally()
+         with (
+             mock.patch.object(pipeline, "_client", return_value=client),
+             mock.patch.object(pipeline, "estimate_tokens", return_value=10),
+@@ -459,9 +548,14 @@
+             mock.patch.dict("os.environ", {"OPENAI_MAX_INPUT_TOKENS_PER_CALL": "12"}),
+         ):
+             with self.assertRaises(pipeline.PipelineError) as raised:
+-                pipeline._call_openai_json("large prompt", max_completion_tokens=3)
++                pipeline._call_openai_json(
++                    "large prompt",
++                    max_completion_tokens=3,
++                    tally=tally,
++                )
+         self.assertEqual(raised.exception.status_code, pipeline.INPUT_TOKEN_LIMIT_STATUS_CODE)
+         client.chat.completions.create.assert_not_called()
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
+ 
+     def test_batch_envelope_accepts_exact_limit(self):
+         with (
+--- a/backend/test_preload_jobs.py
++++ b/backend/test_preload_jobs.py
+@@ -3151,7 +3151,17 @@
+             context_text="Ambiguous network failure.",
+         )
+         client = mock.Mock()
+-        client.chat.completions.create.side_effect = RuntimeError("connection reset after dispatch")
++
++        def fail_after_dispatch(**_kwargs):
++            marker = self.usage.get_result("u1", request.operation_id)
++            self.assertEqual(marker["state"], "dispatching")
++            self.assertEqual(
++                self.usage.get_operation("u1", request.operation_id).dispatch_evidence_state,
++                "dispatched",
++            )
++            raise RuntimeError("connection reset after dispatch")
++
++        client.chat.completions.create.side_effect = fail_after_dispatch
+ 
+         with mock.patch.object(pipeline, "_client", return_value=client):
+             with self.assertRaises(pipeline.PipelineError):
+@@ -3160,7 +3170,8 @@
+                 reading.chat_reply(self.preloads, "u1", request, usage_meter=self.meter)
+ 
+         stored = self.usage.get_result("u1", request.operation_id)
+-        self.assertEqual(stored["state"], "dispatching")
++        self.assertEqual(stored["state"], "completed")
++        self.assertFalse(stored["usage"]["usage_complete"])
+         self.assertNotIn("response", stored)
+         self.assertEqual(
+             self.usage.get_operation("u1", request.operation_id).state,
+--- a/backend/test_synchronous_usage_retention.py
++++ b/backend/test_synchronous_usage_retention.py
+@@ -0,0 +1,91 @@
++"""Synchronous retries retain durable accounting evidence without redispatching."""
++
++from datetime import UTC, datetime
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++from accounts.storage import JsonSubscriptionRepository
++from core.pipeline import UsageTally
++from core.plans import PlanLimits
++from core.usage_costs import ModelRate
++from repositories.usage_repository import JsonUsageRepository
++from schemas import ChatResponse
++from services.synchronous_execution import SynchronousExecution
++from services.usage_meter import UsageMeter
++
++
++def _meter(tmp_path) -> UsageMeter:
++    return UsageMeter(
++        JsonSubscriptionRepository(tmp_path / "subscriptions.json"),
++        JsonUsageRepository(tmp_path / "usage.json"),
++        "019b63f8-f600-7000-8000-000000000111",
++        rate=ModelRate("test-model", 1_000_000, 1_000_000, "test-v1"),
++        now=datetime.now(UTC),
++        plan_loader=lambda _: PlanLimits(
++            "pro",
++            articles_per_month=10,
++            chats_per_month=10,
++            tokens_per_month=100_000,
++            sentences_per_article=50,
++            cost_micro_usd_per_month=100_000,
++            source_tokens_per_article=12_000,
++        ),
++    )
++
++
++def test_retry_preserves_full_result_after_finalization_failure_without_redispatch(tmp_path):
++    meter = _meter(tmp_path)
++    operation = meter.reserve(
++        "019b63f8-f600-7000-8000-000000000211",
++        "payload",
++        "chat",
++        13,
++    )
++    tally = UsageTally(rate=meter.rate)
++
++    def provider() -> str:
++        tally.mark_dispatch_attempt()
++        tally.add_response(
++            SimpleNamespace(
++                model="test-model",
++                usage=SimpleNamespace(input_tokens=17, output_tokens=0, total_tokens=17),
++            )
++        )
++        return "reply"
++
++    execution = SynchronousExecution(
++        meter,
++        operation,
++        kind="chat",
++        response_model=ChatResponse,
++    )
++    with patch.object(meter, "finalize", side_effect=RuntimeError("finalize unavailable")):
++        with execution, pytest.raises(RuntimeError, match="finalize unavailable"):
++            execution.run(tally, provider, lambda reply: ChatResponse(reply=reply))
++
++    stored = meter.get_result(operation.operation_id)
++    assert stored is not None
++    assert stored["response"] == {"reply": "reply"}
++    assert meter.get_operation(operation.operation_id).state == "reserved"
++
++    blocked_provider = Mock(side_effect=AssertionError("retry must not redispatch"))
++    with SynchronousExecution(
++        meter,
++        meter.get_operation(operation.operation_id),
++        kind="chat",
++        response_model=ChatResponse,
++    ) as retry:
++        assert retry.run(
++            UsageTally(rate=meter.rate), blocked_provider, ChatResponse
++        ) == ChatResponse(reply="reply")
++
++    blocked_provider.assert_not_called()
++    finalized = meter.get_operation(operation.operation_id)
++    month = meter.usage_repository.get_month(finalized.user_id, finalized.month)
++    assert (finalized.state, finalized.actual_cost_micro_usd, finalized.tokens) == (
++        "finalized",
++        17,
++        17,
++    )
++    assert (month["committed_cost_micro_usd"], month["tokens"]) == (17, 17)

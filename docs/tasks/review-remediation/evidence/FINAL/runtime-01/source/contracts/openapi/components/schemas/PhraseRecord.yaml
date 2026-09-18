@@ -1,0 +1,33 @@
+properties:
+  original_text:
+    type: string
+    maxLength: 3000
+    minLength: 1
+    title: Original Text
+  analysis:
+    $ref: ./AnalyzeResponse.yaml
+  page_url:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Url
+  page_title:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Title
+  id:
+    type: string
+    title: Id
+    description: Opaque compatibility identifier; examples use UUID v7.
+    x-id-compatibility: legacy-string-or-uuid
+  created_at:
+    type: string
+    title: Created At
+type: object
+required:
+- original_text
+- analysis
+- id
+- created_at
+title: PhraseRecord

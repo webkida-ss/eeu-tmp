@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "timestamp": "20260719T000000Z",
+  "baseUri": "https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/",
+  "suites": [
+    "noble",
+    "noble-updates",
+    "noble-security"
+  ],
+  "components": [
+    "main",
+    "restricted",
+    "universe",
+    "multiverse"
+  ],
+  "signedBy": "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+  "validUntilPolicy": "disabled-for-immutable-snapshot-only",
+  "tlsPeerVerification": true,
+  "tlsHostVerification": true,
+  "allowInsecureRepositories": false,
+  "allowUnauthenticatedPackages": false
+}

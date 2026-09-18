@@ -1,0 +1,36 @@
+# Historical design proposal; not a supported runtime contract.
+get:
+  operationId: getAdminUser
+  summary: Get a user with usage and recent events
+  security:
+    - bearerAuth: []
+  parameters:
+    - name: id
+      in: path
+      required: true
+      description: Opaque user identifier.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+      example: user-17
+  responses:
+    "200":
+      description: User details.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/AdminUserDetail
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "403":
+      $ref: ../admin-openapi.yaml#/components/responses/AdminForbidden
+    "404":
+      $ref: ../admin-openapi.yaml#/components/responses/UserNotFound
+    "422":
+      $ref: ../admin-openapi.yaml#/components/responses/ValidationError
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

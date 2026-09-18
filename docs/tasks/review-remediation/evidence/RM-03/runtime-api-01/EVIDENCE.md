@@ -1,0 +1,5 @@
+# Final test-only privacy coverage increment
+
+Parent adds separately gated panel API-readiness wait. Original wait function resumes after account B replaces A; mountCalls must stay0, no stale scoped record may remain, and sync result is false. Gate wait bounded5s and released in finally; injected functions restored in finally. No production changes since independently accepted runtime-01. Existing same-user late completion already passes background-api test START_PRELOAD rejects a completion after the same user receives a replacement login scope.
+
+An initial smoke rerun found a flaky exact-one polling assertion: background panel readiness can legitimately poll the same URL, giving2 requests while no private session exists and document changed. Poll gates now require at least one matching request after exactlyone POST; completion, document identity, absent private sessions and replaced-account checks stay unchanged. This suite is not a network-request-count contract. Parent currently runs canonical lint,format,smoke. Runtime-01 unit/package receipt remains applicable; this increment changes smoke only.

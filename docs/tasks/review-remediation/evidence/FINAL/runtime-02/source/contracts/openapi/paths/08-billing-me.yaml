@@ -1,0 +1,78 @@
+get:
+  summary: Get Billing Me
+  operationId: getBillingSummary
+  parameters:
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/BillingMeResponse.yaml
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                plan: basic
+                quota_plan: basic
+                month: 2026-07
+                articles_used: 0
+                articles_pending: 0
+                articles_limit: 10
+                articles_remaining: 10
+                chats_used: 0
+                chats_pending: 0
+                chats_limit: 50
+                chats_remaining: 50
+                reset_at: '2026-08-01T00:00:00+00:00'
+                sentences_per_article: 20
+                source_tokens_per_article: 12000
+                warning_codes: []
+                plan_ends_at: null
+    '403':
+      description: Account access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Account is suspended.
+            code: account_suspended
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '422':
+      description: Validation Error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/HTTPValidationError.yaml
+          example:
+            detail:
+            - type: value_error
+              loc:
+              - body
+              - field
+              msg: Request validation failed.
+              input: null
+  x-contract-test:
+    mode: generic
+    auth: localBearer
+    setup: billingRepositories
+    owner: billing
+  security:
+  - bearerAuth: []

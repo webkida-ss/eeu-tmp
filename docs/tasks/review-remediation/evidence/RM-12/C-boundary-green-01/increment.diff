@@ -1,0 +1,373 @@
+--- a/backend/core/pipeline.py
++++ b/backend/core/pipeline.py
+@@ -422,6 +422,7 @@
+     total_tokens: int
+     cost_micro_usd: int
+     missing_usage: bool
++    incurred_call_uncertainty: bool = False
+ 
+     @property
+     def actual_cost_micro_usd(self) -> int:
+@@ -447,6 +448,7 @@
+         self.output_tokens = 0
+         self.total_tokens = 0
+         self.missing_usage = False
++        self.incurred_call_uncertainty = False
+ 
+     def set_dispatch_callback(self, callback: Callable[[], None] | None) -> None:
+         self._dispatch_callback = callback
+@@ -457,6 +459,12 @@
+             callback()
+         with self._lock:
+             self._any_dispatch_attempted = True
++
++    def mark_incurred_call_uncertainty(self) -> None:
++        """Record an actual provider-call failure without discarding known usage."""
++        with self._lock:
++            self.incurred_call_uncertainty = True
++            self.missing_usage = True
+ 
+     @property
+     def any_dispatch_attempted(self) -> bool:
+@@ -531,6 +539,7 @@
+             output_tokens = self.output_tokens
+             total_tokens = self.total_tokens
+             missing_usage = self.missing_usage
++            incurred_call_uncertainty = self.incurred_call_uncertainty
+         rate = rate or load_model_rate(OPENAI_MODEL)
+         return UsageSnapshot(
+             model=rate.model,
+@@ -541,6 +550,7 @@
+             total_tokens=total_tokens,
+             cost_micro_usd=calculate_cost_micro_usd(input_tokens, output_tokens, rate),
+             missing_usage=missing_usage,
++            incurred_call_uncertainty=incurred_call_uncertainty,
+         )
+ 
+ 
+@@ -551,11 +561,14 @@
+     **request: Any,
+ ) -> Any:
+     with _openai_call_slots:
++        create = client.chat.completions.create
+         if tally:
+             tally.mark_dispatch_attempt()
+         try:
+-            return client.chat.completions.create(**request)
++            return create(**request)
+         except Exception as exc:
++            if tally:
++                tally.mark_incurred_call_uncertainty()
+             raise PipelineError(
+                 f"OpenAI API request failed: {exc}",
+                 status_code=502,
+--- a/backend/services/preloading.py
++++ b/backend/services/preloading.py
+@@ -1085,15 +1085,12 @@
+ def _durable_shadow_usage(tally: UsageTally, operation: Any) -> dict[str, Any]:
+     """Use exact measured cost, preserving a floor only for uncertain usage."""
+     usage = _settlement_usage(tally, operation)
+-    snapshot = tally.snapshot()
+-    if snapshot.missing_usage or operation.pricing_available is not True:
++    if not usage["usage_complete"] or operation.pricing_available is not True:
+         usage["actual_cost_micro_usd"] = max(
+             int(usage.get("actual_cost_micro_usd") or 0),
+-            int(snapshot.cost_micro_usd or 0),
++            int(usage.get("cost_micro_usd") or 0),
+             int(operation.reserved_cost_micro_usd),
+         )
+-    else:
+-        usage["actual_cost_micro_usd"] = int(snapshot.cost_micro_usd or 0)
+     return usage
+ 
+ 
+@@ -1533,9 +1530,7 @@
+                 vocabulary_coverage=vocabulary_coverage,
+             )
+             repository.validate_publication(user_id, _shadow_ready_record(record, payload))
+-            snapshot = tally.snapshot()
+             usage = _durable_shadow_usage(tally, operation)
+-            usage["usage_complete"] = bool(not snapshot.missing_usage and snapshot.total_tokens > 0)
+             meter.save_result(
+                 operation_id,
+                 {
+@@ -1559,7 +1554,6 @@
+         if provider_error is not None and _dispatch_was_attempted(tally, provider_error):
+             try:
+                 partial_usage = _durable_shadow_usage(tally, operation)
+-                partial_usage["usage_complete"] = False
+                 meter.save_result(
+                     operation_id,
+                     {
+@@ -2314,6 +2308,7 @@
+     )
+     started = time.perf_counter()
+     provider_error = None
++    durable_usage: dict[str, Any] | None = None
+     heartbeat.start()
+     try:
+         sentences = _split_sentences(
+@@ -2341,21 +2336,7 @@
+     finally:
+         try:
+             if meter and (provider_error is None or _dispatch_was_attempted(tally, provider_error)):
+-                durable_usage = (
+-                    _settlement_usage(tally, operation)
+-                    if provider_error is None
+-                    else {"actual_cost_micro_usd": (operation.reserved_cost_micro_usd)}
+-                )
+-                if provider_error is None:
+-                    snapshot = tally.snapshot()
+-                    durable_usage["usage_complete"] = bool(
+-                        not snapshot.missing_usage and snapshot.total_tokens > 0
+-                    )
+-                else:
+-                    # A dispatch-attempted provider error has no complete
+-                    # provider tally, even when its empty snapshot reports no
+-                    # missing fields. Preserve the reservation floor instead.
+-                    durable_usage["usage_complete"] = False
++                durable_usage = _settlement_usage(tally, operation)
+                 meter.save_result(
+                     operation_id,
+                     {
+@@ -2395,9 +2376,7 @@
+                     failed["failure_settlement"] = "finalize_evidence"
+                 else:
+                     failed["failure_settlement"] = "finalize_conservative"
+-                    failed["failure_usage"] = {
+-                        "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-                    }
++                    failed["failure_usage"] = durable_usage or _settlement_usage(tally, operation)
+             else:
+                 failed["failure_settlement"] = "release"
+                 failed["failure_reason"] = "analysis_failed_before_dispatch"
+@@ -2521,9 +2500,7 @@
+                 failed["failure_settlement"] = "finalize_evidence"
+             else:
+                 failed["failure_settlement"] = "finalize_conservative"
+-                failed["failure_usage"] = {
+-                    "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-                }
++                failed["failure_usage"] = ready["usage_tally"]
+             failed["usage_state"] = "reserved"
+         published = repository.finish_processing(
+             user_id,
+--- a/backend/services/reading_support.py
++++ b/backend/services/reading_support.py
+@@ -47,9 +47,22 @@
+ 
+ 
+ def _settlement_usage(tally: UsageTally, operation: Any) -> dict[str, Any]:
++    """Build one durable usage snapshot without replacing known partial usage.
++
++    Complete provider usage settles at its measured cost. Any missing or
++    incurred-call uncertainty retains every known counter and applies only the
++    reservation floor, rather than adding that floor on top of known cost.
++    """
+     snapshot = asdict(tally.snapshot())
+-    if snapshot.get("missing_usage") or snapshot.get("total_tokens") == 0:
+-        snapshot["actual_cost_micro_usd"] = operation.reserved_cost_micro_usd
++    complete = not snapshot["missing_usage"] and snapshot["total_tokens"] > 0
++    snapshot["usage_complete"] = complete
++    if complete:
++        snapshot["actual_cost_micro_usd"] = int(snapshot["cost_micro_usd"])
++    else:
++        snapshot["actual_cost_micro_usd"] = max(
++            int(snapshot["cost_micro_usd"]),
++            int(operation.reserved_cost_micro_usd),
++        )
+     return snapshot
+ 
+ 
+--- a/backend/services/synchronous_execution.py
++++ b/backend/services/synchronous_execution.py
+@@ -229,9 +229,26 @@
+     operation: Any,
+     error: Exception,
+     *,
++    tally: UsageTally,
++    kind: str,
+     dispatch_attempted: bool,
+ ) -> None:
+     if dispatch_attempted:
++        usage = _settlement_usage(tally, operation)
++        try:
++            meter.save_result(
++                operation.operation_id,
++                {
++                    "kind": kind,
++                    "state": "completed",
++                    "usage": usage,
++                },
++            )
++        except Exception:  # noqa: BLE001 - preserve the prior durable marker for settlement
++            logger.warning(
++                "synchronous partial evidence could not be saved operation_id=%s",
++                operation.operation_id,
++            )
+         latest = meter.get_operation(operation.operation_id)
+         if latest and latest.dispatch_evidence_state in ("dispatched", "completed"):
+             meter.finalize(
+@@ -385,16 +402,14 @@
+                 self.meter,
+                 self.operation,
+                 provider_error,
++                tally=tally,
++                kind=self.kind,
+                 dispatch_attempted=_dispatch_was_attempted(tally, provider_error),
+             )
+             raise provider_error
+         try:
+             response = build_response(provider_result)
+             self.usage = _settlement_usage(tally, self.operation)
+-            snapshot = tally.snapshot()
+-            self.usage["usage_complete"] = bool(
+-                not snapshot.missing_usage and snapshot.total_tokens > 0
+-            )
+             self.meter.save_result(
+                 self.operation.operation_id,
+                 {
+@@ -422,6 +437,8 @@
+                 self.meter,
+                 self.operation,
+                 error,
++                tally=tally,
++                kind=self.kind,
+                 dispatch_attempted=True,
+             )
+             raise
+--- a/backend/test_pipeline_usage.py
++++ b/backend/test_pipeline_usage.py
+@@ -9,6 +9,7 @@
+ import core.pipeline as pipeline
+ from core.plans import get_plan_limits
+ from core.usage_costs import ModelRate, UnknownModelRateError
++from services.reading_support import _settlement_usage
+ 
+ 
+ class _WordEncoding:
+@@ -124,6 +125,75 @@
+         self.assertEqual(
+             (snapshot.input_tokens, snapshot.output_tokens, snapshot.total_tokens), (100, 200, 300)
+         )
++
++    def test_incurred_call_uncertainty_is_sticky_across_concurrent_responses(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        client = mock.Mock()
++        client.chat.completions.create.side_effect = TimeoutError("provider timeout")
++
++        with self.assertRaises(pipeline.PipelineError):
++            pipeline._create_chat_completion_at_dispatch_boundary(
++                client,
++                tally=tally,
++                model="priced-model",
++                messages=[],
++            )
++
++        usage = types.SimpleNamespace(input_tokens=1, output_tokens=2, total_tokens=3)
++        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++            list(pool.map(lambda _: tally.add_response(_response(usage=usage)), range(100)))
++
++        snapshot = tally.snapshot()
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertTrue(snapshot.incurred_call_uncertainty)
++        self.assertTrue(snapshot.missing_usage)
++        self.assertEqual(
++            (snapshot.input_tokens, snapshot.output_tokens, snapshot.total_tokens),
++            (100, 200, 300),
++        )
++        self.assertFalse(settlement["usage_complete"])
++        self.assertEqual(settlement["actual_cost_micro_usd"], 800)
++
++    def test_uncertain_settlement_keeps_the_reservation_floor_without_losing_tokens(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        tally.add_response(
++            _response(usage=types.SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1))
++        )
++        tally.mark_incurred_call_uncertainty()
++
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertFalse(settlement["usage_complete"])
++        self.assertEqual(
++            (
++                settlement["input_tokens"],
++                settlement["output_tokens"],
++                settlement["total_tokens"],
++                settlement["actual_cost_micro_usd"],
++            ),
++            (1, 0, 1, 13),
++        )
++
++    def test_complete_settlement_keeps_exact_cost_below_the_reservation_floor(self):
++        tally = pipeline.UsageTally(rate=self.rate)
++        tally.add_response(
++            _response(usage=types.SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1))
++        )
++
++        settlement = _settlement_usage(
++            tally,
++            types.SimpleNamespace(reserved_cost_micro_usd=13),
++        )
++
++        self.assertTrue(settlement["usage_complete"])
++        self.assertEqual(settlement["actual_cost_micro_usd"], 2)
+ 
+     def test_rejects_inconsistent_response_models(self):
+         tally = pipeline.UsageTally()
+@@ -348,6 +418,24 @@
+ 
+         dispatch_callback.assert_not_called()
+         self.assertFalse(tally.any_dispatch_attempted)
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
++
++    def test_dispatch_marker_failure_does_not_mark_incurred_call_uncertainty(self):
++        tally = pipeline.UsageTally(rate=ModelRate(pipeline.OPENAI_MODEL, 1, 1, "test"))
++        tally.set_dispatch_callback(mock.Mock(side_effect=RuntimeError("marker failed")))
++        client = mock.Mock()
++
++        with self.assertRaisesRegex(RuntimeError, "marker failed"):
++            pipeline._create_chat_completion_at_dispatch_boundary(
++                client,
++                tally=tally,
++                model=pipeline.OPENAI_MODEL,
++                messages=[],
++            )
++
++        client.chat.completions.create.assert_not_called()
++        self.assertFalse(tally.any_dispatch_attempted)
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
+ 
+     def test_split_agent_local_post_boundary_failure_is_classified_dispatched(self):
+         tally = pipeline.UsageTally()
+@@ -448,6 +536,7 @@
+ 
+     def test_preflight_rejects_before_provider_dispatch(self):
+         client = mock.Mock()
++        tally = pipeline.UsageTally()
+         with (
+             mock.patch.object(pipeline, "_client", return_value=client),
+             mock.patch.object(pipeline, "estimate_tokens", return_value=10),
+@@ -459,9 +548,14 @@
+             mock.patch.dict("os.environ", {"OPENAI_MAX_INPUT_TOKENS_PER_CALL": "12"}),
+         ):
+             with self.assertRaises(pipeline.PipelineError) as raised:
+-                pipeline._call_openai_json("large prompt", max_completion_tokens=3)
++                pipeline._call_openai_json(
++                    "large prompt",
++                    max_completion_tokens=3,
++                    tally=tally,
++                )
+         self.assertEqual(raised.exception.status_code, pipeline.INPUT_TOKEN_LIMIT_STATUS_CODE)
+         client.chat.completions.create.assert_not_called()
++        self.assertFalse(tally.snapshot().incurred_call_uncertainty)
+ 
+     def test_batch_envelope_accepts_exact_limit(self):
+         with (

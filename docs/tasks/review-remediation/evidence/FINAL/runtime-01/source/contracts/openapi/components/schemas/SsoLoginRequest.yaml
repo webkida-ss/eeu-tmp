@@ -1,0 +1,10 @@
+properties:
+  credential:
+    type: string
+    maxLength: 4096
+    minLength: 1
+    title: Credential
+type: object
+required:
+- credential
+title: SsoLoginRequest

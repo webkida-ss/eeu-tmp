@@ -1,0 +1,336 @@
+diff --git a/extension/background.js b/extension/background.js
+index b278b95..428bc02 100644
+--- a/extension/background.js
++++ b/extension/background.js
+@@ -418,7 +418,7 @@ async function openOrPreloadInPageImpl(tab) {
+   const recordStatus = status?.status ?? status?.preload?.status ?? null;
+   if (recordStatus === 'processing') {
+     // Join the server job already running — do not POST/cancel again.
+-    await updatePreloadJob(pageUrl, {
++    await globalThis.updatePreloadJob(pageUrl, {
+       state: 'loading',
+       message: t('preloadSplitting'),
+     });
+@@ -426,7 +426,7 @@ async function openOrPreloadInPageImpl(tab) {
+     try {
+       const preload = await pollPreloadUntilReady(pageUrl);
+       const sentenceCount = preload?.sentences?.length || 0;
+-      await updatePreloadJob(pageUrl, {
++      await globalThis.updatePreloadJob(pageUrl, {
+         state: 'ready',
+         message: t('preloadDonePanel', { count: sentenceCount }),
+         sentenceCount,
+@@ -776,7 +776,7 @@ async function runStartPreload(preloadSession) {
+     }
+ 
+     pageUrl = normalizePageUrl(extracted.payload.page_url);
+-    await updatePreloadJob(pageUrl, {
++    await globalThis.updatePreloadJob(pageUrl, {
+       state: 'loading',
+       message: t('preloadSplitting'),
+     });
+@@ -811,7 +811,7 @@ async function runStartPreload(preloadSession) {
+     }
+ 
+     const sentenceCount = preload?.sentences?.length || 0;
+-    await updatePreloadJob(pageUrl, {
++    await globalThis.updatePreloadJob(pageUrl, {
+       state: 'ready',
+       message: t('preloadDonePanel', { count: sentenceCount }),
+       sentenceCount,
+@@ -831,7 +831,7 @@ async function runStartPreload(preloadSession) {
+     await clearPreloadBadge();
+     if (pageUrl) {
+       const cancelled = preloadSession.aborted || isPreloadCancelledError(error);
+-      await updatePreloadJob(pageUrl, {
++      await globalThis.updatePreloadJob(pageUrl, {
+         state: cancelled ? 'idle' : 'error',
+         message: cancelled
+           ? t('preloadAborted')
+diff --git a/extension/content.js b/extension/content.js
+index 4eace83..dfd74d4 100644
+--- a/extension/content.js
++++ b/extension/content.js
+@@ -282,16 +282,6 @@ if (window.top !== window.self) {
+   });
+ } // end __ERA_READING_ASSISTANT_RUNTIME__ init guard
+ 
+-async function updatePreloadJob(pageUrl, patch) {
+-  await chrome.storage.local.set({
+-    preloadJob: {
+-      pageUrl: normalizePageUrl(pageUrl),
+-      updatedAt: Date.now(),
+-      ...patch,
+-    },
+-  });
+-}
+-
+ function setPreloadBadge(text) {
+   chrome.runtime.sendMessage({ type: 'SET_PRELOAD_BADGE', payload: { text } }).catch(() => {});
+ }
+@@ -311,7 +301,7 @@ async function runPagePreload() {
+   const pageUrl = getPageUrl();
+ 
+   try {
+-    await updatePreloadJob(pageUrl, {
++    await globalThis.updatePreloadJob(pageUrl, {
+       state: 'loading',
+       message: t('preloadSplitting'),
+     });
+@@ -353,7 +343,7 @@ async function runPagePreload() {
+     const preload = response.preload;
+     const sentenceCount = preload?.sentences?.length || 0;
+ 
+-    await updatePreloadJob(pageUrl, {
++    await globalThis.updatePreloadJob(pageUrl, {
+       state: 'ready',
+       message: t('preloadDonePanel', { count: sentenceCount }),
+       sentenceCount,
+@@ -364,14 +354,14 @@ async function runPagePreload() {
+   } catch (error) {
+     setPreloadBadge('');
+     if (error.name === 'AbortError' || generation !== pagePreloadGeneration) {
+-      await updatePreloadJob(pageUrl, {
++      await globalThis.updatePreloadJob(pageUrl, {
+         state: 'idle',
+         message: t('preloadAborted'),
+       });
+       throw new Error(t('preloadCancelled'), { cause: error });
+     }
+ 
+-    await updatePreloadJob(pageUrl, {
++    await globalThis.updatePreloadJob(pageUrl, {
+       state: 'error',
+       message: toUserFacingErrorMessage(error, t('preloadFailed')),
+     });
+diff --git a/extension/eslint.config.js b/extension/eslint.config.js
+index b18ed9e..f9f6c12 100644
+--- a/extension/eslint.config.js
++++ b/extension/eslint.config.js
+@@ -122,7 +122,6 @@ const classicScriptGlobals = Object.fromEntries(
+     'toggleHiddenQuickAction',
+     'toAnalysisResponse',
+     'updateCustomChatPrompt',
+-    'updatePreloadJob',
+     'loadCustomChatPromptsCache',
+     'loadHiddenQuickActionsCache',
+     'moveCustomChatPrompt',
+diff --git a/extension/shared.js b/extension/shared.js
+index 6d45770..de8e2b0 100644
+--- a/extension/shared.js
++++ b/extension/shared.js
+@@ -26,6 +26,18 @@ function withOperationId(payload, operationId = null) {
+   return { ...payload, operation_id: operationId || generateUuidV7() };
+ }
+ 
++// The content script and service worker publish the same preload progress
++// record, so this helper must remain available in both extension contexts.
++globalThis.updatePreloadJob = async function updatePreloadJob(pageUrl, patch) {
++  await chrome.storage.local.set({
++    preloadJob: {
++      pageUrl: normalizePageUrl(pageUrl),
++      updatedAt: Date.now(),
++      ...patch,
++    },
++  });
++};
++
+ async function releaseRetryResponseBody(response) {
+   const body = response?.body;
+   if (!body) return;
+diff --git a/extension/test/background-api.test.mjs b/extension/test/background-api.test.mjs
+index 0983906..719290f 100644
+--- a/extension/test/background-api.test.mjs
++++ b/extension/test/background-api.test.mjs
+@@ -18,10 +18,17 @@ function event() {
+   };
+ }
+ 
+-function createWorker() {
+-  const state = Object.create(null);
++function createWorker({
++  initialStorage = {},
++  responseBodies: responseBodyOverrides = {},
++  statuses: statusOverrides = {},
++  tab = null,
++  extraction = null,
++} = {}) {
++  const state = Object.assign(Object.create(null), initialStorage);
+   const calls = [];
+   const consoleErrors = [];
++  const tabMessages = [];
+   const runtimeMessages = event();
+   const storageChanged = event();
+ 
+@@ -40,8 +47,9 @@ function createWorker() {
+     'POST /billing/portal': { url: 'https://billing.example/portal' },
+     'GET /vocabulary': { items: [] },
+     'POST /auth/logout': {},
++    ...responseBodyOverrides,
+   };
+-  const statuses = { 'POST /pages/preload': 202 };
++  const statuses = { 'POST /pages/preload': 202, ...statusOverrides };
+ 
+   const sandbox = {
+     ArrayBuffer,
+@@ -115,10 +123,14 @@ function createWorker() {
+         async query() {
+           return [];
+         },
+-        async get() {
++        async get(tabId) {
++          if (tab?.id === tabId) return tab;
+           throw new Error('tab unavailable');
+         },
+-        async sendMessage() {
++        async sendMessage(tabId, message) {
++          tabMessages.push({ tabId, message });
++          if (message.type === 'PING') return { ok: true };
++          if (message.type === 'EXTRACT_PAGE_HTML') return extraction || { ok: false };
+           return { ok: true };
+         },
+       },
+@@ -137,7 +149,7 @@ function createWorker() {
+   vm.runInContext(readFileSync(backgroundPath, 'utf8'), sandbox, {
+     filename: backgroundPath,
+   });
+-  return { calls, consoleErrors, runtimeMessages, sandbox, state };
++  return { calls, consoleErrors, runtimeMessages, sandbox, state, tabMessages };
+ }
+ 
+ async function sendWorkerMessage(worker, type, payload = undefined) {
+@@ -364,3 +376,82 @@ test('non-API message failures retain their existing localized behavior', async
+   assert.equal(result.ok, false);
+   assert.equal(result.error, vm.runInContext(`t("errNeedWebPage")`, worker.sandbox));
+ });
++
++test('START_PRELOAD worker handler extracts, submits, and publishes a preload', async () => {
++  const pageUrl = 'https://article.example/reading';
++  const worker = createWorker({
++    initialStorage: {
++      apiBaseUrl: 'https://api.example.test',
++      authSession: { accessToken: 'worker-access-token' },
++    },
++    tab: { id: 23, url: pageUrl },
++    extraction: {
++      ok: true,
++      payload: {
++        page_url: pageUrl,
++        page_title: 'Article title',
++        html: '<main>Article text.</main>',
++        detected_language: 'en',
++      },
++    },
++  });
++
++  const response = await sendWorkerMessage(worker, 'START_PRELOAD', { tabId: 23 });
++
++  assert.equal(response.ok, true);
++  assert.equal(response.preload.id, 'preload-id');
++  assert.equal(worker.state.preloadJob.state, 'ready');
++  assert.equal(worker.state.preloadJob.pageUrl, pageUrl);
++  assert.equal(worker.state.preloadJob.sentenceCount, 0);
++  assert.deepEqual(
++    worker.tabMessages.map(({ message }) => message.type),
++    ['PING', 'EXTRACT_PAGE_HTML', 'SHOW_SENTENCE_PANEL'],
++  );
++
++  const submission = worker.calls.find(
++    ({ method, url }) => method === 'POST' && new URL(url).pathname === '/pages/preload',
++  );
++  assert.ok(submission);
++  assert.equal(submission.options.headers.Authorization, 'Bearer worker-access-token');
++  assert.equal(JSON.parse(submission.options.body).page_url, pageUrl);
++});
++
++test('START_PRELOAD worker handler records submission failures without a missing binding', async () => {
++  const pageUrl = 'https://article.example/submission-failure';
++  const worker = createWorker({
++    initialStorage: {
++      apiBaseUrl: 'https://api.example.test',
++      authSession: { accessToken: 'worker-access-token' },
++    },
++    responseBodies: {
++      'POST /pages/preload': { detail: 'submission failed' },
++    },
++    statuses: { 'POST /pages/preload': 422 },
++    tab: { id: 29, url: pageUrl },
++    extraction: {
++      ok: true,
++      payload: {
++        page_url: pageUrl,
++        page_title: 'Article title',
++        html: '<main>Article text.</main>',
++        detected_language: 'en',
++      },
++    },
++  });
++
++  const response = await sendWorkerMessage(worker, 'START_PRELOAD', { tabId: 29 });
++
++  assert.equal(response.ok, false);
++  assert.equal(response.error, vm.runInContext(`t("apiFailure")`, worker.sandbox));
++  assert.equal(worker.state.preloadJob.state, 'error');
++  assert.equal(worker.state.preloadJob.pageUrl, pageUrl);
++  assert.equal(
++    worker.tabMessages.some(({ message }) => message.type === 'SHOW_SENTENCE_PANEL'),
++    false,
++  );
++  assert.ok(
++    worker.calls.some(
++      ({ method, url }) => method === 'POST' && new URL(url).pathname === '/pages/preload',
++    ),
++  );
++});
+diff --git a/extension/test/shared.test.mjs b/extension/test/shared.test.mjs
+index 69d785d..f5c77c3 100644
+--- a/extension/test/shared.test.mjs
++++ b/extension/test/shared.test.mjs
+@@ -78,6 +78,31 @@ test('operation helper generates UUID v7 and preserves retry identity', () => {
+   assert.equal(retry.text, 'hello');
+ });
+ 
++test('preload job updates use shared extension storage and normalize the page URL', async () => {
++  const shared = loadScripts('settings.js', 'i18n.js', 'shared.js');
++  const writes = [];
++  shared.chrome = {
++    storage: {
++      local: {
++        async set(value) {
++          writes.push(value);
++        },
++      },
++    },
++  };
++
++  await shared.updatePreloadJob('https://article.example/reading/#section', {
++    state: 'loading',
++    message: 'Preparing article',
++  });
++
++  assert.equal(writes.length, 1);
++  assert.equal(writes[0].preloadJob.pageUrl, 'https://article.example/reading');
++  assert.equal(writes[0].preloadJob.state, 'loading');
++  assert.equal(writes[0].preloadJob.message, 'Preparing article');
++  assert.equal(typeof writes[0].preloadJob.updatedAt, 'number');
++});
++
+ test('logical request retries reuse one operation identity', async () => {
+   const attempts = [];
+   const result = await S.runIdempotentRequest({ text: 'hello' }, async (payload) => {
+diff --git a/extension/test/test_build_release.py b/extension/test/test_build_release.py
+index 4a08083..8fad829 100644
+--- a/extension/test/test_build_release.py
++++ b/extension/test/test_build_release.py
+@@ -67,7 +67,10 @@ class ReleaseBuildTests(unittest.TestCase):
+                 imports = re.search(r"importScripts\((.*?)\)", worker, re.DOTALL)
+                 self.assertIsNotNone(imports)
+                 assert imports is not None
+-                for reference in re.findall(r"['\"]([^'\"]+)['\"]", imports.group(1)):
++                worker_imports = re.findall(r"['\"]([^'\"]+)['\"]", imports.group(1))
++                self.assertIn("shared.js", worker_imports)
++                self.assertIn("async function updatePreloadJob", archive.read("shared.js").decode())
++                for reference in worker_imports:
+                     self.assertIn(reference, entries)
+                 html = archive.read("sidepanel.html").decode()
+                 for reference in re.findall(r'<script\s+src="([^"]+)"', html):

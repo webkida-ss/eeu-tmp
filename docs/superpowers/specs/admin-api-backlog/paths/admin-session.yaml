@@ -1,0 +1,22 @@
+# Historical design proposal; not a supported runtime contract.
+get:
+  operationId: getAdminSession
+  summary: Get the current authorized administrator
+  security:
+    - bearerAuth: []
+  responses:
+    "200":
+      description: Authorized administrator session.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/AdminSession
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "403":
+      $ref: ../admin-openapi.yaml#/components/responses/AdminForbidden
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

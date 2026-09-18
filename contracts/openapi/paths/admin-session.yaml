@@ -1,0 +1,64 @@
+get:
+  operationId: getAdminSession
+  summary: Get the current authorized administrator
+  description: Available only when ADMIN_ENABLED is true; otherwise this route is absent (404).
+  tags: [admin]
+  x-runtime-feature: admin
+  x-contract-test:
+    mode: manual
+    owner: admin
+    auth: localBearer
+    setup: authenticatedUser
+    reason: Administrator allowlist and disabled-mode availability require isolated configuration.
+    test: backend/test_admin_auth.py::test_admin_session_canonical_contract
+  security:
+    - bearerAuth: []
+  parameters:
+    - name: authorization
+      in: header
+      required: false
+      schema:
+        anyOf:
+          - type: string
+          - type: 'null'
+  responses:
+    '200':
+      description: Authorized administrator session.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/AdminSession.yaml
+          example:
+            user_id: user-admin-1
+            email: admin@example.com
+            display_name: Local Admin
+    '401':
+      description: Authentication is required.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/CorrelationError.yaml
+          example:
+            code: unauthenticated
+            message: Authentication is required.
+            correlation_id: admin-session-401
+    '403':
+      description: Administrator access is required.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/CorrelationError.yaml
+          example:
+            code: admin_forbidden
+            message: Administrator access is required.
+            correlation_id: admin-session-403
+    '422':
+      description: Request validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/CorrelationError.yaml
+          example:
+            code: validation_error
+            message: The request is invalid.
+            correlation_id: admin-session-422

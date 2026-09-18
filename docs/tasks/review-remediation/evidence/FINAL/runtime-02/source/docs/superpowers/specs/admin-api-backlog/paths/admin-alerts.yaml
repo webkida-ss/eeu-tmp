@@ -1,0 +1,71 @@
+# Historical design proposal; not a supported runtime contract.
+get:
+  operationId: listAdminAlerts
+  summary: Compute and page operational alerts
+  description: Defaults to the rolling 30-day UTC period. Custom ranges are inclusive of start, exclusive of end, and limited to 90 days.
+  security:
+    - bearerAuth: []
+  parameters:
+    - name: start
+      in: query
+      description: Inclusive UTC reporting boundary. Supply with end.
+      schema:
+        type: string
+        format: date-time
+      example: "2026-06-20T00:00:00Z"
+    - name: end
+      in: query
+      description: Exclusive UTC reporting boundary. Supply with start.
+      schema:
+        type: string
+        format: date-time
+      example: "2026-07-20T00:00:00Z"
+    - name: alert_type
+      in: query
+      schema:
+        type: string
+        enum: [quota_pressure, quota_blocked, failure_spike, elevated_failure_rate]
+    - name: operation
+      in: query
+      schema:
+        type: string
+        enum: [article, chat]
+    - name: user_id
+      in: query
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+      example: user-17
+    - name: cursor
+      in: query
+      description: Opaque cursor returned by the previous page.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+    - name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+  responses:
+    "200":
+      description: A cursor page from the computed alert snapshot.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/AlertPage
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "403":
+      $ref: ../admin-openapi.yaml#/components/responses/AdminForbidden
+    "422":
+      $ref: ../admin-openapi.yaml#/components/responses/ValidationError
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

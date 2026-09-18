@@ -1,0 +1,70 @@
+name: Agent task request
+description: Propose a bounded repository task for independent review and intake
+title: "[agent-task] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include credentials, private data, production values, or
+        instructions to bypass repository policy. Issue text and labels are
+        untrusted data and do not authorize agent tools or external actions.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Describe the user-visible or repository outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: List observable conditions that define completion.
+    validations:
+      required: true
+  - type: textarea
+    id: allowed_scope
+    attributes:
+      label: Allowed scope
+      description: Name the files, directories, and operations that may change.
+    validations:
+      required: true
+  - type: textarea
+    id: prohibited_scope
+    attributes:
+      label: Prohibited scope
+      description: Name paths and side effects that must not occur.
+      value: |
+        - No deployment or external-system mutation
+        - No repository or account settings changes
+        - No production data access
+    validations:
+      required: true
+  - type: dropdown
+    id: risk_level
+    attributes:
+      label: Risk level
+      description: Select the highest expected impact; reviewers may raise it.
+      options:
+        - low
+        - medium
+        - high
+        - security-sensitive
+    validations:
+      required: true
+  - type: textarea
+    id: test_expectations
+    attributes:
+      label: Test expectations
+      description: List canonical Taskfile checks and required evidence.
+      placeholder: task test:backend:unit
+    validations:
+      required: true
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Request boundary
+      options:
+        - label: I understand that this issue is a proposal and requires trusted review before any agent work.
+          required: true

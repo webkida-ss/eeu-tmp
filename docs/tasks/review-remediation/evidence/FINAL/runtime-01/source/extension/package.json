@@ -1,0 +1,38 @@
+{
+  "name": "untangle-extension",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Untangle Chrome extension sources and their Node.js test suite.",
+  "type": "module",
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "test": "npm run test:unit",
+    "test:unit": "node --test test/shared.test.mjs test/signin-methods.test.mjs test/content-parsing.test.mjs test/content-highlighting.test.mjs test/reading-panel.test.mjs test/api-contract.test.mjs test/background-api.test.mjs",
+    "test:coverage": "c8 --all --include='*.js' --exclude='generated/**' --exclude='eslint.config.js' --reporter=text --reporter=json-summary --reporter=lcov --reporter=html --reports-dir=../output/coverage/extension npm run test:unit",
+    "test:smoke": "node test/smoke.mjs",
+    "test:package:smoke": "node test/package-smoke.mjs",
+    "test:fidelity": "node test/chrome-fidelity.mjs",
+    "test:automation": "npm run test:automation:static",
+    "test:automation:static": "node --test test/automation.test.mjs",
+    "test:automation:lifecycle": "node --test test/automation-lifecycle.test.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@redocly/cli": "2.39.0",
+    "c8": "12.0.0",
+    "eslint": "10.7.0",
+    "globals": "17.7.0",
+    "jsdom": "^26.1.0",
+    "playwright": "^1.61.1",
+    "prettier": "3.9.5"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "overrides": {
+    "lodash": "4.18.1",
+    "uuid": "11.1.1"
+  }
+}

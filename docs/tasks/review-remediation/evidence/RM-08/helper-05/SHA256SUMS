@@ -1,0 +1,6 @@
+ce22f5066ff330258f23ab10fac7f038281954301ac7b6ee5dc87996c478beff  scripts/test_terraform_provider_guards.sh
+3036df4dc0b0df02cc9f8b0bb9ae27fec2dcfddfc684ecac65faf3ccd4a15101  backend/test_offline_build_inputs.py
+d2f8066bedf18f658c622ec6ada256fbbaa7ba4d492e544e6d187fd4d59e3e00  docs/tasks/review-remediation/evidence/RM-08/helper-05/changes.diff
+6aa435b8b02a3eb379a0e4c529c3572bbc0bb5d63b160d1731a4b461be5bf8ef  docs/tasks/review-remediation/evidence/RM-08/helper-05/focused.log
+3036df4dc0b0df02cc9f8b0bb9ae27fec2dcfddfc684ecac65faf3ccd4a15101  docs/tasks/review-remediation/evidence/RM-08/helper-05/source/backend/test_offline_build_inputs.py
+ce22f5066ff330258f23ab10fac7f038281954301ac7b6ee5dc87996c478beff  docs/tasks/review-remediation/evidence/RM-08/helper-05/source/scripts/test_terraform_provider_guards.sh

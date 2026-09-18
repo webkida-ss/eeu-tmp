@@ -1,0 +1,20 @@
+# Historical design proposal; not a supported runtime contract.
+post:
+  operationId: logout
+  summary: Revoke the current bearer session
+  security:
+    - bearerAuth: []
+  responses:
+    "200":
+      description: Session revoked.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/LogoutResponse
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

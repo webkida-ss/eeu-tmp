@@ -1,0 +1,15 @@
+properties:
+  role:
+    type: string
+    pattern: ^(user|assistant)$
+    title: Role
+  content:
+    type: string
+    maxLength: 4000
+    minLength: 1
+    title: Content
+type: object
+required:
+- role
+- content
+title: ChatMessage

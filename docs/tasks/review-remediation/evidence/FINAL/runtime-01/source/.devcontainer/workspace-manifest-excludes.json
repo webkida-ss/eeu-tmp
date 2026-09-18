@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "description": "Generated and ignored runtime directories excluded from post-create source mutation checks.",
+  "relativeDirectories": [
+    ".cache",
+    ".devcontainer-tools",
+    ".git",
+    ".runtime",
+    ".tools",
+    "backend/.devcontainer-venv",
+    "backend/.venv",
+    "backend/build",
+    "backend/dist",
+    "extension/node_modules",
+    "logs",
+    "node_modules",
+    "output",
+    "tmp"
+  ],
+  "directoryNames": [
+    ".pytest_cache",
+    ".terraform",
+    "__pycache__"
+  ],
+  "fileSuffixes": [
+    ".pyc",
+    ".pyo"
+  ]
+}

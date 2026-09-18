@@ -1,0 +1,38 @@
+properties:
+  original_text:
+    type: string
+    title: Original Text
+  translation:
+    type: string
+    title: Translation
+    default: ''
+  grammar:
+    type: string
+    title: Grammar
+    default: ''
+  nuance:
+    type: string
+    title: Nuance
+    default: ''
+  vocabulary:
+    items:
+      type: string
+    type: array
+    title: Vocabulary
+  examples:
+    items:
+      type: string
+    type: array
+    title: Examples
+  study_tip:
+    type: string
+    title: Study Tip
+    default: ''
+  used_preload:
+    type: boolean
+    title: Used Preload
+    default: false
+type: object
+required:
+- original_text
+title: AnalyzeResponse

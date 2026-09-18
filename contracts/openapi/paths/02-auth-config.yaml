@@ -1,0 +1,23 @@
+get:
+  summary: Get Auth Config
+  operationId: getAuthConfig
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/AuthConfigResponse.yaml
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                provider: mock
+                google_client_id: null
+  x-contract-test:
+    mode: generic
+    auth: anonymous
+    setup: none
+    owner: auth
+  security: []

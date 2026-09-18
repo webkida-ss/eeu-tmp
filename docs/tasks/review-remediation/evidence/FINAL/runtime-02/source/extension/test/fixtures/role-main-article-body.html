@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Release notes for version 12</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <div class="topbar">
+        <p>Example Platform documentation</p>
+      </div>
+
+      <div role="main" id="main-region">
+        <div class="breadcrumbs">
+          <a href="/releases">All releases</a>
+        </div>
+        <div class="article-body" id="article-body">
+          <h1 id="title">Release notes for version 12</h1>
+          <p id="body-1">
+            Version 12 replaces the polling scheduler with an event driven one. Existing jobs keep
+            running without any change to their definitions.
+          </p>
+          <p id="body-2">
+            Upgrading requires a database migration. Run it before you deploy the new workers, not
+            afterwards.
+          </p>
+        </div>
+      </div>
+
+      <footer>
+        <p>Documentation feedback is welcome through the issue tracker.</p>
+      </footer>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,44 @@
+{
+  "name": "Untangle repository development",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "remoteUser": "vscode",
+  "containerUser": "vscode",
+  "updateRemoteUserUID": true,
+  "init": true,
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "runArgs": [
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges:true"
+  ],
+  "containerEnv": {
+    "AUTH_PROVIDER": "mock",
+    "BILLING_PROVIDER": "mock",
+    "JOB_RUNNER": "inline",
+    "STORAGE_BACKEND": "json",
+    "DEVCONTAINER": "1"
+  },
+  "remoteEnv": {
+    "BACKEND_VENV": "backend/.devcontainer-venv",
+    "BOOTSTRAP_TOOLS_DIR": "${containerWorkspaceFolder}/.devcontainer-tools",
+    "MISE_AUTO_INSTALL": "0",
+    "MISE_CACHE_DIR": "${containerWorkspaceFolder}/.devcontainer-tools/mise/cache",
+    "MISE_CONFIG_DIR": "${containerWorkspaceFolder}/.devcontainer-tools/mise/config",
+    "MISE_DATA_DIR": "${containerWorkspaceFolder}/.devcontainer-tools/mise/data",
+    "MISE_GLOBAL_CONFIG_FILE": "/dev/null",
+    "MISE_PYTHON_COMPILE": "0",
+    "MISE_PYTHON_GITHUB_ATTESTATIONS": "false",
+    "MISE_STATE_DIR": "${containerWorkspaceFolder}/.devcontainer-tools/mise/state",
+    "PATH": "${containerWorkspaceFolder}/.devcontainer-tools/mise/bin:${containerWorkspaceFolder}/.devcontainer-tools/mise/data/shims:${containerEnv:PATH}",
+    "REPOSITORY_TOOLS_DIR": "${containerWorkspaceFolder}/.devcontainer-tools/repository"
+  },
+  "postCreateCommand": "./scripts/devcontainer-post-create.sh",
+  "waitFor": "postCreateCommand",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb",
+    "storage": "32gb"
+  }
+}

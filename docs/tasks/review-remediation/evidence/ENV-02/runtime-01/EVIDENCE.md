@@ -1,0 +1,7 @@
+# Backend canonical runtime checkpoint
+
+Base 3c4fae5d2c03e6592ebd1f51debf5c798294a476; source/diff/log SHA256SUMS bind this checkpoint. RM-01, RM-02, RM-05 and RM-06 already have independent static reviews; the current increment fixes canonical collection by adding the repository root to sys.path and scoping a fake Mangum adapter around the real Lambda module import. This fake establishes composition only, not real package coverage. Parent corrected import formatting afterwards.
+
+Parent ran in credential-free, network-disconnected container untangle-remediation-mrxkdp53. First collection failed (root scripts and absent Mangum). After test correction, suite collected but 81 failures depended on absent public tokenizer data. Public o200k_base.tiktoken was retrieved separately and verified against installed tiktoken expected SHA256 446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d, then copied into its offline cache. Final canonical test:backend:unit: 842 passed, 6 skipped, 33 subtests passed. No test network or provider access. Final lint:backend, format:backend:check and devcontainer:validate all passed. Import formatting is the only source change following that suite.
+
+Request independent review of the collection/test isolation increment and assessment of canonical evidence for prior RM-01/RM-05 work. RM-06 workflow/deploy evidence is in RM-07/runtime-02. No publication/deployment.

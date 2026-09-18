@@ -1,0 +1,17 @@
+# Historical design proposal; not a supported runtime contract.
+get:
+  operationId: getAuthConfig
+  summary: Get the configured authentication provider
+  security: []
+  responses:
+    "200":
+      description: Authentication provider configuration.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/AuthConfig
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

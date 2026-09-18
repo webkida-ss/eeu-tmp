@@ -1,0 +1,899 @@
+{
+  "_generated": "DO NOT EDIT. Source: contracts/openapi/openapi.yaml",
+  "cases": [
+    {
+      "auth": "localBearer",
+      "invoke": false,
+      "method": "POST",
+      "mode": "manual",
+      "operationId": "analyzeText",
+      "owner": "reading",
+      "path": "/analyze",
+      "reason": "Analysis crosses the model-provider boundary.",
+      "setup": "fakeModelPipeline",
+      "test": "backend/test_openapi_manual_contract.py::test_analyze_text"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "POST",
+      "mode": "generic",
+      "operationId": "closeAuthSession",
+      "parameters": {},
+      "path": "/auth/logout",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "status": "ok"
+      },
+      "setup": "authenticatedUser"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-401-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 401,
+      "invoke": false,
+      "method": "POST",
+      "mode": "generic",
+      "operationId": "closeAuthSession",
+      "parameters": {},
+      "path": "/auth/logout",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": "Authentication failed."
+      },
+      "setup": "authenticatedUser"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "POST",
+      "mode": "generic",
+      "operationId": "closeAuthSession",
+      "parameters": {},
+      "path": "/auth/logout",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": [
+          {
+            "input": null,
+            "loc": [
+              "body",
+              "field"
+            ],
+            "msg": "Request validation failed.",
+            "type": "value_error"
+          }
+        ]
+      },
+      "setup": "authenticatedUser"
+    },
+    {
+      "auth": "anonymous",
+      "invoke": false,
+      "method": "POST",
+      "mode": "manual",
+      "operationId": "createAuthSession",
+      "owner": "auth",
+      "path": "/auth/login",
+      "reason": "Identity-provider credentials require explicit fake-provider coverage.",
+      "setup": "mockIdentity",
+      "test": "backend/test_openapi_manual_contract.py::test_create_auth_session"
+    },
+    {
+      "auth": "localBearer",
+      "invoke": false,
+      "method": "POST",
+      "mode": "manual",
+      "operationId": "createBillingCheckout",
+      "owner": "billing",
+      "path": "/billing/checkout",
+      "reason": "Checkout creates provider-owned billing state.",
+      "setup": "mockBilling",
+      "test": "backend/test_openapi_manual_contract.py::test_create_billing_checkout"
+    },
+    {
+      "auth": "localBearer",
+      "invoke": false,
+      "method": "POST",
+      "mode": "manual",
+      "operationId": "createChatReply",
+      "owner": "reading",
+      "path": "/chat",
+      "reason": "Chat crosses the model-provider boundary.",
+      "setup": "fakeModelPipeline",
+      "test": "backend/test_openapi_manual_contract.py::test_create_chat_reply"
+    },
+    {
+      "auth": "localBearer",
+      "invoke": false,
+      "method": "POST",
+      "mode": "manual",
+      "operationId": "createPagePreload",
+      "owner": "reading",
+      "path": "/pages/preload",
+      "reason": "Submission executes asynchronous extraction and analysis.",
+      "setup": "fakePreloadPipeline",
+      "test": "backend/test_openapi_manual_contract.py::test_create_page_preload"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "POST",
+      "mode": "generic",
+      "operationId": "createPhrase",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": {
+        "analysis": {
+          "original_text": "Learning takes practice.",
+          "translation": "Learning requires practice."
+        },
+        "original_text": "Learning takes practice.",
+        "page_title": "A public sample article",
+        "page_url": "https://example.test/article"
+      },
+      "requestMediaType": "application/json",
+      "responseExample": {
+        "analysis": {
+          "original_text": "Learning takes practice.",
+          "translation": "Learning requires practice."
+        },
+        "created_at": "2026-07-19T00:00:00+00:00",
+        "id": "018f47a2-7b3c-7abc-8def-0123456789ab",
+        "original_text": "Learning takes practice.",
+        "page_title": "A public sample article",
+        "page_url": "https://example.test/article"
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-401-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 401,
+      "invoke": false,
+      "method": "POST",
+      "mode": "generic",
+      "operationId": "createPhrase",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": {
+        "analysis": {
+          "original_text": "Learning takes practice.",
+          "translation": "Learning requires practice."
+        },
+        "original_text": "Learning takes practice.",
+        "page_title": "A public sample article",
+        "page_url": "https://example.test/article"
+      },
+      "requestMediaType": "application/json",
+      "responseExample": {
+        "detail": "Authentication failed."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-403-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 403,
+      "invoke": false,
+      "method": "POST",
+      "mode": "generic",
+      "operationId": "createPhrase",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": {
+        "analysis": {
+          "original_text": "Learning takes practice.",
+          "translation": "Learning requires practice."
+        },
+        "original_text": "Learning takes practice.",
+        "page_title": "A public sample article",
+        "page_url": "https://example.test/article"
+      },
+      "requestMediaType": "application/json",
+      "responseExample": {
+        "code": "account_suspended",
+        "detail": "Account is suspended."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "POST",
+      "mode": "generic",
+      "operationId": "createPhrase",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": {
+        "analysis": {
+          "original_text": "Learning takes practice.",
+          "translation": "Learning requires practice."
+        },
+        "original_text": "Learning takes practice.",
+        "page_title": "A public sample article",
+        "page_url": "https://example.test/article"
+      },
+      "requestMediaType": "application/json",
+      "responseExample": {
+        "detail": "Request validation failed."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "invoke": false,
+      "method": "GET",
+      "mode": "manual",
+      "operationId": "getAdminSession",
+      "owner": "admin",
+      "path": "/admin/v1/session",
+      "reason": "Administrator allowlist and disabled-mode availability require isolated configuration.",
+      "setup": "authenticatedUser",
+      "test": "backend/test_admin_auth.py::test_admin_session_canonical_contract"
+    },
+    {
+      "auth": "anonymous",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getAuthConfig",
+      "parameters": {},
+      "path": "/auth/config",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "google_client_id": null,
+        "provider": "mock"
+      },
+      "setup": "none"
+    },
+    {
+      "auth": "anonymous",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "text/html",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getBillingDonePage",
+      "parameters": {
+        "state": "success"
+      },
+      "path": "/billing/done?state=success",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": "<html><body><h2>Untangle</h2><p>Subscription updated.</p></body></html>",
+      "setup": "none"
+    },
+    {
+      "auth": "anonymous",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getBillingDonePage",
+      "parameters": {
+        "state": "success"
+      },
+      "path": "/billing/done?state=success",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": [
+          {
+            "input": null,
+            "loc": [
+              "body",
+              "field"
+            ],
+            "msg": "Request validation failed.",
+            "type": "value_error"
+          }
+        ]
+      },
+      "setup": "none"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getBillingSummary",
+      "parameters": {},
+      "path": "/billing/me",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "articles_limit": 10,
+        "articles_pending": 0,
+        "articles_remaining": 10,
+        "articles_used": 0,
+        "chats_limit": 50,
+        "chats_pending": 0,
+        "chats_remaining": 50,
+        "chats_used": 0,
+        "month": "2026-07",
+        "plan": "basic",
+        "plan_ends_at": null,
+        "quota_plan": "basic",
+        "reset_at": "2026-08-01T00:00:00+00:00",
+        "sentences_per_article": 20,
+        "source_tokens_per_article": 12000,
+        "warning_codes": []
+      },
+      "setup": "billingRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-401-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 401,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getBillingSummary",
+      "parameters": {},
+      "path": "/billing/me",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": "Authentication failed."
+      },
+      "setup": "billingRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-403-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 403,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getBillingSummary",
+      "parameters": {},
+      "path": "/billing/me",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "code": "account_suspended",
+        "detail": "Account is suspended."
+      },
+      "setup": "billingRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getBillingSummary",
+      "parameters": {},
+      "path": "/billing/me",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": [
+          {
+            "input": null,
+            "loc": [
+              "body",
+              "field"
+            ],
+            "msg": "Request validation failed.",
+            "type": "value_error"
+          }
+        ]
+      },
+      "setup": "billingRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getCurrentUser",
+      "parameters": {},
+      "path": "/auth/me",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "display_name": "Learner",
+        "email": "learner@example.test",
+        "id": "018f47a2-7b3c-7abc-8def-0123456789ab"
+      },
+      "setup": "authenticatedUser"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-401-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 401,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getCurrentUser",
+      "parameters": {},
+      "path": "/auth/me",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": "Authentication failed."
+      },
+      "setup": "authenticatedUser"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getCurrentUser",
+      "parameters": {},
+      "path": "/auth/me",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": [
+          {
+            "input": null,
+            "loc": [
+              "body",
+              "field"
+            ],
+            "msg": "Request validation failed.",
+            "type": "value_error"
+          }
+        ]
+      },
+      "setup": "authenticatedUser"
+    },
+    {
+      "auth": "anonymous",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getHealth",
+      "parameters": {},
+      "path": "/health",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "status": "ok"
+      },
+      "setup": "none"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "failed",
+      "caseKind": "success",
+      "exampleName": "failed",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getPagePreload",
+      "parameters": {
+        "page_url": "https://example.test/article"
+      },
+      "path": "/pages/preload?page_url=https%3A%2F%2Fexample.test%2Farticle",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "error": "Synthetic local analysis failure.",
+        "preload": null,
+        "ready": false,
+        "status": "failed"
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "processing",
+      "caseKind": "success",
+      "exampleName": "processing",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getPagePreload",
+      "parameters": {
+        "page_url": "https://example.test/article"
+      },
+      "path": "/pages/preload?page_url=https%3A%2F%2Fexample.test%2Farticle",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "error": null,
+        "preload": null,
+        "ready": false,
+        "status": "processing"
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "ready",
+      "caseKind": "success",
+      "exampleName": "ready",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getPagePreload",
+      "parameters": {
+        "page_url": "https://example.test/article"
+      },
+      "path": "/pages/preload?page_url=https%3A%2F%2Fexample.test%2Farticle",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "error": null,
+        "preload": {
+          "created_at": "2026-07-19T00:00:00+00:00",
+          "id": "018f47a2-7b3c-7abc-8def-0123456789ab",
+          "page_title": "A public sample article",
+          "page_url": "https://example.test/article",
+          "sentences": [],
+          "status": "ready",
+          "study_items": [],
+          "summary": "A short public sample.",
+          "topics": [
+            "learning"
+          ]
+        },
+        "ready": true,
+        "status": "ready"
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-401-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 401,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getPagePreload",
+      "parameters": {
+        "page_url": "https://example.test/article"
+      },
+      "path": "/pages/preload?page_url=https%3A%2F%2Fexample.test%2Farticle",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": "Authentication failed."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-403-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 403,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getPagePreload",
+      "parameters": {
+        "page_url": "https://example.test/article"
+      },
+      "path": "/pages/preload?page_url=https%3A%2F%2Fexample.test%2Farticle",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "code": "account_suspended",
+        "detail": "Account is suspended."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getPagePreload",
+      "parameters": {
+        "page_url": "https://example.test/article"
+      },
+      "path": "/pages/preload?page_url=https%3A%2F%2Fexample.test%2Farticle",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": "Request validation failed."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getVocabularyBook",
+      "parameters": {},
+      "path": "/vocabulary",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "items": [],
+        "preload_count": 0
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-401-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 401,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getVocabularyBook",
+      "parameters": {},
+      "path": "/vocabulary",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": "Authentication failed."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-403-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 403,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getVocabularyBook",
+      "parameters": {},
+      "path": "/vocabulary",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "code": "account_suspended",
+        "detail": "Account is suspended."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "getVocabularyBook",
+      "parameters": {},
+      "path": "/vocabulary",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": [
+          {
+            "input": null,
+            "loc": [
+              "body",
+              "field"
+            ],
+            "msg": "Request validation failed.",
+            "type": "value_error"
+          }
+        ]
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "happy",
+      "caseKind": "success",
+      "exampleName": "happy",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 200,
+      "invoke": true,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "listPhrases",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": [],
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-401-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 401,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "listPhrases",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": "Authentication failed."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-403-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 403,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "listPhrases",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "code": "account_suspended",
+        "detail": "Account is suspended."
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "caseId": "response-422-application-json-example",
+      "caseKind": "documentedError",
+      "exampleName": "example",
+      "expectedMediaType": "application/json",
+      "expectedStatus": 422,
+      "invoke": false,
+      "method": "GET",
+      "mode": "generic",
+      "operationId": "listPhrases",
+      "parameters": {},
+      "path": "/phrases",
+      "requestBody": null,
+      "requestMediaType": null,
+      "responseExample": {
+        "detail": [
+          {
+            "input": null,
+            "loc": [
+              "body",
+              "field"
+            ],
+            "msg": "Request validation failed.",
+            "type": "value_error"
+          }
+        ]
+      },
+      "setup": "emptyRepositories"
+    },
+    {
+      "auth": "localBearer",
+      "invoke": false,
+      "method": "POST",
+      "mode": "manual",
+      "operationId": "openBillingPortal",
+      "owner": "billing",
+      "path": "/billing/portal",
+      "reason": "Portal creation crosses the billing-provider boundary.",
+      "setup": "mockBilling",
+      "test": "backend/test_openapi_manual_contract.py::test_open_billing_portal"
+    },
+    {
+      "auth": "stripeSignature",
+      "invoke": false,
+      "method": "POST",
+      "mode": "manual",
+      "operationId": "processBillingWebhook",
+      "owner": "billing-security",
+      "path": "/billing/webhook",
+      "reason": "Signature verification depends on exact raw bytes.",
+      "setup": "signedWebhook",
+      "test": "backend/test_openapi_manual_contract.py::test_process_billing_webhook"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,5 @@
+aa868ab0979d04f57a743630b2db82e3c7253a6883a4ec8a1d987efa13f910f6  docs/tasks/review-remediation/evidence/ENV-01/docker-recovery/changes.diff
+a71dd0e378e310b0d34907cbe89cf842106dc72fcc9fd160eca7c2e6c33ff9b1  .devcontainer/workspace-manifest-excludes.json
+3db0dd845c54153b9a45c96b7c8f5c540da38736121e2461c8a5a54a09448bf1  backend/test_devcontainer_workspace_manifest.py
+11bc8c484b4f51cf825daae34d01a1b987ba979671429147ed3b70f1f829346b  docs/tasks/review-remediation/evidence/ENV-01/docker-recovery/manifest-red.log
+68d634ac9870486269e005d4305f6657279e5c9a565ead74ee45bda14f594d34  docs/tasks/review-remediation/evidence/ENV-01/docker-recovery/manifest-green.log

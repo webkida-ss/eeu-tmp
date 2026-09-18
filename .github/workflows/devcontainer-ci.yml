@@ -1,0 +1,126 @@
+name: Dev Container CI
+
+on:
+  pull_request:
+    paths:
+      - ".devcontainer/**"
+      - ".github/workflows/devcontainer-ci.yml"
+      - "Taskfile.yaml"
+      - "mise.toml"
+      - "scripts/bootstrap.sh"
+      - "scripts/devcontainer-post-create.sh"
+      - "scripts/devcontainer-platform-smoke.sh"
+      - "scripts/validate-devcontainer.py"
+      - "scripts/verify-base-image-lock.py"
+      - "scripts/workspace-manifest.py"
+      - "scripts/tool-locks/**"
+      - "backend/requirements*.in"
+      - "backend/requirements*.txt"
+      - "extension/package.json"
+      - "extension/package-lock.json"
+  push:
+    branches:
+      - main
+    paths:
+      - ".devcontainer/**"
+      - ".github/workflows/devcontainer-ci.yml"
+      - "Taskfile.yaml"
+      - "mise.toml"
+      - "scripts/bootstrap.sh"
+      - "scripts/devcontainer-post-create.sh"
+      - "scripts/devcontainer-platform-smoke.sh"
+      - "scripts/validate-devcontainer.py"
+      - "scripts/verify-base-image-lock.py"
+      - "scripts/workspace-manifest.py"
+      - "scripts/tool-locks/**"
+      - "backend/requirements*.in"
+      - "backend/requirements*.txt"
+      - "extension/package.json"
+      - "extension/package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devcontainer-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  platform-images:
+    name: Build and smoke ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify immutable base image lock
+        run: python3 scripts/verify-base-image-lock.py
+
+      - name: Set up QEMU
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          image: tonistiigi/binfmt@sha256:ea2f0dd74e74f101df59f9a6b31d0960994060c7982a921cbceecee0f1841125
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          driver-opts: image=moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Build requested platform image
+        run: |
+          docker buildx build \
+            --platform "linux/${{ matrix.arch }}" \
+            --load \
+            --tag "untangle-devcontainer:${{ matrix.arch }}" \
+            --file .devcontainer/Dockerfile \
+            .devcontainer
+
+      - name: Prepare isolated writable workspace
+        run: |
+          install -d -m 0755 /tmp/untangle-platform-workspace
+          cp -a . /tmp/untangle-platform-workspace/repository
+          sudo chown -R 1000:1000 /tmp/untangle-platform-workspace
+
+      - name: Run non-root tool and package smoke
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' "untangle-devcontainer:${{ matrix.arch }}")" = "vscode"
+          docker run --rm \
+            --platform "linux/${{ matrix.arch }}" \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --mount type=bind,source=/tmp/untangle-platform-workspace/repository,target=/workspace \
+            --workdir /workspace \
+            "untangle-devcontainer:${{ matrix.arch }}" \
+            ./scripts/devcontainer-platform-smoke.sh "${{ matrix.arch }}"
+
+  build-and-check:
+    name: Build amd64 container and verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Build and run repository checks
+        uses: devcontainers/ci@8bf61b26e9c3a98f69cb6ce2f88d24ff59b785c6 # v0.3.1900000417
+        with:
+          configFile: .devcontainer/devcontainer.json
+          inheritEnv: false
+          platform: linux/amd64
+          push: never
+          runCmd: |
+            task setup
+            task check
+            task test:extension:smoke

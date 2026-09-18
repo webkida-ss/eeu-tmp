@@ -1,0 +1,7 @@
+version: 1
+# Compatibility entries require:
+# id, kind, owner, reason, approval, expires, fingerprint, operationId,
+# property, consumers, rollout, monitoring, rollback.
+# `operationId` and `property` must exactly match the normalized finding whose
+# full sha256 fingerprint is approved. Stale or unused entries fail closed.
+exceptions: []

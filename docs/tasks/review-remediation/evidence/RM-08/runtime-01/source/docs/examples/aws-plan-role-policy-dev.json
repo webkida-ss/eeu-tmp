@@ -1,0 +1,247 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyDevTerraformStateObject",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectAttributes",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::STATE_BUCKET/02_english/reading-assistant/dev/terraform.tfstate"
+    },
+    {
+      "Sid": "ListOnlyEnvironmentStatePrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::STATE_BUCKET",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "02_english/reading-assistant/dev/terraform.tfstate",
+            "02_english/reading-assistant/dev/terraform.tfstate.*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DecryptOnlyEnvironmentState",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "STATE_KMS_KEY_ARN",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.REGION.amazonaws.com"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::STATE_BUCKET/02_english/reading-assistant/dev/terraform.tfstate*"
+        }
+      }
+    },
+    {
+      "Sid": "ReadOnlyDevLambdaFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:GetPolicy",
+        "lambda:ListTags",
+        "lambda:ListVersionsByFunction"
+      ],
+      "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:english-dev-reading-assistant-*"
+    },
+    {
+      "Sid": "ReadOnlyDevLambdaRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListRoleTags"
+      ],
+      "Resource": [
+        "arn:aws:iam::ACCOUNT_ID:role/english-dev-reading-assistant-api-role",
+        "arn:aws:iam::ACCOUNT_ID:role/english-dev-reading-assistant-worker-role"
+      ]
+    },
+    {
+      "Sid": "ReadOnlyDevDynamoDB",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:DescribeContinuousBackups",
+        "dynamodb:DescribeTable",
+        "dynamodb:ListTagsOfResource"
+      ],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/english-dev-reading-assistant"
+    },
+    {
+      "Sid": "ReadOnlyDevPreloadBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketAcl",
+        "s3:GetBucketCors",
+        "s3:GetBucketLifecycleConfiguration",
+        "s3:GetBucketLocation",
+        "s3:GetBucketPolicy",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketTagging",
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::english-dev-reading-assistant-preload-content-ACCOUNT_ID"
+    },
+    {
+      "Sid": "ReadOnlyDevQueues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ListQueueTags"
+      ],
+      "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:english-dev-reading-assistant-*"
+    },
+    {
+      "Sid": "ReadOnlyDevAlertsTopic",
+      "Effect": "Allow",
+      "Action": [
+        "sns:GetTopicAttributes",
+        "sns:ListSubscriptionsByTopic",
+        "sns:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:sns:REGION:ACCOUNT_ID:english-dev-reading-assistant-alerts"
+    },
+    {
+      "Sid": "ReadOnlyDevLogGroups",
+      "Effect": "Allow",
+      "Action": ["logs:DescribeLogStreams", "logs:ListTagsForResource"],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/english-dev-reading-assistant-*"
+    },
+    {
+      "Sid": "ReadOnlyDevAlarms",
+      "Effect": "Allow",
+      "Action": "cloudwatch:ListTagsForResource",
+      "Resource": "arn:aws:cloudwatch:REGION:ACCOUNT_ID:alarm:english-dev-reading-assistant-*"
+    },
+    {
+      "Sid": "ReadOnlyDevBudget",
+      "Effect": "Allow",
+      "Action": "budgets:ViewBudget",
+      "Resource": "arn:aws:budgets::ACCOUNT_ID:budget/english-dev-reading-assistant-monthly-cost"
+    },
+    {
+      "Sid": "ReadOnlyTaggedDevHttpApi",
+      "Effect": "Allow",
+      "Action": "apigateway:GET",
+      "Resource": "arn:aws:apigateway:REGION::/apis/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/Environment": "dev",
+          "aws:ResourceTag/Project": "english-reading-assistant"
+        }
+      }
+    },
+    {
+      "Sid": "RegionalAccountScopedUnscopableReads",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:DescribeAlarms",
+        "lambda:ListEventSourceMappings",
+        "logs:DescribeLogGroups",
+        "sns:GetSubscriptionAttributes"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "REGION"
+        },
+        "StringEqualsIfExists": {
+          "aws:ResourceAccount": "ACCOUNT_ID"
+        }
+      }
+    },
+    {
+      "Sid": "CallerIdentityOnly",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "WriteOnlyRunDerivedEncryptedDevPlanObject",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
+        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-server-side-encryption": "aws:kms",
+          "s3:x-amz-server-side-encryption-aws-kms-key-id": "PLAN_KMS_KEY_ARN"
+        }
+      }
+    },
+    {
+      "Sid": "InspectPrivatePlanBucketControls",
+      "Effect": "Allow",
+      "Action": ["s3:GetEncryptionConfiguration", "s3:GetBucketVersioning"],
+      "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET"
+    },
+    {
+      "Sid": "EncryptOnlyRunDerivedDevPlanObject",
+      "Effect": "Allow",
+      "Action": ["kms:Encrypt", "kms:GenerateDataKey"],
+      "Resource": "PLAN_KMS_KEY_ARN",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.REGION.amazonaws.com"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:s3:arn": [
+            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
+            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyInfrastructureMutationAndPlanDeletion",
+      "Effect": "Deny",
+      "Action": [
+        "apigateway:DELETE",
+        "apigateway:PATCH",
+        "apigateway:POST",
+        "apigateway:PUT",
+        "dynamodb:Create*",
+        "dynamodb:Delete*",
+        "dynamodb:Update*",
+        "iam:Attach*",
+        "iam:Create*",
+        "iam:Delete*",
+        "iam:Detach*",
+        "iam:PassRole",
+        "iam:Put*",
+        "iam:Update*",
+        "kms:Create*",
+        "kms:Disable*",
+        "kms:Put*",
+        "lambda:Create*",
+        "lambda:Delete*",
+        "lambda:Publish*",
+        "lambda:Put*",
+        "lambda:Update*",
+        "s3:DeleteObject",
+        "sns:Create*",
+        "sns:Delete*",
+        "sns:Set*",
+        "sqs:Create*",
+        "sqs:Delete*",
+        "sqs:Set*",
+        "ssm:Delete*",
+        "ssm:Put*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

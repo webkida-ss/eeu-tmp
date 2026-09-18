@@ -1,0 +1,33 @@
+--- ../B-runtime-04/source/backend/test_shadow_recovery_windows.py	2026-09-14 23:11:30
++++ source/backend/test_shadow_recovery_windows.py	2026-09-14 23:21:06
+@@ -209,6 +209,10 @@
+         ):
+             self._run_success()
+ 
++        durable_measurement = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(durable_measurement.dispatch_usage_completeness, "measured")
++        expected_cost = durable_measurement.dispatch_usage["actual_cost_micro_usd"]
++        expected_tokens = durable_measurement.dispatch_usage["total_tokens"]
+         records = json.loads((Path(self._temporary_directory.name) / "usage.json").read_text())
+         for record in records:
+             if record.get("record_type") == "usage_result":
+@@ -235,7 +239,18 @@
+         self._assert_terminal_once(_OPERATION_ID, outcome="failed_after_dispatch", articles=0)
+         operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
+         month = self.usage.get_month(_USER_ID, operation.month)
+-        self.assertGreaterEqual(month["shadow_cost_micro_usd"], operation.reserved_cost_micro_usd)
++        self.assertEqual(
++            (
++                operation.dispatch_usage_completeness,
++                operation.actual_cost_micro_usd,
++                operation.tokens,
++            ),
++            ("measured", expected_cost, expected_tokens),
++        )
++        self.assertEqual(
++            (month["shadow_cost_micro_usd"], month["tokens"]),
++            (expected_cost, expected_tokens),
++        )
+ 
+     def test_missing_content_after_dispatch_conserves_cost_instead_of_zero(self) -> None:
+         for job_index, (state, operation_id) in enumerate(

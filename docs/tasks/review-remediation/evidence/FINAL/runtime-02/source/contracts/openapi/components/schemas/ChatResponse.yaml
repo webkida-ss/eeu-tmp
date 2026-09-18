@@ -1,0 +1,8 @@
+properties:
+  reply:
+    type: string
+    title: Reply
+type: object
+required:
+- reply
+title: ChatResponse

@@ -1,0 +1,70 @@
+properties:
+  plan:
+    type: string
+    title: Plan
+  quota_plan:
+    type: string
+    title: Quota Plan
+  month:
+    type: string
+    title: Month
+  articles_used:
+    type: integer
+    title: Articles Used
+  articles_pending:
+    type: integer
+    title: Articles Pending
+  articles_limit:
+    type: integer
+    title: Articles Limit
+  articles_remaining:
+    type: integer
+    title: Articles Remaining
+  chats_used:
+    type: integer
+    title: Chats Used
+  chats_pending:
+    type: integer
+    title: Chats Pending
+  chats_limit:
+    type: integer
+    title: Chats Limit
+  chats_remaining:
+    type: integer
+    title: Chats Remaining
+  reset_at:
+    type: string
+    title: Reset At
+  sentences_per_article:
+    type: integer
+    title: Sentences Per Article
+  source_tokens_per_article:
+    type: integer
+    title: Source Tokens Per Article
+  warning_codes:
+    items:
+      type: string
+    type: array
+    title: Warning Codes
+  plan_ends_at:
+    anyOf:
+    - type: integer
+    - type: 'null'
+    title: Plan Ends At
+type: object
+required:
+- plan
+- quota_plan
+- month
+- articles_used
+- articles_pending
+- articles_limit
+- articles_remaining
+- chats_used
+- chats_pending
+- chats_limit
+- chats_remaining
+- reset_at
+- sentences_per_article
+- source_tokens_per_article
+title: BillingMeResponse

@@ -1,0 +1,63 @@
+version: 1
+operations:
+  - operationId: getAdminSession
+    kind: bearerAuth
+    dependency: deps.get_current_user
+    authorizationDependency: admin.deps.get_admin_user
+  - operationId: getHealth
+    kind: public
+    owner: backend
+    reason: Health information contains no user data.
+  - operationId: getAuthConfig
+    kind: public
+    owner: auth
+    reason: Clients need provider configuration before authentication.
+  - operationId: createAuthSession
+    kind: public
+    owner: auth
+    reason: Login verifies the supplied provider credential before issuing a session.
+  - operationId: getCurrentUser
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: closeAuthSession
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: getPagePreload
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: createPagePreload
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: getVocabularyBook
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: analyzeText
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: createChatReply
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: listPhrases
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: createPhrase
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: getBillingSummary
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: createBillingCheckout
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: openBillingPortal
+    kind: bearerAuth
+    dependency: deps.get_current_user
+  - operationId: processBillingWebhook
+    kind: stripeSignature
+    dependency: deps.get_accounts
+    verifier: accounts.billing.stripe_billing.StripeBillingProvider.parse_webhook_event
+    test: backend/test_openapi_manual_contract.py::test_process_billing_webhook
+  - operationId: getBillingDonePage
+    kind: public
+    owner: billing
+    reason: The landing page contains no account data and is opened after provider redirects.

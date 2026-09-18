@@ -1,0 +1,109 @@
+post:
+  summary: Chat
+  operationId: createChatReply
+  parameters:
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/ChatRequest.yaml
+        examples:
+          happy:
+            summary: Deterministic local request
+            x-contract-test-case: happy
+            value:
+              operation_id: 018f47a2-7b3c-7abc-8def-0123456789ab
+              message: Why is this tense used?
+              context_label: sentence
+              context_text: Learning takes practice.
+              history: []
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ChatResponse.yaml
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                reply: The present simple describes a general truth.
+    '400':
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The request is invalid.
+    '403':
+      description: Account access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Account is suspended.
+            code: account_suspended
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '402':
+      description: Plan quota exceeded
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The current plan quota is exhausted.
+            code: article_quota_exceeded
+    '422':
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Request validation failed.
+    '429':
+      description: Usage limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The usage limit is exhausted.
+            code: article_quota_exceeded
+    '500':
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: The request could not be completed.
+  x-contract-test:
+    mode: manual
+    auth: localBearer
+    setup: fakeModelPipeline
+    owner: reading
+    reason: Chat crosses the model-provider boundary.
+    test: backend/test_openapi_manual_contract.py::test_create_chat_reply
+  security:
+  - bearerAuth: []

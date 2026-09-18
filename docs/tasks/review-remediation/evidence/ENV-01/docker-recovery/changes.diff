@@ -1,0 +1,43 @@
+diff --git a/.devcontainer/workspace-manifest-excludes.json b/.devcontainer/workspace-manifest-excludes.json
+index ef877ea..ddfabcc 100644
+--- a/.devcontainer/workspace-manifest-excludes.json
++++ b/.devcontainer/workspace-manifest-excludes.json
+@@ -13,6 +13,7 @@
+     "backend/dist",
+     "extension/node_modules",
+     "logs",
++    "node_modules",
+     "output",
+     "tmp"
+   ],
+diff --git a/backend/test_devcontainer_workspace_manifest.py b/backend/test_devcontainer_workspace_manifest.py
+index 44e7fa2..b2552ce 100644
+--- a/backend/test_devcontainer_workspace_manifest.py
++++ b/backend/test_devcontainer_workspace_manifest.py
+@@ -133,14 +133,16 @@ def test_fallback_detects_add_delete_mode_and_symlink_changes(
+     assert expected in result.stderr
+ 
+ 
+-def test_fallback_excludes_only_declared_runtime_directories(tmp_path: Path) -> None:
+-    workspace = prepare_workspace(tmp_path, git=False)
++@pytest.mark.parametrize("git", [True, False])
++def test_manifest_excludes_only_declared_runtime_directories(tmp_path: Path, git: bool) -> None:
++    workspace = prepare_workspace(tmp_path, git=git)
+     manifest = tmp_path / "manifest.json"
+-    capture(workspace, manifest, fallback=True)
++    capture(workspace, manifest, fallback=not git)
+ 
+     for relative in (
+         ".devcontainer-tools/cache.bin",
+         "backend/.devcontainer-venv/state.bin",
++        "node_modules/package/file.js",
+         "extension/node_modules/package/file.js",
+         "output/report.json",
+     ):
+@@ -148,5 +150,5 @@ def test_fallback_excludes_only_declared_runtime_directories(tmp_path: Path) ->
+         path.parent.mkdir(parents=True, exist_ok=True)
+         path.write_text("generated\n", encoding="utf-8")
+ 
+-    result = verify(workspace, manifest, fallback=True)
++    result = verify(workspace, manifest, fallback=not git)
+     assert result.returncode == 0, result.stderr

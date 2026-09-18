@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "editor": {
+    "vimMode": false
+  },
+  "permissions": {
+    "allow": [],
+    "deny": [
+      "Read(**/*.cer)",
+      "Read(**/*.crt)",
+      "Read(**/*.key)",
+      "Read(**/*.p12)",
+      "Read(**/*.pem)",
+      "Read(**/*.pfx)",
+      "Read(**/*.tfstate)",
+      "Read(**/*.tfstate.*)",
+      "Read(**/*.tfvars)",
+      "Read(**/.aws/**)",
+      "Read(**/.config/gcloud/**)",
+      "Read(**/.env)",
+      "Read(**/.env.development.local)",
+      "Read(**/.env.local)",
+      "Read(**/.env.production.local)",
+      "Read(**/.env.test.local)",
+      "Read(**/.ssh/**)",
+      "Read(**/credentials/**)",
+      "Read(.aws/**)",
+      "Read(.config/gcloud/**)",
+      "Read(.env)",
+      "Read(.env.development.local)",
+      "Read(.env.local)",
+      "Read(.env.production.local)",
+      "Read(.env.test.local)",
+      "Read(.ssh/**)",
+      "Read(credentials/**)"
+    ]
+  }
+}
