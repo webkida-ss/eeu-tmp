@@ -9,6 +9,6 @@ pytest-cov
 ruff
 httpx
 stripe
-datamodel-code-generator==0.68.1
+datamodel-code-generator==0.81.0
 openapi-core==0.23.1
 PyYAML==6.0.3
