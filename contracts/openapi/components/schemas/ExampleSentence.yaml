@@ -1,0 +1,26 @@
+type: object
+required:
+  - id
+  - targetText
+  - targetSentence
+  - sourceTranslation
+  - variant
+properties:
+  id:
+    type: string
+  targetText:
+    type: string
+  targetSentence:
+    type: string
+  sourceTranslation:
+    type: string
+  variant:
+    type: string
+    enum:
+      - curated
+      - personalized
+  personalization:
+    $ref: "./ExampleSentencePersonalization.yaml"
+  usageNote:
+    type: string
+additionalProperties: false

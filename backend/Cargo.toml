@@ -1,0 +1,31 @@
+[package]
+name = "english-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+aws-config = "1.8.17"
+aws-sdk-dynamodb = "1.113.0"
+aws-sdk-sqs = "1.102.0"
+aws_lambda_events = "1.2.0"
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["cookie", "typed-header"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+english_backend_openapi = { path = "generated/openapi" }
+headers = "0.4"
+http = "1"
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+lambda_runtime = "1.2.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

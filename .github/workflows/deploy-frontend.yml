@@ -1,0 +1,15 @@
+name: Deploy Frontend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-frontend:
+    name: Deploy frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "Frontend deploy workflow is not implemented yet."

@@ -1,0 +1,15 @@
+name: Deploy Infra
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-infra:
+    name: Deploy infra
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "Infra deploy workflow is not implemented yet."

@@ -1,0 +1,31 @@
+get:
+  operationId: getPersonalizedExampleSentences
+  summary: Get stored personalized example sentences for the current learner
+  security:
+    - BearerAuth: []
+  responses:
+    "200":
+      description: Stored personalized example sentences.
+      content:
+        application/json:
+          schema:
+            type: array
+            items:
+              $ref: "../openapi.yaml#/components/schemas/ExampleSentence"
+          example:
+            - id: "personalized-apply-1"
+              targetText: "apply"
+              targetSentence: "I applied for a cafe job near my station."
+              sourceTranslation: ""
+              variant: "personalized"
+              personalization:
+                contextSummary: "Daily scenes: commuting."
+                personalizedFromUserContextAt: "2026-06-13T08:00:00Z"
+    "401":
+      description: Missing, invalid, or expired access token.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/AuthErrorResponse"
+          example:
+            message: "Unauthorized"

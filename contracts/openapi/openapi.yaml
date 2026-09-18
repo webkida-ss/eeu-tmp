@@ -1,0 +1,48 @@
+openapi: 3.1.0
+info:
+  title: API
+  version: 0.1.0
+servers:
+  - url: http://localhost:18080
+paths:
+  /auth/session:
+    $ref: "./paths/auth-session.yaml"
+  /example-sentences:
+    $ref: "./paths/example-sentences.yaml"
+  /learning-paths:
+    $ref: "./paths/learning-paths.yaml"
+  /learning-paths/{pathId}:
+    $ref: "./paths/learning-path.yaml"
+  /learning-paths/{pathId}/courses/{courseId}:
+    $ref: "./paths/learning-path-course.yaml"
+  /me/learner-profile:
+    $ref: "./paths/me-learner-profile.yaml"
+  /me/personalized-example-sentences:
+    $ref: "./paths/me-personalized-example-sentences.yaml"
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    AuthErrorResponse:
+      $ref: "./components/schemas/AuthErrorResponse.yaml"
+    AuthSession:
+      $ref: "./components/schemas/AuthSession.yaml"
+    Course:
+      $ref: "./components/schemas/Course.yaml"
+    ExampleSentence:
+      $ref: "./components/schemas/ExampleSentence.yaml"
+    ExampleSentencePersonalization:
+      $ref: "./components/schemas/ExampleSentencePersonalization.yaml"
+    GenerateExampleSentenceRequest:
+      $ref: "./components/schemas/GenerateExampleSentenceRequest.yaml"
+    LearningPath:
+      $ref: "./components/schemas/LearningPath.yaml"
+    LearnerProfile:
+      $ref: "./components/schemas/LearnerProfile.yaml"
+    Unit:
+      $ref: "./components/schemas/Unit.yaml"
+    VocabularyEntry:
+      $ref: "./components/schemas/VocabularyEntry.yaml"

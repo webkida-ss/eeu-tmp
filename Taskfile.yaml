@@ -1,0 +1,274 @@
+version: '3'
+
+tasks:
+  install:
+    cmds:
+      - cd frontend && pnpm install
+
+  # ====================================================================================
+  # Environment
+  # ====================================================================================
+  env:allow:
+    aliases:
+      - ea
+    cmds:
+      - direnv allow
+
+  # ====================================================================================
+  # Generate
+  # ====================================================================================
+  generate:backend:openapi:
+    aliases:
+      - gbo
+    cmds:
+      - bash scripts/generate-backend-openapi.sh
+
+  # ====================================================================================
+  # Run
+  # ====================================================================================
+  run:all:
+    aliases:
+      - run
+      - r
+      - ra
+    cmds:
+      - task run:backend
+      - task run:frontend
+
+  run:backend:
+    aliases:
+      - rb
+    deps:
+      - dynamodb:setup
+    env:
+      APP_PORT: '{{.APP_PORT | default "18080"}}'
+      CATALOG_REPOSITORY: '{{.CATALOG_REPOSITORY | default "dynamodb"}}'
+      DYNAMODB_TABLE_NAME: '{{.DYNAMODB_TABLE_NAME | default "english-local-learning-catalog"}}'
+      DYNAMODB_ENDPOINT: '{{.DYNAMODB_ENDPOINT | default "http://localhost:18000"}}'
+      DYNAMODB_LOCAL_PORT: '{{.DYNAMODB_LOCAL_PORT | default "18000"}}'
+      USER_REPOSITORY: '{{.USER_REPOSITORY | default "dynamodb"}}'
+      USER_DYNAMODB_TABLE_NAME: '{{.USER_DYNAMODB_TABLE_NAME | default "english-local-learning-catalog"}}'
+      AWS_REGION: '{{.AWS_REGION | default "ap-northeast-1"}}'
+      AWS_ACCESS_KEY_ID: '{{.AWS_ACCESS_KEY_ID | default "dummy"}}'
+      AWS_SECRET_ACCESS_KEY: '{{.AWS_SECRET_ACCESS_KEY | default "dummy"}}'
+      COGNITO_REGION: '{{.COGNITO_REGION | default "ap-northeast-1"}}'
+      COGNITO_USER_POOL_ID: '{{.COGNITO_USER_POOL_ID | default "ap-northeast-1_rkSuB16Vu"}}'
+      COGNITO_CLIENT_ID: '{{.COGNITO_CLIENT_ID | default "5m9endllggd3urihf6t8gd0k2r"}}'
+      COGNITO_HOSTED_UI_BASE_URL: '{{.COGNITO_HOSTED_UI_BASE_URL | default "https://vicente-calderon-dev-auth.auth.ap-northeast-1.amazoncognito.com"}}'
+      AI_MODEL_CATALOG_REPOSITORY: '{{.AI_MODEL_CATALOG_REPOSITORY | default "dynamodb"}}'
+      AI_MODEL_CATALOG_DYNAMODB_TABLE_NAME: '{{.AI_MODEL_CATALOG_DYNAMODB_TABLE_NAME | default "english-local-learning-catalog"}}'
+      AI_OPENAI_COMPATIBLE_ENDPOINT: '{{.AI_OPENAI_COMPATIBLE_ENDPOINT | default "https://api.openai.com/v1/chat/completions"}}'
+      AI_OPENAI_COMPATIBLE_API_KEY: '{{.AI_OPENAI_COMPATIBLE_API_KEY}}'
+    cmds:
+      - |
+        if command -v direnv >/dev/null 2>&1; then
+          direnv exec . bash -lc 'cd backend && cargo run'
+        else
+          echo "direnv is not installed; running with the current shell environment." >&2
+          cd backend && cargo run
+        fi
+
+  run:backend:dynamodb:
+    aliases:
+      - rbd
+    cmds:
+      - task run:backend
+
+  run:frontend:
+    aliases:
+      - rf
+    cmds:
+      - task run:frontend:api
+
+  run:frontend:api:
+    aliases:
+      - rfa
+    env:
+      PORT: '{{.FRONTEND_PORT | default "13000"}}'
+    cmds:
+      - cd frontend && pnpm dev:api
+
+  # ====================================================================================
+  # DynamoDB
+  # ====================================================================================
+  dynamodb:local:
+    aliases:
+      - ddl
+    env:
+      DYNAMODB_LOCAL_PORT: '{{.DYNAMODB_LOCAL_PORT | default "18000"}}'
+    cmds:
+      - bash scripts/start-local-dynamodb.sh
+
+  dynamodb:create-table:
+    aliases:
+      - ddct
+    deps:
+      - dynamodb:local
+    env:
+      DYNAMODB_ENDPOINT: '{{.DYNAMODB_ENDPOINT | default "http://localhost:18000"}}'
+    cmds:
+      - bash scripts/create-learning-catalog-table.sh
+
+  dynamodb:seed:
+    aliases:
+      - dds
+    deps:
+      - dynamodb:create-table
+    env:
+      DYNAMODB_ENDPOINT: '{{.DYNAMODB_ENDPOINT | default "http://localhost:18000"}}'
+    cmds:
+      - bash scripts/seed-learning-catalog-dynamodb.sh
+      - bash scripts/seed-ai-model-catalog-dynamodb.sh
+
+  dynamodb:show:
+    aliases:
+      - ddv
+    deps:
+      - dynamodb:local
+    env:
+      DYNAMODB_ENDPOINT: '{{.DYNAMODB_ENDPOINT | default "http://localhost:18000"}}'
+    cmds:
+      - bash scripts/show-learning-catalog-dynamodb.sh
+
+  dynamodb:setup:
+    aliases:
+      - dd
+    cmds:
+      - task dynamodb:seed
+
+  reading-assistant:dynamodb:create-table:
+    aliases:
+      - radct
+    deps:
+      - dynamodb:local
+    env:
+      DYNAMODB_ENDPOINT: '{{.DYNAMODB_ENDPOINT | default "http://localhost:18000"}}'
+      READING_ASSISTANT_DYNAMODB_TABLE_NAME: '{{.READING_ASSISTANT_DYNAMODB_TABLE_NAME | default "english-local-reading-assistant"}}'
+    cmds:
+      - bash scripts/create-reading-assistant-table.sh
+
+  reading-assistant:test:dynamodb:
+    aliases:
+      - ratd
+    deps:
+      - reading-assistant:dynamodb:create-table
+    env:
+      STORAGE_BACKEND: dynamodb
+      DYNAMODB_ENDPOINT: '{{.DYNAMODB_ENDPOINT | default "http://localhost:18000"}}'
+      READING_ASSISTANT_DYNAMODB_TABLE_NAME: '{{.READING_ASSISTANT_DYNAMODB_TABLE_NAME | default "english-local-reading-assistant"}}'
+    cmds:
+      - cd tools/reading-assistant/backend && .venv/bin/pytest test_dynamodb_storage.py -q
+
+  dynamodb:all:
+    aliases:
+      - dda
+      - ddb
+    cmds:
+      - task run:backend:dynamodb
+
+  # ====================================================================================
+  # Test
+  # ====================================================================================
+  test:all:
+    aliases:
+      - test
+      - t
+      - ta
+    cmds:
+      - task test:backend
+      - task test:frontend
+
+  test:backend:
+    aliases:
+      - tb
+    cmds:
+      - task test:backend:unit
+
+  test:backend:unit:
+    aliases:
+      - tbu
+    cmds:
+      - cd backend && cargo test
+
+  test:backend:integration:
+    aliases:
+      - tbi
+    cmds:
+      - bash scripts/test-backend-api.sh
+
+  test:backend:e2e:
+    aliases:
+      - tbe
+    cmds:
+      - cd backend && cargo test --test e2e
+
+  test:frontend:
+    aliases:
+      - tf
+    cmds:
+      - cd frontend && pnpm test
+
+  # ====================================================================================
+  # Infrastructure
+  # ====================================================================================
+  infra:dev:init:
+    aliases:
+      - idi
+    cmds:
+      - cd infra/envs/dev && terraform init
+
+  infra:dev:validate:
+    aliases:
+      - idv
+    cmds:
+      - cd infra/envs/dev && terraform init -backend=false
+      - cd infra/envs/dev && terraform validate
+
+  infra:dev:plan:
+    aliases:
+      - idp
+    cmds:
+      - cd infra/envs/dev && terraform plan
+
+  infra:dev:apply:
+    aliases:
+      - ida
+    cmds:
+      - cd infra/envs/dev && terraform apply
+
+  infra:prod:init:
+    aliases:
+      - ipi
+    cmds:
+      - cd infra/envs/prod && terraform init
+
+  infra:prod:validate:
+    aliases:
+      - ipv
+    cmds:
+      - cd infra/envs/prod && terraform init -backend=false
+      - cd infra/envs/prod && terraform validate
+
+  # ====================================================================================
+  # Clean
+  # ====================================================================================
+  clean:all:
+    aliases:
+      - clean
+      - c
+      - ca
+    cmds:
+      - task clean:backend
+      - task clean:dynamodb
+
+  clean:backend:
+    aliases:
+      - cb
+    cmds:
+      - rm -rf backend/target
+
+  clean:dynamodb:
+    aliases:
+      - cdd
+    cmds:
+      - bash scripts/clean-local-dynamodb.sh

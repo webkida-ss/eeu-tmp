@@ -1,0 +1,25 @@
+get:
+  operationId: getAuthSession
+  summary: Get the current auth session
+  security:
+    - BearerAuth: []
+  responses:
+    "200":
+      description: Current authenticated application session.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/AuthSession"
+          example:
+            authenticated: true
+            cognitoSub: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            appUserId: "0194fd38-7c2e-7a5a-8f2b-28b5d08a9f31"
+            email: "user@example.com"
+    "401":
+      description: Missing, invalid, or expired access token.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/AuthErrorResponse"
+          example:
+            message: "Unauthorized"

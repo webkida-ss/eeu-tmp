@@ -1,0 +1,35 @@
+post:
+  operationId: generateExampleSentence
+  summary: Generate a personalized example sentence
+  security:
+    - BearerAuth: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: "../openapi.yaml#/components/schemas/GenerateExampleSentenceRequest"
+  responses:
+    "200":
+      description: Personalized example sentence.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/ExampleSentence"
+          example:
+            id: "018f3f9c-7d3b-7a8a-b4e2-8f4a4a0b0001"
+            targetText: "apply"
+            targetSentence: "I applied for a new job yesterday."
+            sourceTranslation: "私は昨日、新しい仕事に応募しました。"
+            variant: "personalized"
+            personalization:
+              contextSummary: "The learner works in an office."
+            usageNote: "Use apply for jobs, schools, and programs."
+    "401":
+      description: Authentication required.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/AuthErrorResponse"
+          example:
+            message: "Unauthorized"

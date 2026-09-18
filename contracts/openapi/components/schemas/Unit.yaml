@@ -1,0 +1,25 @@
+type: object
+required:
+  - id
+  - title
+  - description
+  - targetSkill
+  - durationMinutes
+  - vocabularyEntries
+properties:
+  id:
+    type: string
+  title:
+    type: string
+  description:
+    type: string
+  targetSkill:
+    type: string
+  durationMinutes:
+    type: integer
+    minimum: 0
+  vocabularyEntries:
+    type: array
+    items:
+      $ref: "./VocabularyEntry.yaml"
+additionalProperties: false

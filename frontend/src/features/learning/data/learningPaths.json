@@ -1,0 +1,234 @@
+[
+  {
+    "id": "toeic",
+    "title": "TOEIC",
+    "tagline": "Score-focused vocabulary in practical business contexts.",
+    "description": "Build the vocabulary and expressions that appear often in TOEIC reading and listening tasks.",
+    "audience": "Learners who want a clear exam-oriented entry point while still learning words through context.",
+    "courses": [
+      {
+        "id": "starter",
+        "title": "TOEIC Starter",
+        "levelLabel": "First TOEIC course",
+        "description": "Start with common office verbs, nouns, and short expressions that make TOEIC passages easier to read.",
+        "outcome": "Recognize basic workplace vocabulary and understand short business sentences.",
+        "estimatedHours": 4,
+        "units": [
+          {
+            "id": "basic-business-verbs-01",
+            "title": "Basic Business Verbs 01",
+            "description": "Core action verbs that appear in announcements, emails, and short notices.",
+            "targetSkill": "Understand common business actions",
+            "durationMinutes": 8,
+            "vocabularyEntries": [
+              {
+                "id": "apply",
+                "targetText": "apply",
+                "kind": "word",
+                "sourceMeaning": "応募する、申請する。ルールなどを適用する意味でも使う。",
+                "targetExampleSentence": "Please apply for the position by Friday.",
+                "sourceExampleTranslation": "金曜日までにその職種へ応募してください。",
+                "progressStatus": "remembered",
+                "exampleSentences": [
+                  {
+                    "id": "019730f0-8b95-7f7d-9f65-bf5e18c7b5a1",
+                    "targetText": "apply",
+                    "targetSentence": "I applied the new vocabulary to a short email about my work.",
+                    "sourceTranslation": "私は仕事に関する短いメールに新しい語彙を応用しました。",
+                    "variant": "personalized",
+                    "personalization": {
+                      "contextSummary": "Workplace email practice context."
+                    },
+                    "usageNote": "Use apply when putting knowledge, rules, or skills into practice."
+                  }
+                ]
+              },
+              {
+                "id": "attend",
+                "targetText": "attend",
+                "kind": "word",
+                "sourceMeaning": "会議・イベント・授業などに出席する。",
+                "targetExampleSentence": "All team members must attend the safety meeting.",
+                "sourceExampleTranslation": "すべてのチームメンバーは安全会議に出席しなければなりません。",
+                "progressStatus": "learning"
+              },
+              {
+                "id": "confirm",
+                "targetText": "confirm",
+                "kind": "word",
+                "sourceMeaning": "予約・予定・内容などが正しいことを確認する。",
+                "targetExampleSentence": "Please confirm your reservation by email.",
+                "sourceExampleTranslation": "メールで予約内容を確認してください。",
+                "progressStatus": "notStarted"
+              }
+            ]
+          },
+          {
+            "id": "office-nouns-01",
+            "title": "Office Nouns 01",
+            "description": "Basic nouns used in schedules, applications, invoices, and workplace notices.",
+            "targetSkill": "Read short office-related passages",
+            "durationMinutes": 8,
+            "vocabularyEntries": [
+              {
+                "id": "department",
+                "targetText": "department",
+                "kind": "word",
+                "sourceMeaning": "会社や組織の部署、部門。",
+                "targetExampleSentence": "The marketing department moved to the third floor.",
+                "sourceExampleTranslation": "マーケティング部は3階へ移動しました。",
+                "progressStatus": "remembered"
+              },
+              {
+                "id": "applicant",
+                "targetText": "applicant",
+                "kind": "word",
+                "sourceMeaning": "仕事や制度などに応募・申請する人。",
+                "targetExampleSentence": "Each applicant should bring a copy of their resume.",
+                "sourceExampleTranslation": "各応募者は履歴書のコピーを持参してください。",
+                "progressStatus": "learning"
+              },
+              {
+                "id": "in-charge-of",
+                "targetText": "in charge of",
+                "kind": "phrase",
+                "sourceMeaning": "何かを担当している、責任を持っている。",
+                "targetExampleSentence": "Ms. Lee is in charge of the training schedule.",
+                "sourceExampleTranslation": "Leeさんは研修スケジュールを担当しています。",
+                "progressStatus": "notStarted"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "600",
+        "title": "TOEIC 600",
+        "levelLabel": "Core score builder",
+        "description": "Practice high-frequency vocabulary and sentence patterns for reaching the 600 range.",
+        "outcome": "Understand common TOEIC business contexts and answer straightforward vocabulary questions.",
+        "estimatedHours": 6,
+        "units": [
+          {
+            "id": "frequent-verbs-01",
+            "title": "Frequent Verbs 01",
+            "description": "Verbs that often drive the meaning of TOEIC questions and email passages.",
+            "targetSkill": "Identify key actions in business sentences",
+            "durationMinutes": 10,
+            "vocabularyEntries": [
+              {
+                "id": "provide",
+                "targetText": "provide",
+                "kind": "word",
+                "sourceMeaning": "必要なものやサービスを提供する。",
+                "targetExampleSentence": "The hotel will provide free shuttle service.",
+                "sourceExampleTranslation": "そのホテルは無料シャトルサービスを提供します。",
+                "progressStatus": "remembered"
+              },
+              {
+                "id": "determine",
+                "targetText": "determine",
+                "kind": "word",
+                "sourceMeaning": "事実や状況を確認したうえで決定する、判断する。",
+                "targetExampleSentence": "The manager will determine the final schedule.",
+                "sourceExampleTranslation": "マネージャーが最終スケジュールを決定します。",
+                "progressStatus": "learning"
+              },
+              {
+                "id": "put-off",
+                "targetText": "put off",
+                "kind": "phrasalVerb",
+                "sourceMeaning": "予定や作業を延期する。",
+                "targetExampleSentence": "The meeting was put off until next Tuesday.",
+                "sourceExampleTranslation": "会議は次の火曜日まで延期されました。",
+                "progressStatus": "notStarted"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "730",
+        "title": "TOEIC 730",
+        "levelLabel": "Business reading upgrade",
+        "description": "Move beyond basic recognition and learn vocabulary used in operations, decisions, and paraphrases.",
+        "outcome": "Read medium-length business passages with fewer vocabulary blockers.",
+        "estimatedHours": 8,
+        "units": [
+          {
+            "id": "business-operations-01",
+            "title": "Business Operations 01",
+            "description": "Operational verbs used when companies change plans, negotiate, or approve work.",
+            "targetSkill": "Follow business process updates",
+            "durationMinutes": 10,
+            "vocabularyEntries": [
+              {
+                "id": "implement",
+                "targetText": "implement",
+                "kind": "word",
+                "sourceMeaning": "計画・制度・変更などを実施する、導入する。",
+                "targetExampleSentence": "The company will implement the new policy next month.",
+                "sourceExampleTranslation": "その会社は来月、新しい方針を導入します。",
+                "progressStatus": "learning"
+              },
+              {
+                "id": "negotiate",
+                "targetText": "negotiate",
+                "kind": "word",
+                "sourceMeaning": "合意に向けて交渉する、話し合う。",
+                "targetExampleSentence": "The purchasing team negotiated a lower price with the supplier.",
+                "sourceExampleTranslation": "購買チームは仕入先とより低い価格を交渉しました。",
+                "progressStatus": "notStarted"
+              },
+              {
+                "id": "authorize",
+                "targetText": "authorize",
+                "kind": "word",
+                "sourceMeaning": "公式に許可する、承認する。",
+                "targetExampleSentence": "Only the branch manager can authorize large refunds.",
+                "sourceExampleTranslation": "高額な返金を承認できるのは支店長だけです。",
+                "progressStatus": "notStarted"
+              }
+            ]
+          },
+          {
+            "id": "reading-paraphrase-01",
+            "title": "Reading Paraphrase 01",
+            "description": "Words that often appear as paraphrases between questions and passages.",
+            "targetSkill": "Connect questions with rephrased passage details",
+            "durationMinutes": 12,
+            "vocabularyEntries": [
+              {
+                "id": "purchase",
+                "targetText": "purchase",
+                "kind": "word",
+                "sourceMeaning": "購入する。buyより少しフォーマルな表現。",
+                "targetExampleSentence": "Customers who purchase two items will receive a discount.",
+                "sourceExampleTranslation": "2点購入したお客様は割引を受けられます。",
+                "progressStatus": "notStarted"
+              },
+              {
+                "id": "obtain",
+                "targetText": "obtain",
+                "kind": "word",
+                "sourceMeaning": "努力や手続きを通じて入手する、取得する。",
+                "targetExampleSentence": "Employees must obtain approval before booking international travel.",
+                "sourceExampleTranslation": "従業員は海外出張を予約する前に承認を得る必要があります。",
+                "progressStatus": "notStarted"
+              },
+              {
+                "id": "as-soon-as-possible",
+                "targetText": "as soon as possible",
+                "kind": "expression",
+                "sourceMeaning": "できるだけ早く。略してASAPとも言う。",
+                "targetExampleSentence": "Please send the updated invoice as soon as possible.",
+                "sourceExampleTranslation": "更新済みの請求書をできるだけ早く送ってください。",
+                "progressStatus": "notStarted"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

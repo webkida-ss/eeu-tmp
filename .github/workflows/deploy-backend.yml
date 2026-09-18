@@ -1,0 +1,15 @@
+name: Deploy Backend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-backend:
+    name: Deploy backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "Backend deploy workflow is not implemented yet."

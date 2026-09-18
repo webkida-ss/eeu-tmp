@@ -1,0 +1,38 @@
+type: object
+required:
+  - id
+  - targetText
+  - kind
+  - sourceMeaning
+  - targetExampleSentence
+  - sourceExampleTranslation
+properties:
+  id:
+    type: string
+  targetText:
+    type: string
+  kind:
+    type: string
+    enum:
+      - word
+      - phrase
+      - idiom
+      - phrasalVerb
+      - expression
+  sourceMeaning:
+    type: string
+  targetExampleSentence:
+    type: string
+  sourceExampleTranslation:
+    type: string
+  progressStatus:
+    type: string
+    enum:
+      - notStarted
+      - learning
+      - remembered
+  exampleSentences:
+    type: array
+    items:
+      $ref: "./ExampleSentence.yaml"
+additionalProperties: false

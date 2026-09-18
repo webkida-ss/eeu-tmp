@@ -1,0 +1,8 @@
+type: object
+properties:
+  contextSummary:
+    type: string
+  personalizedFromUserContextAt:
+    type: string
+    format: date-time
+additionalProperties: false

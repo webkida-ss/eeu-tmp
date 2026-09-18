@@ -1,0 +1,56 @@
+get:
+  operationId: getLearnerProfile
+  summary: Get the current learner profile
+  security:
+    - BearerAuth: []
+  responses:
+    "200":
+      description: Current learner profile.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/LearnerProfile"
+          example:
+            learningPurpose: "Speak more naturally while traveling."
+            targetLevel: "CEFR B1"
+            deadline: "Before my summer trip"
+            interests: "Coffee shops, baseball, and indie games."
+            favoriteContent: "Travel videos and casual podcasts."
+            dailyScenes: "Commuting, shopping, and short work chats."
+            englishUseCases: "Ordering food and casual small talk."
+            weakPoints: "Prepositions and tense."
+            vocabularyFocus: "Phrasal verbs and travel adjectives."
+    "401":
+      description: Missing, invalid, or expired access token.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/AuthErrorResponse"
+          example:
+            message: "Unauthorized"
+put:
+  operationId: putLearnerProfile
+  summary: Save the current learner profile
+  security:
+    - BearerAuth: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: "../openapi.yaml#/components/schemas/LearnerProfile"
+  responses:
+    "200":
+      description: Saved learner profile.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/LearnerProfile"
+    "401":
+      description: Missing, invalid, or expired access token.
+      content:
+        application/json:
+          schema:
+            $ref: "../openapi.yaml#/components/schemas/AuthErrorResponse"
+          example:
+            message: "Unauthorized"

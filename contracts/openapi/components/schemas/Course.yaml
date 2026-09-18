@@ -1,0 +1,28 @@
+type: object
+required:
+  - id
+  - title
+  - levelLabel
+  - description
+  - outcome
+  - estimatedHours
+  - units
+properties:
+  id:
+    type: string
+  title:
+    type: string
+  levelLabel:
+    type: string
+  description:
+    type: string
+  outcome:
+    type: string
+  estimatedHours:
+    type: integer
+    minimum: 0
+  units:
+    type: array
+    items:
+      $ref: "./Unit.yaml"
+additionalProperties: false

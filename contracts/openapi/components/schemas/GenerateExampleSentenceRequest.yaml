@@ -1,0 +1,12 @@
+type: object
+required:
+  - targetText
+  - userContextSummary
+properties:
+  targetText:
+    type: string
+    minLength: 1
+  userContextSummary:
+    type: string
+    minLength: 1
+additionalProperties: false

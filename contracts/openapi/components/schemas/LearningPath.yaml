@@ -1,0 +1,24 @@
+type: object
+required:
+  - id
+  - title
+  - tagline
+  - description
+  - audience
+  - courses
+properties:
+  id:
+    type: string
+  title:
+    type: string
+  tagline:
+    type: string
+  description:
+    type: string
+  audience:
+    type: string
+  courses:
+    type: array
+    items:
+      $ref: "./Course.yaml"
+additionalProperties: false

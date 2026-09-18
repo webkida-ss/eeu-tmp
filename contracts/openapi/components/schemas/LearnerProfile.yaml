@@ -1,0 +1,34 @@
+type: object
+required:
+  - learningPurpose
+  - targetLevel
+  - deadline
+  - interests
+  - favoriteContent
+  - dailyScenes
+  - englishUseCases
+  - weakPoints
+  - vocabularyFocus
+properties:
+  learningPurpose:
+    type: string
+  targetLevel:
+    type: string
+  deadline:
+    type: string
+  interests:
+    type: string
+  favoriteContent:
+    type: string
+  dailyScenes:
+    type: string
+  englishUseCases:
+    type: string
+  weakPoints:
+    type: string
+  vocabularyFocus:
+    type: string
+  updatedAt:
+    type: string
+    format: date-time
+additionalProperties: false

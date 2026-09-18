@@ -1,0 +1,165 @@
+# =============================================================================
+# OS
+# =============================================================================
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon
+
+# Windows
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# Tools
+# =============================================================================
+
+# Cursor (project settings are tracked; ignore only local/generated files)
+.cursor/logs/
+.cursor/chat/
+
+# Claude (project settings are tracked; ignore only local/generated files)
+.claude/logs/
+
+# Codex (project settings are tracked; ignore only local/generated files)
+.codex/logs/
+
+# JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+.fleet/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+
+# =============================================================================
+# Environment variables
+# =============================================================================
+.env
+.env.*
+!.env.example
+!.env.template
+
+# =============================================================================
+# Logs
+# =============================================================================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =============================================================================
+# Temporary files
+# =============================================================================
+*.tmp
+*.temp
+.temp/
+.tmp/
+.cache/
+
+# =============================================================================
+# Backend
+# =============================================================================
+
+# Go
+/bin/
+/vendor/
+*.exe
+*.test
+*.out
+
+# Rust
+target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+*.so
+
+# =============================================================================
+# Frontend
+# =============================================================================
+
+# Node
+node_modules/
+
+# TypeScript
+*.tsbuildinfo
+
+# Nuxt
+.nuxt/
+.output/
+.data/
+.nitro/
+
+# Next.js
+.next/
+next-env.d.ts
+
+# Vercel
+.vercel
+
+# Build outputs
+build/
+out/
+dist/
+dist-ssr/
+coverage/
+
+# Certificates
+*.pem
+
+# =============================================================================
+# Infra
+# =============================================================================
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+override.tf
+override.tf.json
+
+# AWS
+.aws-sam/
+samconfig.toml
+
+# Supabase
+supabase/.branches/
+supabase/.temp/
+
+# Firebase
+.firebase/
+firebase-debug.log
+.firebaserc

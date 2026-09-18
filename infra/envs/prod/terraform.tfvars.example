@@ -1,0 +1,13 @@
+google_client_id     = "replace-with-google-oauth-client-id"
+google_client_secret = "replace-with-google-oauth-client-secret"
+
+auth_callback_urls = [
+  "https://example.com/auth/callback",
+]
+
+auth_logout_urls = [
+  "https://example.com/auth/logout",
+]
+
+# Optional. Must be unique in the AWS region.
+# cognito_domain_prefix = "vicente-calderon-prod-auth"

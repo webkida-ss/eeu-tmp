@@ -1,0 +1,39 @@
+get:
+  operationId: getLearningPaths
+  summary: List learning paths
+  responses:
+    "200":
+      description: Learning paths.
+      content:
+        application/json:
+          schema:
+            type: array
+            items:
+              $ref: "../components/schemas/LearningPath.yaml"
+          example:
+            - id: toeic
+              title: TOEIC
+              tagline: Score-focused vocabulary in practical business contexts.
+              description: Build the vocabulary and expressions that appear often in TOEIC reading and listening tasks.
+              audience: Learners who want a clear exam-oriented entry point while still learning words through context.
+              courses:
+                - id: starter
+                  title: TOEIC Starter
+                  levelLabel: First TOEIC course
+                  description: Start with common office verbs, nouns, and short expressions that make TOEIC passages easier to read.
+                  outcome: Recognize basic workplace vocabulary and understand short business sentences.
+                  estimatedHours: 4
+                  units:
+                    - id: basic-business-verbs-01
+                      title: Basic Business Verbs 01
+                      description: Core action verbs that appear in announcements, emails, and short notices.
+                      targetSkill: Understand common business actions
+                      durationMinutes: 8
+                      vocabularyEntries:
+                        - id: apply
+                          targetText: apply
+                          kind: word
+                          sourceMeaning: 応募する、申請する。ルールなどを適用する意味でも使う。
+                          targetExampleSentence: Please apply for the position by Friday.
+                          sourceExampleTranslation: 金曜日までにその職種へ応募してください。
+                          progressStatus: remembered

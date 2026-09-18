@@ -1,0 +1,43 @@
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm dev:mock",
+    "dev:json": "dotenv -e .env.json -- next dev -p 13000",
+    "dev:mock": "concurrently -n prism,next -c cyan,green \"pnpm mock:api\" \"dotenv -e .env.mock -- next dev -p 13000\"",
+    "dev:api": "dotenv -e .env.api -- next dev -p 13000",
+    "generate:api": "openapi-ts",
+    "mock:api": "nodemon --watch ../contracts/openapi --ext yaml,yml --exec \"prism mock ../contracts/openapi/openapi.yaml --host 0.0.0.0 --port 14010\"",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "next": "16.2.6",
+    "oidc-client-ts": "^3.5.0",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "^0.97.3",
+    "@stoplight/prism-cli": "^5.15.10",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "concurrently": "^10.0.0",
+    "dotenv-cli": "^11.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "nodemon": "^3.1.14",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "pnpm": {
+    "overrides": {
+      "@faker-js/faker": "5.5.3"
+    }
+  },
+  "packageManager": "pnpm@9.12.0+sha512.4abf725084d7bcbafbd728bfc7bee61f2f791f977fd87542b3579dcb23504d170d46337945e4c66485cd12d588a0c0e570ed9c477e7ccdd8507cf05f3f92eaca"
+}
