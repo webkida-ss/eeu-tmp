@@ -1,0 +1,15 @@
+{
+  "name": "untangle-repository-tools",
+  "private": true,
+  "scripts": {
+    "setup:agents": "npm ci --ignore-scripts",
+    "agents:preflight": "python3 scripts/check_agent_config.py --preflight",
+    "agents:generate": "python3 scripts/check_agent_config.py --generate",
+    "agents:check": "python3 scripts/check_agent_config.py --preflight && rulesync generate --check && python3 scripts/check_agent_config.py --postflight"
+  },
+  "devDependencies": {
+    "@playwright/mcp": "0.0.78",
+    "@upstash/context7-mcp": "3.2.4",
+    "rulesync": "14.0.1"
+  }
+}

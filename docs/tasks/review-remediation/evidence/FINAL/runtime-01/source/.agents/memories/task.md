@@ -1,0 +1,46 @@
+# Taskfile Conventions
+
+Use `Taskfile.yaml` as the project command entry point.
+
+## Sections
+
+Group tasks with comment-based section dividers.
+
+```yaml
+# ====================================================================================
+# Run
+# ====================================================================================
+```
+
+## Small Commands
+
+Prefer small, focused tasks such as `run:backend`, `test:backend:unit`, or `dynamodb:seed`.
+
+Do not hide unrelated work inside one task. Split setup, run, test, seed, and clean steps into separate commands.
+
+## Composite Commands
+
+Create composite tasks by calling smaller tasks with `task <name>`.
+
+```yaml
+run:all:
+  cmds:
+    - task run:backend
+    - task run:frontend
+```
+
+Use composite commands for common workflows such as `run:all`, `test:all`, `dynamodb:setup`, and `clean:all`.
+
+## Aliases
+
+Add short aliases for frequently used tasks.
+
+```yaml
+run:backend:
+  aliases:
+    - rb
+  cmds:
+    - cd backend && cargo run
+```
+
+Keep aliases short, memorable, and consistent with the task name.

@@ -1,0 +1,141 @@
+name: Nightly Automation
+
+on:
+  schedule:
+    - cron: "27 17 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-automation
+  cancel-in-progress: false
+
+jobs:
+  nightly-tests:
+    name: DynamoDB and browser lifecycle
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local@sha256:d89f8fcc6b1a39cb35976c248ed42a28c66ae00dc043099210f5571e42648ab4
+        ports:
+          - 8000:8000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bootstrap managed tools
+        run: ./scripts/bootstrap.sh
+
+      - name: Run canonical setup
+        run: ./scripts/bootstrap.sh --exec task setup
+
+      - name: Install managed Playwright Chromium
+        run: ./scripts/bootstrap.sh --exec task setup:browser
+
+      - name: Run required DynamoDB integration tests
+        env:
+          DYNAMODB_INTEGRATION_ENDPOINT: http://localhost:8000
+        run: ./scripts/bootstrap.sh --exec task test:backend:integration
+
+      - name: Run browser smoke
+        run: ./scripts/bootstrap.sh --exec task test:extension:smoke
+
+      - name: Run browser lifecycle automation
+        run: ./scripts/bootstrap.sh --exec task test:extension:automation:lifecycle
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nightly-playwright-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/playwright/
+          if-no-files-found: warn
+          retention-days: 14
+
+  notify:
+    name: Update nightly failure issue
+    if: always()
+    needs: nightly-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Reconcile deduplicated nightly issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          NIGHTLY_RESULT: ${{ needs.nightly-tests.result }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = "[automation] Nightly repository checks failed";
+            const marker = "<!-- untangle-nightly-automation -->";
+            const result = process.env.NIGHTLY_RESULT;
+            const runUrl =
+              `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              "The scheduled repository checks require attention.",
+              "",
+              `Status: ${result}`,
+              `Run: ${runUrl}`,
+              "",
+              "This issue intentionally contains no workflow logs.",
+            ].join("\n");
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "all",
+              per_page: 100,
+            });
+            const matches = issues
+              .filter(
+                (issue) =>
+                  !issue.pull_request &&
+                  issue.title === title &&
+                  issue.user?.login === "github-actions[bot]" &&
+                  issue.body?.includes(marker),
+              )
+              .sort((left, right) => {
+                if (left.state !== right.state) {
+                  return left.state === "open" ? -1 : 1;
+                }
+                return left.number - right.number;
+              });
+            const issue = matches[0];
+            if (matches.length > 1) {
+              core.warning(
+                `Found ${matches.length} bot-authored marked issues; ` +
+                  `reconciling #${issue.number} only.`,
+              );
+            }
+
+            if (result === "success") {
+              if (issue?.state === "open") {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: "closed",
+                  body,
+                });
+              }
+              return;
+            }
+
+            if (issue) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: "open",
+                body,
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }

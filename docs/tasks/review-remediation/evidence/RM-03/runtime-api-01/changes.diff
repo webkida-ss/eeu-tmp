@@ -1,0 +1,737 @@
+diff --git a/extension/test/smoke.mjs b/extension/test/smoke.mjs
+index 7c0b22d..b47ed13 100644
+--- a/extension/test/smoke.mjs
++++ b/extension/test/smoke.mjs
+@@ -6,6 +6,7 @@
+ //   extension/node_modules/.bin/playwright install chromium
+ //
+ // Usage: npm run test:smoke
++/* global activePageUrl:writable, cachedActivePreload, clearCachedActivePreload, refreshPreloadStatus, startPreload, syncReadingViewUi, waitForReadingPanelApi:writable */
+ import { createServer } from 'node:http';
+ import {
+   mkdirSync,
+@@ -30,6 +31,96 @@ const ARTIFACT_ROOT = join(REPOSITORY_ROOT, 'output', 'playwright');
+ mkdirSync(ARTIFACT_ROOT, { recursive: true });
+ const ARTIFACT_DIR = mkdtempSync(join(ARTIFACT_ROOT, 'smoke-'));
+ let fixtureBaseUrl;
++let preloadEndpointController = null;
++
++function normalizeFixturePageUrl(pageUrl) {
++  const normalized = new URL(pageUrl);
++  normalized.hash = '';
++  return normalized.toString().replace(/\/$/, '');
++}
++
++function fixtureUrlPattern(pageUrl) {
++  const normalized = new URL(normalizeFixturePageUrl(pageUrl));
++  return `${normalized.origin}${normalized.pathname === '/' ? '/*' : `${normalized.pathname}*`}`;
++}
++
++function createPreloadRequestGate(matches = () => true) {
++  let releaseRequest;
++  let signalRequestStarted;
++  const released = new Promise((resolve) => {
++    releaseRequest = resolve;
++  });
++  return {
++    matches,
++    matchCount: 0,
++    used: false,
++    started: new Promise((resolve) => {
++      signalRequestStarted = resolve;
++    }),
++    async wait() {
++      signalRequestStarted();
++      await released;
++    },
++    release() {
++      releaseRequest();
++    },
++  };
++}
++
++async function waitForPreloadRequestGate(gate, description, timeoutMs = 5000) {
++  let timeout;
++  try {
++    await Promise.race([
++      gate.started,
++      new Promise((_, reject) => {
++        timeout = setTimeout(
++          () => reject(new Error(`Timed out waiting for ${description}`)),
++          timeoutMs,
++        );
++      }),
++    ]);
++  } finally {
++    clearTimeout(timeout);
++  }
++}
++
++async function getContentPing(worker, pageUrl) {
++  for (let attempt = 0; attempt < 20; attempt += 1) {
++    const ping = await worker.evaluate(async (url) => {
++      const [tab] = await chrome.tabs.query({ url });
++      if (!tab?.id) return null;
++      try {
++        return { tabId: tab.id, response: await chrome.tabs.sendMessage(tab.id, { type: 'PING' }) };
++      } catch {
++        return null;
++      }
++    }, fixtureUrlPattern(pageUrl));
++    if (ping?.response?.ok) return ping;
++    await new Promise((resolve) => setTimeout(resolve, 50));
++  }
++  throw new Error(`Content script did not answer PING for ${pageUrl}`);
++}
++
++async function respondToPreloadRequest(req, res) {
++  const method = req.method === 'POST' ? 'post' : 'get';
++  const controller = preloadEndpointController;
++  const countKey = `${method}RequestCount`;
++  const count = (controller?.[countKey] || 0) + 1;
++  if (controller) controller[countKey] = count;
++
++  const gate = controller?.[`${method}Gate`];
++  const matchesGate = Boolean(gate?.matches(req));
++  if (matchesGate) gate.matchCount += 1;
++  if (gate && !gate.used && matchesGate) {
++    gate.used = true;
++    await gate.wait();
++  }
++
++  const response = controller?.[`${method}Response`];
++  const body = typeof response === 'function' ? response(req, count) : response || { ready: false };
++  res.writeHead(method === 'post' ? 202 : 200, { 'Content-Type': 'application/json' });
++  res.end(JSON.stringify(body));
++}
+ 
+ function hasForcedColorsFocusFallback(cssFile, selector) {
+   const css = readFileSync(join(EXT_DIR, cssFile), 'utf8');
+@@ -62,7 +153,7 @@ const PAGE_HTML = `<!doctype html>
+ </body></html>`;
+ 
+ let billingScenario = 'downgrade';
+-const server = createServer((req, res) => {
++const server = createServer(async (req, res) => {
+   if (req.url === '/auth/config') {
+     res.writeHead(200, { 'Content-Type': 'application/json' });
+     res.end(JSON.stringify({ provider: 'mock' }));
+@@ -79,8 +170,7 @@ const server = createServer((req, res) => {
+     return;
+   }
+   if (req.url?.startsWith('/pages/preload')) {
+-    res.writeHead(200, { 'Content-Type': 'application/json' });
+-    res.end(JSON.stringify({ ready: false }));
++    await respondToPreloadRequest(req, res);
+     return;
+   }
+   if (req.url === '/billing/me') {
+@@ -578,6 +668,584 @@ async function runSmokeTest() {
+     errors.push(`quota warning accessibility contract failed: ${JSON.stringify(quotaState)}`);
+   }
+ 
++  // RM-03: a stale worker envelope must not mutate a live content document,
++  // and a panel must not mount account A data after account B replaces it.
++  const rm03Isolation = await worker.evaluate(async (pattern) => {
++    const [tab] = await chrome.tabs.query({ url: pattern });
++    const scope = await chrome.storage.local.get('authSession');
++    const authScope = {
++      userId: scope.authSession.user.id,
++      loginId: scope.authSession.loginId,
++    };
++    const preload = {
++      id: 'rm03-private-preload',
++      page_url: tab.url.replace(/\/$/, ''),
++      sentences: [
++        { id: 'rm03-sentence', index: 0, text: 'Private reading sentence.', analysis: {} },
++      ],
++    };
++    const staleResponse = await chrome.tabs.sendMessage(tab.id, {
++      type: 'SHOW_SENTENCE_PANEL',
++      payload: {
++        preload,
++        pageUrl: preload.page_url,
++        authScope,
++        documentNonce: 'stale-smoke-document',
++      },
++    });
++    const [contentState] = await chrome.scripting.executeScript({
++      target: { tabId: tab.id },
++      func: () => Boolean(globalThis.activePreload),
++    });
++    return { staleResponse, contentMutated: contentState.result };
++  }, `${fixtureBaseUrl}/*`);
++  if (rm03Isolation.staleResponse?.ok || rm03Isolation.contentMutated) {
++    errors.push(`RM03 stale-document delivery mutated content: ${JSON.stringify(rm03Isolation)}`);
++  }
++
++  const rm03PanelSwitch = await panel.evaluate(async (pageUrl) => {
++    const accountA = {
++      accessToken: 'account-a-token',
++      user: { id: 'account-a' },
++      loginId: 'account-a-login',
++    };
++    const preload = {
++      id: 'rm03-panel-preload',
++      page_url: pageUrl,
++      sentences: [
++        { id: 'rm03-panel-sentence', index: 0, text: 'Account A sentence.', analysis: {} },
++      ],
++    };
++    await chrome.storage.local.set({ authSession: accountA });
++    const scopeA = await getAuthScope();
++    await setReadingSession(
++      {
++        pageUrl,
++        pageTitle: 'Account A article',
++        preload,
++        domLinkStatus: {},
++        ui: {},
++        updatedAt: Date.now(),
++      },
++      scopeA,
++    );
++    await chrome.storage.local.set({
++      authSession: {
++        accessToken: 'account-b-token',
++        user: { id: 'account-b' },
++        loginId: 'account-b-login',
++      },
++    });
++    await new Promise((resolve) => setTimeout(resolve, 0));
++    const mounted = await syncReadingViewUi({
++      preload,
++      pageTitle: 'Account A article',
++      authScope: scopeA,
++    });
++    return {
++      mounted,
++      cached: Boolean(cachedActivePreload),
++      visible: document.getElementById('readingPanelRoot')?.hidden === false,
++    };
++  }, `${fixtureBaseUrl}`);
++  if (rm03PanelSwitch.mounted || rm03PanelSwitch.cached || rm03PanelSwitch.visible) {
++    errors.push(`RM03 account switch mounted stale panel data: ${JSON.stringify(rm03PanelSwitch)}`);
++  }
++  await worker.evaluate(async () => {
++    const storage = await chrome.storage.local.get(null);
++    const privateSessionKeys = Object.keys(storage).filter((key) =>
++      key.startsWith('eraReadingSession:'),
++    );
++    if (privateSessionKeys.length) await chrome.storage.local.remove(privateSessionKeys);
++  });
++
++  const readyPreload = (id, pageUrl) => ({
++    ready: true,
++    preload: {
++      id,
++      page_url: pageUrl,
++      sentences: [
++        { id: `${id}-sentence`, index: 0, text: 'Private reading sentence.', analysis: {} },
++      ],
++    },
++  });
++
++  // RM-03: hold the real worker POST and poll requests. A navigation to a
++  // different origin must prevent the captured document from receiving data.
++  const originalArticleUrl = normalizeFixturePageUrl(page.url());
++  const crossOriginArticleUrl = normalizeFixturePageUrl(
++    originalArticleUrl.replace('127.0.0.1', 'localhost'),
++  );
++  const originalContent = await getContentPing(worker, originalArticleUrl);
++  const navigationPostGate = createPreloadRequestGate();
++  const navigationPollGate = createPreloadRequestGate(
++    (request) =>
++      normalizeFixturePageUrl(new URL(request.url, fixtureBaseUrl).searchParams.get('page_url')) ===
++      originalArticleUrl,
++  );
++  preloadEndpointController = {
++    postGate: navigationPostGate,
++    getGate: navigationPollGate,
++    postResponse: { status: 'processing' },
++    getResponse: readyPreload('rm03-navigation-preload', originalArticleUrl),
++  };
++  let navigationCompletion;
++  let navigationState;
++  try {
++    navigationCompletion = panel.evaluate(
++      (tabId) => chrome.runtime.sendMessage({ type: 'START_PRELOAD', payload: { tabId } }),
++      originalContent.tabId,
++    );
++    await waitForPreloadRequestGate(navigationPostGate, 'RM03 worker submission');
++    await page.goto(crossOriginArticleUrl);
++    const crossOriginContent = await getContentPing(worker, crossOriginArticleUrl);
++    navigationPostGate.release();
++    await waitForPreloadRequestGate(navigationPollGate, 'RM03 worker poll');
++    navigationPollGate.release();
++    await navigationCompletion;
++    navigationState = await worker.evaluate(async () => {
++      const storage = await chrome.storage.local.get(null);
++      return {
++        privateSessions: Object.keys(storage).filter((key) => key.startsWith('eraReadingSession:')),
++      };
++    });
++    navigationState.documentReplaced =
++      crossOriginContent.response.documentNonce !== originalContent.response.documentNonce;
++    navigationState.postRequests = preloadEndpointController.postRequestCount || 0;
++    navigationState.pollRequests = navigationPollGate.matchCount;
++  } finally {
++    navigationPostGate.release();
++    navigationPollGate.release();
++    preloadEndpointController = null;
++    await navigationCompletion?.catch(() => {});
++  }
++  if (
++    !navigationState.documentReplaced ||
++    navigationState.privateSessions.length ||
++    navigationState.postRequests !== 1 ||
++    navigationState.pollRequests < 1
++  ) {
++    errors.push(
++      `RM03 cross-origin completion leaked private data: ${JSON.stringify(navigationState)}`,
++    );
++  }
++
++  // RM-03: account replacement during a real worker poll must prevent both
++  // delivery and scoped persistence of the original account's response.
++  const accountA = {
++    accessToken: 'rm03-account-a-token',
++    user: { id: 'rm03-account-a' },
++    loginId: 'rm03-account-a-login',
++  };
++  const accountB = {
++    accessToken: 'rm03-account-b-token',
++    user: { id: 'rm03-account-b' },
++    loginId: 'rm03-account-b-login',
++  };
++  await worker.evaluate((session) => chrome.storage.local.set({ authSession: session }), accountA);
++  await panel.waitForTimeout(0);
++  const logoutPostGate = createPreloadRequestGate();
++  const logoutPollGate = createPreloadRequestGate(
++    (request) =>
++      normalizeFixturePageUrl(new URL(request.url, fixtureBaseUrl).searchParams.get('page_url')) ===
++      crossOriginArticleUrl,
++  );
++  preloadEndpointController = {
++    postGate: logoutPostGate,
++    getGate: logoutPollGate,
++    postResponse: { status: 'processing' },
++    getResponse: readyPreload('rm03-logout-preload', crossOriginArticleUrl),
++  };
++  let logoutCompletion;
++  let logoutState;
++  try {
++    const crossOriginContent = await getContentPing(worker, crossOriginArticleUrl);
++    logoutCompletion = panel.evaluate(
++      (tabId) => chrome.runtime.sendMessage({ type: 'START_PRELOAD', payload: { tabId } }),
++      crossOriginContent.tabId,
++    );
++    await waitForPreloadRequestGate(logoutPostGate, 'RM03 logout submission');
++    logoutPostGate.release();
++    await waitForPreloadRequestGate(logoutPollGate, 'RM03 logout poll');
++    await worker.evaluate(() => chrome.storage.local.remove('authSession'));
++    await worker.evaluate(
++      (session) => chrome.storage.local.set({ authSession: session }),
++      accountB,
++    );
++    logoutPollGate.release();
++    await logoutCompletion;
++    logoutState = await worker.evaluate(async () => {
++      const storage = await chrome.storage.local.get(null);
++      return {
++        accountASessions: Object.keys(storage).filter((key) => key.includes('rm03-account-a')),
++      };
++    });
++    logoutState.postRequests = preloadEndpointController.postRequestCount || 0;
++    logoutState.pollRequests = logoutPollGate.matchCount;
++  } finally {
++    logoutPostGate.release();
++    logoutPollGate.release();
++    preloadEndpointController = null;
++    await logoutCompletion?.catch(() => {});
++  }
++  if (
++    logoutState.accountASessions.length ||
++    logoutState.postRequests !== 1 ||
++    logoutState.pollRequests < 1
++  ) {
++    errors.push(`RM03 account switch completed account A work: ${JSON.stringify(logoutState)}`);
++  }
++
++  // RM-03: a replacement document at the same URL must reject the real
++  // worker restore response that began against the older document nonce.
++  const restoreGate = createPreloadRequestGate(
++    (request) =>
++      normalizeFixturePageUrl(new URL(request.url, fixtureBaseUrl).searchParams.get('page_url')) ===
++      crossOriginArticleUrl,
++  );
++  preloadEndpointController = {
++    getGate: restoreGate,
++    getResponse: (_request, count) =>
++      count === 1 ? readyPreload('rm03-reload-preload', crossOriginArticleUrl) : { ready: false },
++  };
++  let restoreCompletion;
++  let restoreResult;
++  let documentReplaced;
++  try {
++    const originalContent = await getContentPing(worker, crossOriginArticleUrl);
++    restoreCompletion = panel.evaluate(
++      ({ tabId, pageUrl }) =>
++        chrome.runtime.sendMessage({
++          type: 'RESTORE_PAGE_READING_SESSION',
++          payload: { tabId, pageUrl },
++        }),
++      { tabId: originalContent.tabId, pageUrl: crossOriginArticleUrl },
++    );
++    await waitForPreloadRequestGate(restoreGate, 'RM03 restore status');
++    await page.reload();
++    const replacementContent = await getContentPing(worker, crossOriginArticleUrl);
++    documentReplaced =
++      replacementContent.response.documentNonce !== originalContent.response.documentNonce;
++    restoreGate.release();
++    restoreResult = await restoreCompletion;
++  } finally {
++    restoreGate.release();
++    preloadEndpointController = null;
++    await restoreCompletion?.catch(() => {});
++  }
++  if (!documentReplaced || restoreResult?.restored) {
++    errors.push(
++      `RM03 same-URL document reload accepted stale restore data: ${JSON.stringify({ restoreResult, documentReplaced })}`,
++    );
++  }
++
++  // RM-03: hold GET_PRELOAD_STATUS while panel hydration is in progress, then
++  // replace its account. No original-account record or panel may be mounted.
++  await worker.evaluate((session) => chrome.storage.local.set({ authSession: session }), accountA);
++  await panel.waitForTimeout(0);
++  const panelStatusGate = createPreloadRequestGate(
++    (request) =>
++      normalizeFixturePageUrl(new URL(request.url, fixtureBaseUrl).searchParams.get('page_url')) ===
++      crossOriginArticleUrl,
++  );
++  preloadEndpointController = {
++    getGate: panelStatusGate,
++    getResponse: readyPreload('rm03-panel-status-preload', crossOriginArticleUrl),
++  };
++  let panelHydration;
++  let panelMounted;
++  let panelRaceState;
++  try {
++    panelHydration = panel.evaluate(async (pageUrl) => {
++      clearCachedActivePreload();
++      if (activePageUrl !== pageUrl) activePageUrl = pageUrl;
++      window.ReadingPanel?.clearReadingPanel();
++      return syncReadingViewUi({ switchToReading: true, pageTitle: 'Account A article' });
++    }, crossOriginArticleUrl);
++    await waitForPreloadRequestGate(panelStatusGate, 'RM03 panel status');
++    await worker.evaluate(
++      (session) => chrome.storage.local.set({ authSession: session }),
++      accountB,
++    );
++    panelStatusGate.release();
++    panelMounted = await panelHydration;
++    panelRaceState = await panel.evaluate(() => ({
++      cached: Boolean(cachedActivePreload),
++      visible: document.getElementById('readingPanelRoot')?.hidden === false,
++    }));
++  } finally {
++    panelStatusGate.release();
++    preloadEndpointController = null;
++    await panelHydration?.catch(() => {});
++  }
++  if (panelMounted || panelRaceState.cached || panelRaceState.visible) {
++    errors.push(
++      `RM03 delayed panel status mounted account A data for account B: ${JSON.stringify({ panelMounted, panelRaceState })}`,
++    );
++  }
++
++  await worker.evaluate((session) => chrome.storage.local.set({ authSession: session }), accountA);
++  let panelApiCompletion;
++  let panelApiResult;
++  try {
++    panelApiCompletion = panel.evaluate(async (pageUrl) => {
++      const authScope = await getAuthScope();
++      const originalWait = waitForReadingPanelApi;
++      const originalMount = window.ReadingPanel.mountReadingPanel;
++      let releaseApi;
++      let mountCalls = 0;
++      const apiBlocked = new Promise((resolve) => {
++        releaseApi = resolve;
++      });
++      window.__rm03ReleaseApi = () => releaseApi();
++      window.__rm03ApiBlocked = false;
++      waitForReadingPanelApi = async (...args) => {
++        window.__rm03ApiBlocked = true;
++        await apiBlocked;
++        return originalWait(...args);
++      };
++      window.ReadingPanel.mountReadingPanel = (...args) => {
++        mountCalls += 1;
++        return originalMount(...args);
++      };
++      try {
++        const mounted = await syncReadingViewUi({
++          preload: {
++            id: 'rm03-api-readiness-preload',
++            page_url: pageUrl,
++            sentences: [
++              { id: 'rm03-api-sentence', index: 0, text: 'Private sentence.', analysis: {} },
++            ],
++          },
++          authScope,
++        });
++        const stored = await chrome.storage.local.get(null);
++        return {
++          mounted,
++          mountCalls,
++          staleRecord: Object.values(stored).some(
++            (value) => value?.preload?.id === 'rm03-api-readiness-preload',
++          ),
++        };
++      } finally {
++        waitForReadingPanelApi = originalWait;
++        window.ReadingPanel.mountReadingPanel = originalMount;
++        delete window.__rm03ReleaseApi;
++        delete window.__rm03ApiBlocked;
++      }
++    }, crossOriginArticleUrl);
++    await panel.waitForFunction(() => window.__rm03ApiBlocked === true, null, { timeout: 5000 });
++    await worker.evaluate(
++      (session) => chrome.storage.local.set({ authSession: session }),
++      accountB,
++    );
++    await panel.evaluate(() => window.__rm03ReleaseApi?.());
++    panelApiResult = await panelApiCompletion;
++  } finally {
++    await panel.evaluate(() => window.__rm03ReleaseApi?.()).catch(() => {});
++    await panelApiCompletion?.catch(() => {});
++  }
++  if (panelApiResult.mounted || panelApiResult.mountCalls !== 0 || panelApiResult.staleRecord) {
++    errors.push(
++      `RM03 panel API readiness accepted stale account data: ${JSON.stringify(panelApiResult)}`,
++    );
++  }
++
++  const runPanelLearnerProfileRace = async (flow) => {
++    await worker.evaluate(
++      (session) => chrome.storage.local.set({ authSession: session }),
++      accountA,
++    );
++    await panel.waitForTimeout(0);
++    let completion;
++    try {
++      completion = panel.evaluate(
++        async ({ pageUrl, flowName }) => {
++          const originalGet = chrome.storage.local.get.bind(chrome.storage.local);
++          const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
++          let releaseProfileRead;
++          const profileReadBlocked = new Promise((resolve) => {
++            releaseProfileRead = resolve;
++          });
++          let profileReadStarted = false;
++          window.__rm03ReleaseProfileRead = () => releaseProfileRead();
++          window.__rm03ProfileReadBlocked = false;
++          chrome.storage.local.get = async (keys) => {
++            const requestsLearnerProfile =
++              keys === 'learnerProfile' || (Array.isArray(keys) && keys.includes('learnerProfile'));
++            if (requestsLearnerProfile && !profileReadStarted) {
++              profileReadStarted = true;
++              window.__rm03ProfileReadBlocked = true;
++              await profileReadBlocked;
++            }
++            return originalGet(keys);
++          };
++          chrome.runtime.sendMessage = async (message, ...args) => {
++            if (message?.type === 'GET_PRELOAD_STATUS') {
++              return {
++                ok: true,
++                status: {
++                  ready: true,
++                  preload: {
++                    id: `rm03-${flowName}-preload`,
++                    page_url: pageUrl,
++                    sentences: [
++                      {
++                        id: `rm03-${flowName}-sentence`,
++                        index: 0,
++                        text: 'Private reading sentence.',
++                        analysis: {},
++                      },
++                    ],
++                  },
++                },
++              };
++            }
++            return originalSendMessage(message, ...args);
++          };
++
++          try {
++            const result =
++              flowName === 'existing'
++                ? await startPreload({ tab: { id: 1, url: pageUrl, title: 'Account A article' } })
++                : await refreshPreloadStatus();
++            return {
++              result,
++              cached: Boolean(cachedActivePreload),
++              visible: document.getElementById('readingPanelRoot')?.hidden === false,
++              confirmVisible: document.getElementById('preloadConfirm')?.hidden === false,
++            };
++          } finally {
++            chrome.storage.local.get = originalGet;
++            chrome.runtime.sendMessage = originalSendMessage;
++            delete window.__rm03ReleaseProfileRead;
++            delete window.__rm03ProfileReadBlocked;
++          }
++        },
++        { pageUrl: crossOriginArticleUrl, flowName: flow },
++      );
++      await panel.waitForFunction(() => window.__rm03ProfileReadBlocked === true, null, {
++        timeout: 5000,
++      });
++      await worker.evaluate(
++        (session) => chrome.storage.local.set({ authSession: session }),
++        accountB,
++      );
++      await panel.evaluate(() => window.__rm03ReleaseProfileRead?.());
++      return await completion;
++    } finally {
++      await panel.evaluate(() => window.__rm03ReleaseProfileRead?.()).catch(() => {});
++      await completion?.catch(() => {});
++    }
++  };
++
++  const existingPreloadRace = await runPanelLearnerProfileRace('existing');
++  const refreshPreloadRace = await runPanelLearnerProfileRace('refresh');
++  await worker.evaluate((session) => chrome.storage.local.set({ authSession: session }), accountA);
++  await panel.waitForTimeout(0);
++  let panelMountCompletion;
++  let replacementSessionStored;
++  try {
++    panelMountCompletion = panel.evaluate(async (pageUrl) => {
++      const authScope = await getAuthScope();
++      const originalMount = window.ReadingPanel.mountReadingPanel;
++      let releaseMount;
++      const mountBlocked = new Promise((resolve) => {
++        releaseMount = resolve;
++      });
++      window.__rm03ReleaseMount = () => releaseMount();
++      window.__rm03MountBlocked = false;
++      window.ReadingPanel.mountReadingPanel = async (session) => {
++        window.__rm03MountBlocked = true;
++        await mountBlocked;
++        return originalMount(session);
++      };
++      try {
++        return await syncReadingViewUi({
++          preload: {
++            id: 'rm03-delayed-mount-preload',
++            page_url: pageUrl,
++            sentences: [
++              {
++                id: 'rm03-delayed-mount-sentence',
++                index: 0,
++                text: 'Private reading sentence.',
++                analysis: {},
++              },
++            ],
++          },
++          pageTitle: 'Account A article',
++          authScope,
++        });
++      } finally {
++        window.ReadingPanel.mountReadingPanel = originalMount;
++        delete window.__rm03ReleaseMount;
++        delete window.__rm03MountBlocked;
++      }
++    }, crossOriginArticleUrl);
++    await panel.waitForFunction(() => window.__rm03MountBlocked === true, null, { timeout: 5000 });
++    await worker.evaluate(
++      (session) => chrome.storage.local.set({ authSession: session }),
++      accountB,
++    );
++    replacementSessionStored = await panel.evaluate(async (pageUrl) => {
++      const authScope = await getAuthScope();
++      return setReadingSession(
++        {
++          pageUrl,
++          pageTitle: 'Account B article',
++          preload: {
++            id: 'rm03-replacement-account-preload',
++            page_url: pageUrl,
++            sentences: [
++              {
++                id: 'rm03-replacement-account-sentence',
++                index: 0,
++                text: 'Replacement account sentence.',
++                analysis: {},
++              },
++            ],
++          },
++          domLinkStatus: {},
++          ui: {},
++          updatedAt: Date.now(),
++        },
++        authScope,
++      );
++    }, crossOriginArticleUrl);
++    await panel.evaluate(() => window.__rm03ReleaseMount?.());
++    const mounted = await panelMountCompletion;
++    if (mounted)
++      errors.push('RM03 delayed mount rendered account A data after account B signed in');
++  } finally {
++    await panel.evaluate(() => window.__rm03ReleaseMount?.()).catch(() => {});
++    await panelMountCompletion?.catch(() => {});
++  }
++  const mountRaceStorage = await worker.evaluate(() => chrome.storage.local.get(null));
++  if (
++    !replacementSessionStored ||
++    !Object.values(mountRaceStorage).some(
++      (value) => value?.preload?.id === 'rm03-replacement-account-preload',
++    )
++  ) {
++    errors.push('RM03 account-switch cleanup removed the replacement account session');
++  }
++  const learnerProfileRaceStorage = await worker.evaluate(() => chrome.storage.local.get(null));
++  if (
++    existingPreloadRace.cached ||
++    existingPreloadRace.visible ||
++    existingPreloadRace.confirmVisible ||
++    refreshPreloadRace.cached ||
++    refreshPreloadRace.visible ||
++    Object.keys(learnerProfileRaceStorage).some((key) => key.includes('rm03-account-a'))
++  ) {
++    errors.push(
++      `RM03 learner-profile race relabeled account A data: ${JSON.stringify({ existingPreloadRace, refreshPreloadRace })}`,
++    );
++  }
++  await page.goto(originalArticleUrl);
++  await getContentPing(worker, originalArticleUrl);
++
+   // A fresh preload carries the stable-preset-derived coverage to the backend.
+   // Changing that profile clears only the local page session; it must not start
+   // another request until the learner explicitly confirms a reload.
+@@ -600,7 +1268,14 @@ async function runSmokeTest() {
+                 page_url: location.href.replace(/\/$/, ''),
+                 summary: '',
+                 topics: [],
+-                sentences: [],
++                sentences: [
++                  {
++                    id: 'coverage-fixture-sentence',
++                    index: 0,
++                    text: 'Coverage fixture sentence.',
++                    analysis: {},
++                  },
++                ],
+                 study_items: [],
+               },
+             };
+@@ -611,6 +1286,7 @@ async function runSmokeTest() {
+           authSession: {
+             accessToken: 'smoke-token',
+             user: { id: 'smoke', email: 'smoke@example.com' },
++            loginId: 'smoke-login-1',
+           },
+           learnerProfile: { preset: 'cefr-a1', notes: '' },
+         });

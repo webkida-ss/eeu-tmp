@@ -1,0 +1,561 @@
+--- a/extension/content.js
++++ b/extension/content.js
+@@ -248,6 +248,10 @@
+       return;
+     }
+ 
++    if (Object.keys(changes).some((key) => key.startsWith(READING_SESSION_STORAGE_PREFIX))) {
++      applyScopedReadingSessionChange(changes).catch(() => {});
++    }
++
+     if (changes.preloadJob) {
+       const job = changes.preloadJob.newValue;
+       if (job?.pageUrl && pageUrlsMatch(job.pageUrl, getPageUrl()) && job.state === 'ready') {
+@@ -378,6 +382,28 @@
+   activeSentenceScreen = ui.activeSentenceScreen || 'list';
+   await syncPageAnchorsFromPreload({ force: true });
+   return true;
++}
++
++async function applyScopedReadingSessionChange(changes) {
++  if (pageAnchorPersistInProgress) return;
++
++  const pageUrl = getPageUrl();
++  const authScope = activeReadingScope || (await getAuthScope());
++  if (!authScope || !(await authScopeMatches(authScope))) return;
++
++  const key = readingSessionStorageKey(pageUrl, authScope);
++  const change = changes[key];
++  if (!change) return;
++
++  const nextSession = change.newValue;
++  if (isValidReadingSession(nextSession, pageUrl, authScope)) {
++    await applySessionToPage(nextSession);
++    return;
++  }
++
++  if (authScopesMatch(activeReadingScope, authScope)) {
++    clearActiveReadingState();
++  }
+ }
+ 
+ async function restoreReadingSessionFromServer({
+--- a/extension/panel-ui.js
++++ b/extension/panel-ui.js
+@@ -584,12 +584,9 @@
+       });
+     }
+ 
+-    if (changes.eraReadingSession) {
+-      handleReadingSessionChange(
+-        changes.eraReadingSession.oldValue,
+-        changes.eraReadingSession.newValue,
+-      ).catch((error) => {
+-        logPanelError('handleReadingSessionChange', error);
++    if (Object.keys(changes).some((key) => key.startsWith(READING_SESSION_STORAGE_PREFIX))) {
++      handleScopedReadingSessionChange(changes).catch((error) => {
++        logPanelError('handleScopedReadingSessionChange', error);
+       });
+     }
+ 
+@@ -640,7 +637,7 @@
+   }
+   return (
+     Boolean(root.querySelector('.era-sentence-list, .era-panel-detail-view')) &&
+-    cachedActivePreload?.id === preloadId
++    root.dataset.preloadId === preloadId
+   );
+ }
+ 
+@@ -2068,6 +2065,19 @@
+   }
+ }
+ 
++async function handleScopedReadingSessionChange(changes) {
++  if (readingViewSyncInProgress || !activePageUrl) return;
++
++  const authScope = await getAuthScope();
++  if (!authScope || !(await authScopeMatches(authScope))) return;
++
++  const key = readingSessionStorageKey(activePageUrl, authScope);
++  const change = changes[key];
++  if (!change) return;
++
++  await handleReadingSessionChange(change.oldValue, change.newValue);
++}
++
+ function setPreloadStatus(state, message) {
+   preloadRetryMode = state === 'loading';
+   preloadStatusElement.textContent = message;
+--- a/extension/reading-panel.js
++++ b/extension/reading-panel.js
+@@ -539,6 +539,7 @@
+       root.hidden = false;
+       root.className = 'era-reading-panel-root';
+       root.innerHTML = renderReadingPanelMarkup(activePreload, sentenceDomLinks);
++      root.dataset.preloadId = activePreload.id;
+       applyPanelTheme(root);
+       bindPanelEvents(root);
+       bindPanelKeyboardNavigation();
+@@ -568,6 +569,7 @@
+     if (root) {
+       root.hidden = true;
+       root.innerHTML = '';
++      delete root.dataset.preloadId;
+       root.className = '';
+     }
+     activePreload = null;
+--- a/extension/test/content-parsing.test.mjs
++++ b/extension/test/content-parsing.test.mjs
+@@ -118,6 +118,114 @@
+   sentences: [{ id: 'sentence-private', text: 'Private article sentence.' }],
+ };
+ 
++function readingSession(preload, owner, activeSentenceId = null) {
++  return {
++    schemaVersion: 1,
++    owner,
++    pageUrl: preload.page_url,
++    pageTitle: 'Private article',
++    preload,
++    domLinkStatus: {},
++    ui: {
++      activeSentenceId,
++      hoveredSentenceId: null,
++      activeStudyItemId: null,
++      activeSentenceScreen: activeSentenceId ? 'detail' : 'list',
++    },
++    updatedAt: Date.now(),
++  };
++}
++
++async function settleStorageListeners() {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++
++test('content applies only its own scoped session changes without writing back foreign article events', async () => {
++  await withHtml(
++    '<!doctype html><main><p>Private article sentence.</p></main>',
++    async (page) => {
++      // jsdom has no CSS.escape. This fixture uses only unescaped identifiers;
++      // the real-browser scenario exercises Chrome's selector implementation.
++      page.window.CSS = {
++        escape(value) {
++          assert.match(value, /^[a-z][a-z0-9-]*$/i);
++          return value;
++        },
++      };
++      const accountAScope = { userId: 'account-a', loginId: 'login-a-1' };
++      const accountBScope = { userId: 'account-b', loginId: 'login-b-1' };
++      const applyErrors = [];
++      const originalApply = page.window.applyScopedReadingSessionChange;
++      page.window.applyScopedReadingSessionChange = async (...args) => {
++        try {
++          return await originalApply(...args);
++        } catch (error) {
++          applyErrors.push(error.stack);
++          throw error;
++        }
++      };
++      const ownKey = page.evaluate(
++        `readingSessionStorageKey(${JSON.stringify(PRIVATE_PRELOAD.page_url)}, ${JSON.stringify(accountAScope)})`,
++      );
++      const otherPreload = {
++        ...PRIVATE_PRELOAD,
++        id: 'preload-other-article',
++        page_url: 'https://article.example/other',
++        sentences: [{ id: 'sentence-other', text: 'Other article sentence.' }],
++      };
++      const otherKey = page.evaluate(
++        `readingSessionStorageKey(${JSON.stringify(otherPreload.page_url)}, ${JSON.stringify(accountBScope)})`,
++      );
++
++      await page.window.chrome.storage.local.set({
++        [ownKey]: readingSession(PRIVATE_PRELOAD, accountAScope, 'sentence-private'),
++      });
++      await settleStorageListeners();
++      assert.deepEqual(applyErrors, [], 'scoped storage events must apply without hidden errors');
++      assert.equal(page.evaluate('activePreload.id'), PRIVATE_PRELOAD.id);
++      assert.equal(page.evaluate('activeSentenceId'), 'sentence-private');
++      assert.ok(
++        page.document.querySelector('[data-era-sentence-id="sentence-private"]'),
++        'the scoped session must create its anchor before a foreign event arrives',
++      );
++
++      let writeCount = 0;
++      const originalSet = page.window.chrome.storage.local.set;
++      page.window.chrome.storage.local.set = async (items) => {
++        writeCount += 1;
++        return originalSet(items);
++      };
++      try {
++        await page.window.chrome.storage.local.set({
++          [otherKey]: readingSession(otherPreload, accountBScope, 'sentence-other'),
++        });
++        await settleStorageListeners();
++      } finally {
++        page.window.chrome.storage.local.set = originalSet;
++      }
++
++      assert.equal(writeCount, 1);
++      assert.equal(page.evaluate('activePreload.id'), PRIVATE_PRELOAD.id);
++      assert.equal(page.evaluate('activeSentenceId'), 'sentence-private');
++      assert.equal(
++        page.document.querySelector('[data-era-sentence-id="sentence-private"]') !== null,
++        true,
++      );
++    },
++    {
++      url: PRIVATE_PRELOAD.page_url,
++      storage: {
++        authSession: {
++          accessToken: 'account-a-token',
++          user: { id: 'account-a' },
++          loginId: 'login-a-1',
++        },
++      },
++    },
++  );
++});
++
+ test('content receiver rejects a preload addressed to a replaced same-URL document', async () => {
+   await withHtml(
+     '<!doctype html><main>Private article sentence.</main>',
+--- a/extension/test/smoke.mjs
++++ b/extension/test/smoke.mjs
+@@ -1246,6 +1246,334 @@
+   await page.goto(originalArticleUrl);
+   await getContentPing(worker, originalArticleUrl);
+ 
++  // RM-04: independent article contexts receive their own scoped state. An
++  // update for article B must not reset article A's anchors or selection, and
++  // the panel focused on A must not write back B's change.
++  const secondArticle = await context.newPage();
++  watch(secondArticle, 'rm04-second-article');
++  const secondArticleUrl = `${fixtureBaseUrl}/rm04-independent`;
++  let firstPanel;
++  let secondPanel;
++  let rm04SessionKeys = [];
++  try {
++    await secondArticle.goto(secondArticleUrl);
++    const [firstContent, secondContent] = await Promise.all([
++      getContentPing(worker, originalArticleUrl),
++      getContentPing(worker, secondArticleUrl),
++    ]);
++    const rm04Sessions = await worker.evaluate(
++      async ({ firstUrl, secondUrl }) => {
++        const authScope = await getAuthScope();
++        const createSession = (pageUrl, id, sentenceId, text) => ({
++          schemaVersion: 1,
++          owner: authScope,
++          pageUrl,
++          pageTitle: id,
++          preload: {
++            id,
++            page_url: pageUrl,
++            sentences: [{ id: sentenceId, index: 0, text, analysis: {} }],
++          },
++          domLinkStatus: { [sentenceId]: true },
++          ui: {
++            activeSentenceId: sentenceId,
++            hoveredSentenceId: null,
++            activeStudyItemId: null,
++            activeSentenceScreen: 'detail',
++          },
++          updatedAt: Date.now(),
++        });
++        const firstSession = createSession(
++          firstUrl,
++          'rm04-first-preload',
++          'rm04-first-sentence',
++          'The quick brown fox jumps over the lazy dog.',
++        );
++        const secondSession = createSession(
++          secondUrl,
++          'rm04-second-preload',
++          'rm04-second-sentence',
++          'Reading assistants should not break simple pages like this one.',
++        );
++        const firstKey = readingSessionStorageKey(firstUrl, authScope);
++        const secondKey = readingSessionStorageKey(secondUrl, authScope);
++        await chrome.storage.local.set({ [firstKey]: firstSession, [secondKey]: secondSession });
++        return { firstKey, firstSession, secondKey, secondSession };
++      },
++      { firstUrl: originalArticleUrl, secondUrl: secondArticleUrl },
++    );
++    rm04SessionKeys = [rm04Sessions.firstKey, rm04Sessions.secondKey];
++    const readContentState = async (tabId) =>
++      worker.evaluate(async (id) => {
++        const [result] = await chrome.scripting.executeScript({
++          target: { tabId: id },
++          func: () => ({
++            preloadId: globalThis.activePreload?.id || null,
++            activeSentenceId: globalThis.activeSentenceId || null,
++            anchorCount: document.querySelectorAll('.era-page-anchor').length,
++          }),
++        });
++        return result.result;
++      }, tabId);
++
++    const waitForContentState = (tabId, preloadId, sentenceId) =>
++      worker.evaluate(
++        async ({ id, expectedPreloadId, expectedSentenceId }) => {
++          for (let attempt = 0; attempt < 100; attempt += 1) {
++            const [result] = await chrome.scripting.executeScript({
++              target: { tabId: id },
++              func: () => ({
++                preloadId: globalThis.activePreload?.id || null,
++                activeSentenceId: globalThis.activeSentenceId || null,
++                anchorCount: document.querySelectorAll('.era-page-anchor').length,
++              }),
++            });
++            const state = result.result;
++            if (
++              state.preloadId === expectedPreloadId &&
++              state.activeSentenceId === expectedSentenceId &&
++              state.anchorCount > 0
++            ) {
++              return state;
++            }
++            await new Promise((resolve) => setTimeout(resolve, 50));
++          }
++          throw new Error(`RM04 content did not become ready for ${expectedPreloadId}`);
++        },
++        { id: tabId, expectedPreloadId: preloadId, expectedSentenceId: sentenceId },
++      );
++
++    await Promise.all([
++      waitForContentState(firstContent.tabId, 'rm04-first-preload', 'rm04-first-sentence'),
++      waitForContentState(secondContent.tabId, 'rm04-second-preload', 'rm04-second-sentence'),
++    ]);
++
++    let rm04SecondSession = rm04Sessions.secondSession;
++    preloadEndpointController = {
++      getResponse: (request) => {
++        const requestedPageUrl = new URL(request.url, fixtureBaseUrl).searchParams.get('page_url');
++        const normalizedPageUrl = requestedPageUrl ? normalizeFixturePageUrl(requestedPageUrl) : '';
++        if (normalizedPageUrl === originalArticleUrl) {
++          return { ready: true, preload: rm04Sessions.firstSession.preload };
++        }
++        if (normalizedPageUrl === secondArticleUrl) {
++          return { ready: true, preload: rm04SecondSession.preload };
++        }
++        return { ready: false };
++      },
++    };
++    firstPanel = await context.newPage();
++    secondPanel = await context.newPage();
++    watch(firstPanel, 'rm04-first-panel');
++    watch(secondPanel, 'rm04-second-panel');
++    await Promise.all([
++      firstPanel.goto(
++        `chrome-extension://${extensionId}/sidepanel.html?pageUrl=${encodeURIComponent(originalArticleUrl)}`,
++      ),
++      secondPanel.goto(
++        `chrome-extension://${extensionId}/sidepanel.html?pageUrl=${encodeURIComponent(secondArticleUrl)}`,
++      ),
++    ]);
++    await Promise.all([
++      firstPanel.waitForFunction(
++        () => document.getElementById('targetLanguageSelect')?.disabled === false,
++      ),
++      secondPanel.waitForFunction(
++        () => document.getElementById('targetLanguageSelect')?.disabled === false,
++      ),
++    ]);
++    const mountBoundPanel = (boundPanel, session) =>
++      boundPanel.evaluate(async (readingSession) => {
++        const authScope = await getAuthScope();
++        return syncReadingViewUi({
++          preload: readingSession.preload,
++          pageTitle: readingSession.pageTitle,
++          sentenceCount: readingSession.preload.sentences.length,
++          switchToReading: true,
++          authScope,
++        });
++      }, session);
++    const [firstMounted, secondMounted] = await Promise.all([
++      mountBoundPanel(firstPanel, rm04Sessions.firstSession),
++      mountBoundPanel(secondPanel, rm04Sessions.secondSession),
++    ]);
++    const waitForPanelState = (boundPanel, pageUrl, preloadId, sentenceText) =>
++      boundPanel.waitForFunction(
++        ({ expectedPageUrl, expectedPreloadId, expectedSentenceText }) => {
++          const root = document.getElementById('readingPanelRoot');
++          return (
++            activePageUrl === expectedPageUrl &&
++            cachedActivePreload?.id === expectedPreloadId &&
++            root?.hidden === false &&
++            root.textContent.includes(expectedSentenceText)
++          );
++        },
++        {
++          expectedPageUrl: pageUrl,
++          expectedPreloadId: preloadId,
++          expectedSentenceText: sentenceText,
++        },
++      );
++    await Promise.all([
++      waitForPanelState(
++        firstPanel,
++        originalArticleUrl,
++        'rm04-first-preload',
++        'The quick brown fox jumps over the lazy dog.',
++      ),
++      waitForPanelState(
++        secondPanel,
++        secondArticleUrl,
++        'rm04-second-preload',
++        'Reading assistants should not break simple pages like this one.',
++      ),
++    ]);
++
++    const [firstBefore, secondBefore] = await Promise.all([
++      readContentState(firstContent.tabId),
++      readContentState(secondContent.tabId),
++    ]);
++    const readPanelState = (boundPanel) =>
++      boundPanel.evaluate(() => ({
++        cachedPreloadId: cachedActivePreload?.id || null,
++        pageUrl: activePageUrl,
++        detailText:
++          document.querySelector('#readingPanelRoot .era-section-original')?.textContent || '',
++      }));
++    const [firstPanelBefore, secondPanelBefore] = await Promise.all([
++      readPanelState(firstPanel),
++      readPanelState(secondPanel),
++    ]);
++
++    rm04SecondSession = {
++      ...rm04Sessions.secondSession,
++      ui: {
++        ...rm04Sessions.secondSession.ui,
++        activeSentenceId: 'rm04-second-sentence-updated',
++      },
++      preload: {
++        ...rm04Sessions.secondSession.preload,
++        id: 'rm04-second-preload-updated',
++        sentences: [
++          {
++            id: 'rm04-second-sentence-updated',
++            index: 0,
++            text: 'It happens every day.',
++            analysis: {},
++          },
++        ],
++      },
++      domLinkStatus: { 'rm04-second-sentence-updated': true },
++      updatedAt: Date.now(),
++    };
++    await worker.evaluate(
++      async ({ secondKey, updatedSecondSession }) => {
++        const events = [];
++        const listener = (changes, area) => {
++          if (area === 'local') events.push(Object.keys(changes));
++        };
++        chrome.storage.onChanged.addListener(listener);
++        globalThis.__rm04WriteEvents = events;
++        globalThis.__rm04StopWriteEvents = () => {
++          chrome.storage.onChanged.removeListener(listener);
++        };
++        await chrome.storage.local.set({ [secondKey]: updatedSecondSession });
++      },
++      { secondKey: rm04Sessions.secondKey, updatedSecondSession: rm04SecondSession },
++    );
++
++    await Promise.all([
++      waitForContentState(
++        secondContent.tabId,
++        'rm04-second-preload-updated',
++        'rm04-second-sentence-updated',
++      ),
++      waitForPanelState(
++        secondPanel,
++        secondArticleUrl,
++        'rm04-second-preload-updated',
++        'It happens every day.',
++      ),
++    ]);
++
++    const [firstAfter, secondAfter] = await Promise.all([
++      readContentState(firstContent.tabId),
++      readContentState(secondContent.tabId),
++    ]);
++    const [firstPanelAfter, secondPanelAfter] = await Promise.all([
++      readPanelState(firstPanel),
++      readPanelState(secondPanel),
++    ]);
++    const rm04WriteEvents = await worker.evaluate(() => {
++      const events = globalThis.__rm04WriteEvents || [];
++      globalThis.__rm04StopWriteEvents?.();
++      delete globalThis.__rm04WriteEvents;
++      delete globalThis.__rm04StopWriteEvents;
++      return events;
++    });
++    const onlySecondWrite =
++      rm04WriteEvents.length === 1 &&
++      rm04WriteEvents[0].length === 1 &&
++      rm04WriteEvents[0][0] === rm04Sessions.secondKey;
++    if (
++      firstBefore.preloadId !== 'rm04-first-preload' ||
++      firstBefore.activeSentenceId !== 'rm04-first-sentence' ||
++      firstBefore.anchorCount === 0 ||
++      secondBefore.preloadId !== 'rm04-second-preload' ||
++      secondBefore.activeSentenceId !== 'rm04-second-sentence' ||
++      secondBefore.anchorCount === 0 ||
++      firstAfter.preloadId !== 'rm04-first-preload' ||
++      firstAfter.activeSentenceId !== 'rm04-first-sentence' ||
++      firstAfter.anchorCount === 0 ||
++      secondAfter.preloadId !== 'rm04-second-preload-updated' ||
++      secondAfter.activeSentenceId !== 'rm04-second-sentence-updated' ||
++      secondAfter.anchorCount === 0 ||
++      !firstMounted ||
++      !secondMounted ||
++      firstPanelBefore.cachedPreloadId !== 'rm04-first-preload' ||
++      firstPanelBefore.pageUrl !== originalArticleUrl ||
++      !firstPanelBefore.detailText.includes('The quick brown fox jumps over the lazy dog.') ||
++      secondPanelBefore.cachedPreloadId !== 'rm04-second-preload' ||
++      secondPanelBefore.pageUrl !== secondArticleUrl ||
++      !secondPanelBefore.detailText.includes(
++        'Reading assistants should not break simple pages like this one.',
++      ) ||
++      firstPanelAfter.cachedPreloadId !== 'rm04-first-preload' ||
++      firstPanelAfter.pageUrl !== originalArticleUrl ||
++      !firstPanelAfter.detailText.includes('The quick brown fox jumps over the lazy dog.') ||
++      secondPanelAfter.cachedPreloadId !== 'rm04-second-preload-updated' ||
++      secondPanelAfter.pageUrl !== secondArticleUrl ||
++      !secondPanelAfter.detailText.includes('It happens every day.') ||
++      !onlySecondWrite
++    ) {
++      errors.push(
++        `RM04 interleaved article state crossed contexts: ${JSON.stringify({ firstBefore, secondBefore, firstAfter, secondAfter, firstMounted, secondMounted, firstPanelBefore, secondPanelBefore, firstPanelAfter, secondPanelAfter, rm04WriteEvents })}`,
++      );
++    }
++    await worker.evaluate(
++      ({ firstKey, secondKey }) => chrome.storage.local.remove([firstKey, secondKey]),
++      rm04Sessions,
++    );
++    rm04SessionKeys = [];
++  } finally {
++    preloadEndpointController = null;
++    await worker
++      .evaluate(() => {
++        globalThis.__rm04StopWriteEvents?.();
++        delete globalThis.__rm04WriteEvents;
++        delete globalThis.__rm04StopWriteEvents;
++      })
++      .catch(() => {});
++    if (rm04SessionKeys.length) {
++      await worker
++        .evaluate((keys) => chrome.storage.local.remove(keys), rm04SessionKeys)
++        .catch(() => {});
++    }
++    await Promise.all([firstPanel?.close().catch(() => {}), secondPanel?.close().catch(() => {})]);
++    await secondArticle.close();
++    await page.bringToFront();
++  }
++
+   // A fresh preload carries the stable-preset-derived coverage to the backend.
+   // Changing that profile clears only the local page session; it must not start
+   // another request until the learner explicitly confirms a reload.

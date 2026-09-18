@@ -1,0 +1,8 @@
+# Local DynamoDB for backend development.
+# Matches backend/.env.example (host port 18000 -> container port 8000).
+services:
+  dynamodb:
+    image: amazon/dynamodb-local@sha256:d89f8fcc6b1a39cb35976c248ed42a28c66ae00dc043099210f5571e42648ab4
+    ports:
+      - "18000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]

@@ -1,0 +1,12 @@
+diff --git a/backend/scripts/build_lambda.sh b/backend/scripts/build_lambda.sh
+index 08d3d11..4b93aae 100755
+--- a/backend/scripts/build_lambda.sh
++++ b/backend/scripts/build_lambda.sh
+@@ -26,6 +26,7 @@ APP_FILES=(
+   config.py
+   deps.py
+   schemas.py
++  secret_resolver.py
+   lambda_handler.py
+   worker_handler.py
+ )

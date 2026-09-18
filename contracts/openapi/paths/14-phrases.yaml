@@ -1,0 +1,144 @@
+get:
+  summary: List Phrases
+  operationId: listPhrases
+  parameters:
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            type: array
+            items:
+              $ref: ../components/schemas/PhraseRecord.yaml
+            title: Response Listphrases
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value: []
+    '403':
+      description: Account access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Account is suspended.
+            code: account_suspended
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '422':
+      description: Validation Error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/HTTPValidationError.yaml
+          example:
+            detail:
+            - type: value_error
+              loc:
+              - body
+              - field
+              msg: Request validation failed.
+              input: null
+  x-contract-test:
+    mode: generic
+    auth: localBearer
+    setup: emptyRepositories
+    owner: reading
+  security:
+  - bearerAuth: []
+post:
+  summary: Create Phrase
+  operationId: createPhrase
+  parameters:
+  - name: authorization
+    in: header
+    required: false
+    schema:
+      anyOf:
+      - type: string
+      - type: 'null'
+      title: Authorization
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/PhraseCreateRequest.yaml
+        examples:
+          happy:
+            summary: Deterministic local request
+            x-contract-test-case: happy
+            value:
+              original_text: Learning takes practice.
+              analysis: &id001
+                original_text: Learning takes practice.
+                translation: Learning requires practice.
+              page_url: https://example.test/article
+              page_title: A public sample article
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/PhraseRecord.yaml
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value:
+                original_text: Learning takes practice.
+                analysis: *id001
+                page_url: https://example.test/article
+                page_title: A public sample article
+                id: 018f47a2-7b3c-7abc-8def-0123456789ab
+                created_at: '2026-07-19T00:00:00+00:00'
+    '403':
+      description: Account access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Account is suspended.
+            code: account_suspended
+    '401':
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Authentication failed.
+    '422':
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ApiError.yaml
+          example:
+            detail: Request validation failed.
+  x-contract-test:
+    mode: generic
+    auth: localBearer
+    setup: emptyRepositories
+    owner: reading
+  security:
+  - bearerAuth: []

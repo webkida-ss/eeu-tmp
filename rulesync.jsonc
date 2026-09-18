@@ -1,0 +1,14 @@
+{
+  "$schema": "https://github.com/dyoshikawa/rulesync/releases/download/v14.0.1/config-schema.json",
+  "targets": {
+    "cursor": ["rules", "mcp", "subagents", "skills", "hooks", "permissions"],
+    "claudecode": ["rules", "mcp", "subagents", "skills", "hooks", "permissions"],
+    "codexcli": ["mcp", "subagents", "skills", "hooks", "permissions"],
+    "agentsmd": ["rules"]
+  },
+  "outputRoots": ["."],
+  "delete": false,
+  "global": false,
+  "verbose": false,
+  "silent": false
+}

@@ -1,0 +1,15 @@
+properties:
+  access_token:
+    type: string
+    title: Access Token
+  token_type:
+    type: string
+    title: Token Type
+    default: Bearer
+  user:
+    $ref: ./User.yaml
+type: object
+required:
+- access_token
+- user
+title: AuthSessionResponse

@@ -1,0 +1,396 @@
+diff --git a/backend/auth/dynamodb_email_auth.py b/backend/auth/dynamodb_email_auth.py
+index 8972ce0..603de26 100644
+--- a/backend/auth/dynamodb_email_auth.py
++++ b/backend/auth/dynamodb_email_auth.py
+@@ -9,6 +9,7 @@ composition root.
+ from __future__ import annotations
+ 
+ import secrets
++from collections.abc import Callable
+ from datetime import UTC, datetime, timedelta
+ from typing import Any
+ 
+@@ -23,9 +24,15 @@ def _normalize_email(email: str) -> str:
+ 
+ 
+ class DynamoEmailAuthService:
+-    def __init__(self, store: DynamoDbStore, session_ttl_days: int = 30) -> None:
++    def __init__(
++        self,
++        store: DynamoDbStore,
++        session_ttl_days: int = 30,
++        clock: Callable[[], datetime] | None = None,
++    ) -> None:
+         self._store = store
+         self._session_ttl = timedelta(days=session_ttl_days)
++        self._clock = clock or (lambda: datetime.now(UTC))
+ 
+     def login(self, *, email: str, display_name: str | None = None) -> tuple[str, User]:
+         normalized_email = _normalize_email(email)
+@@ -39,7 +46,7 @@ class DynamoEmailAuthService:
+                 "email": normalized_email,
+                 "display_name": (display_name or normalized_email.split("@")[0]).strip()
+                 or normalized_email,
+-                "created_at": datetime.now(UTC).isoformat(),
++                "created_at": self._clock().isoformat(),
+             }
+             self._store.put_document(
+                 email_pk(normalized_email), SK_USER, {"user_id": user_record["id"]}
+@@ -75,7 +82,7 @@ class DynamoEmailAuthService:
+                 return None
+             if expires_at.tzinfo is None:
+                 expires_at = expires_at.replace(tzinfo=UTC)
+-            if expires_at < datetime.now(UTC):
++            if expires_at <= self._clock():
+                 self._store.delete(session_pk(token), SK_SESSION)
+                 return None
+ 
+@@ -117,7 +124,7 @@ class DynamoEmailAuthService:
+ 
+     def _create_session(self, user_id: str) -> str:
+         token = secrets.token_urlsafe(32)
+-        now = datetime.now(UTC)
++        now = self._clock()
+         self._store.put_document(
+             session_pk(token),
+             SK_SESSION,
+diff --git a/backend/deps.py b/backend/deps.py
+index 806b725..8790243 100644
+--- a/backend/deps.py
++++ b/backend/deps.py
+@@ -1,5 +1,8 @@
+ from __future__ import annotations
+ 
++from collections.abc import Callable
++from datetime import datetime
++
+ from accounts import (
+     AccountsContainer,
+     AuthService,
+@@ -68,11 +71,19 @@ def _get_dynamodb_store() -> DynamoDbStore:
+     return _dynamodb_store
+ 
+ 
+-def _create_auth_service() -> AuthService | None:
++def _create_auth_service(
++    *,
++    store: DynamoDbStore | None = None,
++    clock: Callable[[], datetime] | None = None,
++) -> AuthService | None:
+     # None means "let accounts use its bundled JSON store", so the shared
+     # package keeps owning its own local-development default.
+     if STORAGE_BACKEND == "dynamodb":
+-        return DynamoEmailAuthService(_get_dynamodb_store())
++        return DynamoEmailAuthService(
++            store if store is not None else _get_dynamodb_store(),
++            session_ttl_days=ACCOUNTS_SETTINGS.session_ttl_days,
++            clock=clock,
++        )
+     return None
+ 
+ 
+diff --git a/backend/lambda_handler.py b/backend/lambda_handler.py
+index 798b987..90198a0 100644
+--- a/backend/lambda_handler.py
++++ b/backend/lambda_handler.py
+@@ -3,31 +3,14 @@
+ Deployed behind an API Gateway HTTP API (payload format 2.0), which Mangum
+ handles natively. Built into the deployment zip by scripts/build_lambda.sh.
+ 
+-Before importing the app, this module replaces the DynamoDB resource
+-factory: config.py passes an explicit access key / secret key pair to boto3
+-(a convenience for local development), but Lambda issues temporary role
+-credentials that also require a session token, so boto3's default
+-credential chain must be used instead. deps.py builds its repositories at
+-import time, so the override must happen before ``main`` is imported.
++The DynamoDB store factory applies the SDK default credential chain outside
++DynamoDB Local, so this entrypoint imports the application without rewriting
++storage factories.
+ """
+ 
+ from __future__ import annotations
+ 
+-import os
+-
+-import boto3
+-import storage.dynamodb_store as dynamodb_store
+-
+-
+-def _lambda_dynamodb_resource():
+-    # Default credential chain picks up the execution role's temporary
+-    # credentials, including AWS_SESSION_TOKEN.
+-    return boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
+-
+-
+-dynamodb_store.create_dynamodb_resource = _lambda_dynamodb_resource
+-
+-from main import app  # noqa: E402  (must come after the override above)
+-from mangum import Mangum  # noqa: E402
++from main import app
++from mangum import Mangum
+ 
+ handler = Mangum(app)
+diff --git a/backend/storage/dynamodb_store.py b/backend/storage/dynamodb_store.py
+index fcc6b78..3d76f67 100644
+--- a/backend/storage/dynamodb_store.py
++++ b/backend/storage/dynamodb_store.py
+@@ -8,9 +8,7 @@ from boto3.dynamodb.types import TypeSerializer
+ from boto3.resources.base import ServiceResource
+ from botocore.exceptions import ClientError
+ from config import (
+-    AWS_ACCESS_KEY_ID,
+     AWS_REGION,
+-    AWS_SECRET_ACCESS_KEY,
+     DYNAMODB_ENDPOINT,
+     READING_ASSISTANT_DYNAMODB_TABLE_NAME,
+ )
+@@ -28,9 +26,6 @@ def _dynamodb_client_kwargs() -> dict[str, Any]:
+         # DynamoDB Local accepts any credentials; ignore real AWS profiles here.
+         kwargs["aws_access_key_id"] = "dummy"
+         kwargs["aws_secret_access_key"] = "dummy"
+-    else:
+-        kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+-        kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+     return kwargs
+ 
+ 
+diff --git a/backend/test_handler_independence.py b/backend/test_handler_independence.py
+index 792445a..efae8fc 100644
+--- a/backend/test_handler_independence.py
++++ b/backend/test_handler_independence.py
+@@ -2,6 +2,7 @@
+ work without FastAPI, so the handler layer (FastAPI today, e.g. an AWS
+ Lambda handler tomorrow) can be swapped without touching them."""
+ 
++import importlib
+ import subprocess
+ import sys
+ import tempfile
+@@ -15,9 +16,20 @@ from deps import get_accounts, get_page_preload_repository
+ from fastapi.testclient import TestClient
+ from main import app
+ from repositories.page_preload_repository import JsonPagePreloadRepository
++from storage import dynamodb_store
++
++_dynamodb_resource_factory = dynamodb_store.create_dynamodb_resource
++_dynamodb_client_factory = dynamodb_store.create_dynamodb_client
++
++lambda_handler = importlib.import_module("lambda_handler")
+ 
+ 
+ class FrameworkIndependenceTests(unittest.TestCase):
++    def test_api_lambda_entrypoint_keeps_both_dynamodb_factories(self):
++        self.assertIs(dynamodb_store.create_dynamodb_resource, _dynamodb_resource_factory)
++        self.assertIs(dynamodb_store.create_dynamodb_client, _dynamodb_client_factory)
++        self.assertIsNotNone(lambda_handler.handler)
++
+     def test_core_and_services_import_without_fastapi(self):
+         # A fresh interpreter proves the import graph is clean; in-process
+         # checks would be polluted by other tests importing main.
+diff --git a/backend/test_worker_handler.py b/backend/test_worker_handler.py
+index 381808f..122a52d 100644
+--- a/backend/test_worker_handler.py
++++ b/backend/test_worker_handler.py
+@@ -1,10 +1,20 @@
++import importlib
+ import unittest
+ from unittest import mock
+ 
+-import worker_handler
++from storage import dynamodb_store
++
++_dynamodb_resource_factory = dynamodb_store.create_dynamodb_resource
++_dynamodb_client_factory = dynamodb_store.create_dynamodb_client
++
++worker_handler = importlib.import_module("worker_handler")
+ 
+ 
+ class WorkerHandlerTests(unittest.TestCase):
++    def test_worker_lambda_entrypoint_keeps_both_dynamodb_factories(self):
++        self.assertIs(dynamodb_store.create_dynamodb_resource, _dynamodb_resource_factory)
++        self.assertIs(dynamodb_store.create_dynamodb_client, _dynamodb_client_factory)
++
+     @mock.patch.object(worker_handler, "get_preload_content_store")
+     @mock.patch.object(worker_handler, "get_usage_repository")
+     @mock.patch.object(worker_handler, "get_subscription_repository")
+diff --git a/backend/worker_handler.py b/backend/worker_handler.py
+index 3f71d99..8b59e95 100644
+--- a/backend/worker_handler.py
++++ b/backend/worker_handler.py
+@@ -5,11 +5,9 @@ preload_id, learner_profile_fingerprint} messages onto the preload jobs queue.
+ This worker conditionally claims the matching record before running the slow
+ analysis, so stale or duplicate messages cannot publish results.
+ 
+-Like lambda_handler.py, this replaces the DynamoDB resource factory before
+-importing anything that builds repositories: config.py passes an explicit
+-access key / secret key pair (a local-development convenience), but Lambda
+-issues temporary role credentials that also require a session token, so
+-boto3's default credential chain must be used instead.
++The DynamoDB store factory applies the SDK default credential chain outside
++DynamoDB Local, so this entrypoint imports its dependencies without rewriting
++storage factories.
+ 
+ Returns a partial batch response (batchItemFailures): only messages that
+ raised an infrastructure error are reported for redelivery. A failed
+@@ -21,26 +19,15 @@ from __future__ import annotations
+ 
+ import json
+ import logging
+-import os
+ from typing import Any
+ 
+-import boto3
+-import storage.dynamodb_store as dynamodb_store
+-
+-
+-def _lambda_dynamodb_resource():
+-    return boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
+-
+-
+-dynamodb_store.create_dynamodb_resource = _lambda_dynamodb_resource
+-
+-from deps import (  # noqa: E402  (must come after the override above)
++from deps import (
+     get_page_preload_repository,
+     get_preload_content_store,
+     get_subscription_repository,
+     get_usage_repository,
+ )
+-from services.reading import run_preload_job  # noqa: E402
++from services.reading import run_preload_job
+ 
+ logger = logging.getLogger("untangle.worker")
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+diff --git a/backend/test_dynamodb_composition.py b/backend/test_dynamodb_composition.py
+new file mode 100644
+index 0000000..062fa4a
+--- /dev/null
++++ b/backend/test_dynamodb_composition.py
+@@ -0,0 +1,127 @@
++from __future__ import annotations
++
++import os
++from datetime import UTC, datetime, timedelta
++from unittest import mock
++
++import deps
++from accounts import AccountsSettings
++from auth.dynamodb_email_auth import DynamoEmailAuthService
++from storage import dynamodb_store
++from storage.dynamodb_keys import SK_SESSION, session_pk
++
++
++class MemoryDynamoStore:
++    def __init__(self) -> None:
++        self.documents: dict[tuple[str, str], dict[str, object]] = {}
++
++    def get_document(self, partition_key: str, sort_key: str) -> dict[str, object] | None:
++        document = self.documents.get((partition_key, sort_key))
++        return dict(document) if document is not None else None
++
++    def put_document(
++        self,
++        partition_key: str,
++        sort_key: str,
++        document: dict[str, object],
++    ) -> dict[str, object]:
++        self.documents[(partition_key, sort_key)] = dict(document)
++        return document
++
++    def delete(self, partition_key: str, sort_key: str) -> None:
++        self.documents.pop((partition_key, sort_key), None)
++
++
++class MutableClock:
++    def __init__(self, now: datetime) -> None:
++        self.now = now
++
++    def __call__(self) -> datetime:
++        return self.now
++
++
++def test_dynamodb_factories_use_default_credentials_outside_local() -> None:
++    synthetic_role_credentials = {
++        "AWS_ACCESS_KEY_ID": "ASIAEXAMPLE",
++        "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
++        "AWS_SESSION_TOKEN": "synthetic-session-token",
++    }
++    with (
++        mock.patch.dict(os.environ, synthetic_role_credentials, clear=False),
++        mock.patch.object(dynamodb_store, "DYNAMODB_ENDPOINT", None),
++        mock.patch.object(dynamodb_store.boto3, "resource") as resource,
++        mock.patch.object(dynamodb_store.boto3, "client") as client,
++    ):
++        dynamodb_store.create_dynamodb_resource()
++        dynamodb_store.create_dynamodb_client()
++
++    expected_kwargs = {"region_name": dynamodb_store.AWS_REGION}
++    resource.assert_called_once_with("dynamodb", **expected_kwargs)
++    client.assert_called_once_with("dynamodb", **expected_kwargs)
++
++
++def test_dynamodb_factories_use_dummy_credentials_only_for_local() -> None:
++    endpoint = "http://dynamodb-local.invalid:8000"
++    with (
++        mock.patch.object(dynamodb_store, "DYNAMODB_ENDPOINT", endpoint),
++        mock.patch.object(dynamodb_store.boto3, "resource") as resource,
++        mock.patch.object(dynamodb_store.boto3, "client") as client,
++    ):
++        dynamodb_store.create_dynamodb_resource()
++        dynamodb_store.create_dynamodb_client()
++
++    expected_kwargs = {
++        "region_name": dynamodb_store.AWS_REGION,
++        "endpoint_url": endpoint,
++        "aws_access_key_id": "dummy",
++        "aws_secret_access_key": "dummy",
++    }
++    resource.assert_called_once_with("dynamodb", **expected_kwargs)
++    client.assert_called_once_with("dynamodb", **expected_kwargs)
++
++
++def test_store_builds_resource_and_transaction_client_with_one_credential_policy() -> None:
++    resource = mock.Mock()
++    client = mock.Mock()
++    resource.Table.return_value.name = "reading-assistant"
++    with (
++        mock.patch.object(
++            dynamodb_store,
++            "create_dynamodb_resource",
++            return_value=resource,
++        ) as resource_factory,
++        mock.patch.object(
++            dynamodb_store,
++            "create_dynamodb_client",
++            return_value=client,
++        ) as client_factory,
++    ):
++        store = dynamodb_store.DynamoDbStore(table_name="reading-assistant")
++
++    resource_factory.assert_called_once_with()
++    client_factory.assert_called_once_with()
++    assert store._client is client
++
++
++def test_dynamo_auth_composition_uses_configured_ttl_and_rejects_expired_session() -> None:
++    start = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
++    clock = MutableClock(start)
++    store = MemoryDynamoStore()
++    settings = AccountsSettings(session_ttl_days=1)
++
++    with (
++        mock.patch.object(deps, "STORAGE_BACKEND", "dynamodb"),
++        mock.patch.object(deps, "ACCOUNTS_SETTINGS", settings),
++    ):
++        auth = deps._create_auth_service(store=store, clock=clock)
++
++    assert isinstance(auth, DynamoEmailAuthService)
++    access_token, user = auth.login(email="reader@example.test")
++    session = store.get_document(session_pk(access_token), SK_SESSION)
++    assert session is not None
++    assert session["user_id"] == user.id
++    assert session["expires_at"] == (start + timedelta(days=1)).isoformat()
++
++    clock.now = start + timedelta(days=1)
++    assert auth.resolve_user(access_token) is None
++    assert store.get_document(session_pk(access_token), SK_SESSION) is None

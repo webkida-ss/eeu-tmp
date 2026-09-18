@@ -1,0 +1,104 @@
+properties:
+  id:
+    type: string
+    title: Id
+    description: Opaque compatibility identifier; examples use UUID v7.
+    x-id-compatibility: legacy-string-or-uuid
+  page_url:
+    type: string
+    title: Page Url
+  page_title:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Title
+  summary:
+    type: string
+    title: Summary
+  topics:
+    items:
+      type: string
+    type: array
+    title: Topics
+  sentences:
+    items:
+      $ref: ./IndexedSentence.yaml
+    type: array
+    title: Sentences
+  study_items:
+    items:
+      $ref: ./StudyItem.yaml
+    type: array
+    title: Study Items
+  learner_level:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Learner Level
+  target_language:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Target Language
+  native_language:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Native Language
+  vocabulary_coverage_percent:
+    anyOf:
+    - type: number
+    - type: 'null'
+    title: Vocabulary Coverage Percent
+  vocabulary_coverage:
+    anyOf:
+    - $ref: ./VocabularyCoverageStats.yaml
+    - type: 'null'
+  created_at:
+    type: string
+    title: Created At
+  sentences_detected:
+    anyOf:
+    - type: integer
+    - type: 'null'
+    title: Sentences Detected
+  sentence_limit:
+    anyOf:
+    - type: integer
+    - type: 'null'
+    title: Sentence Limit
+  source_tokens_detected:
+    anyOf:
+    - type: integer
+    - type: 'null'
+    title: Source Tokens Detected
+  source_tokens_analyzed:
+    anyOf:
+    - type: integer
+    - type: 'null'
+    title: Source Tokens Analyzed
+  source_token_limit:
+    anyOf:
+    - type: integer
+    - type: 'null'
+    title: Source Token Limit
+  status:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Status
+  error:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Error
+type: object
+required:
+- id
+- page_url
+- page_title
+- summary
+- topics
+- sentences
+- created_at
+title: PagePreloadResponse

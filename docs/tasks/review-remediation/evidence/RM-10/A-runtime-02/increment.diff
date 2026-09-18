@@ -1,0 +1,180 @@
+diff --git a/docs/tasks/review-remediation/evidence/RM-10/A-runtime-01/source/backend/repositories/dynamodb_page_preload_repository.py b/docs/tasks/review-remediation/evidence/RM-10/A-runtime-02/source/backend/repositories/dynamodb_page_preload_repository.py
+index 6917e92..94b2fdd 100644
+--- a/docs/tasks/review-remediation/evidence/RM-10/A-runtime-01/source/backend/repositories/dynamodb_page_preload_repository.py
++++ b/docs/tasks/review-remediation/evidence/RM-10/A-runtime-02/source/backend/repositories/dynamodb_page_preload_repository.py
+@@ -89,6 +89,9 @@ class DynamoPagePreloadRepository:
+                         "Legacy preload page index cannot establish a matching operation identity."
+                     )
+                 self._validate_legacy_predecessor(user_id, normalized_url, observed_index)
++                if predecessor_id == preload_id:
++                    _require_matching_preload_identity(observed_index, record)
++                    return PreloadCreationResult(record=observed_index, created=False)
+                 legacy_materialization = observed_index
+             elif (
+                 predecessor.get("user_id") != user_id
+@@ -136,7 +139,7 @@ class DynamoPagePreloadRepository:
+         try:
+             self._store.transact_write(transaction)
+         except ClientError as exc:
+-            if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
++            if not _is_conditional_create_conflict(exc):
+                 raise
+             winner = self.get_by_id(user_id, preload_id)
+             if winner is not None:
+@@ -506,3 +509,17 @@ class DynamoPagePreloadRepository:
+             raise PreloadResultTooLarge(
+                 f"Preload result exceeds serialized size ceiling ({size}>{ceiling})"
+             )
++
++
++def _is_conditional_create_conflict(exc: ClientError) -> bool:
++    if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
++        return False
++    reasons = exc.response.get("CancellationReasons")
++    if not isinstance(reasons, list) or not reasons:
++        return False
++    if not all(
++        isinstance(reason, dict) and reason.get("Code") in {"None", "ConditionalCheckFailed"}
++        for reason in reasons
++    ):
++        return False
++    return any(reason["Code"] == "ConditionalCheckFailed" for reason in reasons)
+diff --git a/docs/tasks/review-remediation/evidence/RM-10/A-runtime-01/source/backend/test_preload_submission_repository.py b/docs/tasks/review-remediation/evidence/RM-10/A-runtime-02/source/backend/test_preload_submission_repository.py
+index a909511..7b93d77 100644
+--- a/docs/tasks/review-remediation/evidence/RM-10/A-runtime-01/source/backend/test_preload_submission_repository.py
++++ b/docs/tasks/review-remediation/evidence/RM-10/A-runtime-02/source/backend/test_preload_submission_repository.py
+@@ -110,6 +110,7 @@ class _FakeDynamoStore:
+         self.consistent_reads: list[tuple[str, str]] = []
+         self.transaction_error: ClientError | None = None
+         self.before_transaction = None
++        self.miss_next_page_query = False
+ 
+     def get_document(self, pk, sk, *, consistent_read=False):
+         if consistent_read:
+@@ -117,6 +118,9 @@ class _FakeDynamoStore:
+         return self.documents.get((pk, sk))
+ 
+     def query_by_pk(self, pk, *, sk_prefix=None):
++        if self.miss_next_page_query:
++            self.miss_next_page_query = False
++            return []
+         return [
+             value
+             for (item_pk, item_sk), value in self.documents.items()
+@@ -129,10 +133,14 @@ class _FakeDynamoStore:
+             self.before_transaction()
+         if self.transaction_error is not None:
+             raise self.transaction_error
+-        for item in items:
++        keys = []
++        for position, item in enumerate(items):
+             put = item["Put"]
+             values = put["Item"]
+             key = (values["pk"]["S"], values["sk"]["S"])
++            if key in keys:
++                raise ClientError({"Error": {"Code": "ValidationException"}}, "TransactWriteItems")
++            keys.append(key)
+             condition = put["ConditionExpression"]
+             if condition == "attribute_not_exists(pk)":
+                 matches = key not in self.documents
+@@ -144,8 +152,13 @@ class _FakeDynamoStore:
+             else:
+                 raise AssertionError(f"Unexpected transaction condition: {condition}")
+             if not matches:
++                reasons = [{"Code": "None"} for _ in items]
++                reasons[position] = {"Code": "ConditionalCheckFailed"}
+                 raise ClientError(
+-                    {"Error": {"Code": "TransactionCanceledException"}},
++                    {
++                        "Error": {"Code": "TransactionCanceledException"},
++                        "CancellationReasons": reasons,
++                    },
+                     "TransactWriteItems",
+                 )
+         for item in items:
+@@ -239,6 +252,48 @@ class DynamoPreloadCreationTests(TestCase):
+         with self.assertRaises(ClientError):
+             DynamoPagePreloadRepository(store).create_if_absent("u1", _record())
+ 
++    def test_dynamo_create_does_not_mask_mixed_transaction_cancellation(self) -> None:
++        store = _FakeDynamoStore()
++        store.transaction_error = ClientError(
++            {
++                "Error": {"Code": "TransactionCanceledException"},
++                "CancellationReasons": [
++                    {"Code": "ConditionalCheckFailed"},
++                    {"Code": "ProvisionedThroughputExceeded"},
++                ],
++            },
++            "TransactWriteItems",
++        )
++
++        with self.assertRaises(ClientError):
++            DynamoPagePreloadRepository(store).create_if_absent("u1", _record())
++
++    def test_dynamo_create_does_not_mask_nonconditional_cancellation(self) -> None:
++        store = _FakeDynamoStore()
++        store.transaction_error = ClientError(
++            {
++                "Error": {"Code": "TransactionCanceledException"},
++                "CancellationReasons": [{"Code": "ValidationError"}, {"Code": "None"}],
++            },
++            "TransactWriteItems",
++        )
++
++        with self.assertRaises(ClientError):
++            DynamoPagePreloadRepository(store).create_if_absent("u1", _record())
++
++    def test_dynamo_create_does_not_mask_malformed_transaction_cancellation(self) -> None:
++        store = _FakeDynamoStore()
++        store.transaction_error = ClientError(
++            {
++                "Error": {"Code": "TransactionCanceledException"},
++                "CancellationReasons": [{"Code": "ConditionalCheckFailed"}, {}],
++            },
++            "TransactWriteItems",
++        )
++
++        with self.assertRaises(ClientError):
++            DynamoPagePreloadRepository(store).create_if_absent("u1", _record())
++
+     def test_dynamo_new_operation_replaces_only_the_observed_predecessor_index(self) -> None:
+         store = _FakeDynamoStore()
+         repository = DynamoPagePreloadRepository(store)
+@@ -316,6 +371,23 @@ class DynamoPreloadCreationTests(TestCase):
+         self.assertEqual(store.documents[page_key]["preload_id"], "op-new")
+         self.assertEqual(len(store.transact_items[-1]), 3)
+ 
++    def test_dynamo_consistent_legacy_winner_prevents_duplicate_direct_put(self) -> None:
++        store = _FakeDynamoStore()
++        page_key = (user_pk("u1"), preload_sk("https://example.com/article"))
++        legacy = {
++            **_record(),
++            "user_id": "u1",
++            "page_url": "https://example.com/article",
++        }
++        store.documents[page_key] = legacy
++        store.miss_next_page_query = True
++
++        winner = DynamoPagePreloadRepository(store).create_if_absent("u1", _record())
++
++        self.assertFalse(winner.created)
++        self.assertEqual(winner.record, legacy)
++        self.assertEqual(store.transact_items, [])
++
+     def test_dynamo_legacy_page_index_without_a_winner_fails_closed(self) -> None:
+         store = _FakeDynamoStore()
+         page_key = (user_pk("u1"), preload_sk("https://example.com/article"))
+diff --git a/private/tmp/untangle-remediation-20260914/rm10-base/backend/test_preload_jobs.py b/docs/tasks/review-remediation/evidence/RM-10/A-runtime-02/source/backend/test_preload_jobs.py
+index 7321365..9b09f92 100644
+--- a/private/tmp/untangle-remediation-20260914/rm10-base/backend/test_preload_jobs.py
++++ b/docs/tasks/review-remediation/evidence/RM-10/A-runtime-02/source/backend/test_preload_jobs.py
+@@ -326,7 +326,7 @@ class DynamoPreloadLeaseTests(unittest.TestCase):
+         def put_document(self, pk, sk, document, *, extra_attributes=None):
+             self.items[(pk, sk)] = (dict(document), dict(extra_attributes or {}))
+ 
+-        def get_document(self, pk, sk):
++        def get_document(self, pk, sk, *, consistent_read=False):
+             item = self.items.get((pk, sk))
+             return dict(item[0]) if item else None
+ 

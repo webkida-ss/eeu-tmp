@@ -1,0 +1,14 @@
+type: object
+required: [code, message, correlation_id]
+properties:
+  code:
+    type: string
+    enum: [unauthenticated, admin_forbidden, account_suspended, user_not_found, validation_error, internal_error]
+  message:
+    type: string
+    minLength: 1
+    maxLength: 500
+  correlation_id:
+    type: string
+    minLength: 1
+    maxLength: 128

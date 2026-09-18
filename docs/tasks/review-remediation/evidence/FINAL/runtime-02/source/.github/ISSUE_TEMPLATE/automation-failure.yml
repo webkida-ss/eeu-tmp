@@ -1,0 +1,38 @@
+name: Automation failure
+description: Report a CI, nightly, dependency, or repository automation failure
+title: "[automation] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: Link to the GitHub run. Do not paste untrusted logs, secrets, tokens, or private data.
+  - type: input
+    id: run_url
+    attributes:
+      label: Safe run URL
+      placeholder: https://github.com/OWNER/REPOSITORY/actions/runs/123
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      options:
+        - failure
+        - cancelled
+        - timed_out
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Affected checks
+      description: Name checks and artifacts without copying their log contents.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Local reproduction
+      description: List canonical Taskfile commands that reproduce the failure, if known.

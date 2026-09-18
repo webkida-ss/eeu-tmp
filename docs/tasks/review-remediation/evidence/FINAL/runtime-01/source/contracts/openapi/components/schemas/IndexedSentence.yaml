@@ -1,0 +1,21 @@
+properties:
+  id:
+    type: string
+    title: Id
+    description: Opaque compatibility identifier; examples use UUID v7.
+    x-id-compatibility: legacy-string-or-uuid
+  index:
+    type: integer
+    title: Index
+  text:
+    type: string
+    title: Text
+  analysis:
+    $ref: ./SentenceAnalysis.yaml
+type: object
+required:
+- id
+- index
+- text
+- analysis
+title: IndexedSentence

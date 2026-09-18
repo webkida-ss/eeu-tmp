@@ -1,0 +1,850 @@
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/accounts/ports.py	2026-09-14 20:27:39
++++ backend/accounts/ports.py	2026-09-14 20:13:41
+@@ -115,11 +115,25 @@
+     """Provider-agnostic result of a verified webhook event."""
+ 
+     kind: str  # "updated" | "deleted" | "ignored"
++    event_id: str | None = None
+     user_id: str | None = None
+     stripe_customer_id: str | None = None
+     data: dict[str, Any] = field(default_factory=dict)
+ 
+ 
++@dataclass(frozen=True)
++class ProviderSubscription:
++    """Current subscription state retrieved after a verified provider event."""
++
++    user_id: str | None
++    stripe_customer_id: str | None
++    stripe_subscription_id: str | None
++    plan: str | None
++    status: str | None
++    current_period_end: int | None
++    cancel_at: int | None = None
++
++
+ class BillingProvider(Protocol):
+     def create_checkout_session(
+         self,
+@@ -145,7 +159,9 @@
+ 
+     def parse_webhook_event(self, payload: bytes, signature: str | None) -> SubscriptionEvent: ...
+ 
++    def retrieve_subscription(self, stripe_subscription_id: str) -> ProviderSubscription: ...
+ 
++
+ class SubscriptionRepository(Protocol):
+     """The user's current subscription entitlement.
+ 
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/accounts/billing/stripe_billing.py	2026-09-14 20:27:39
++++ backend/accounts/billing/stripe_billing.py	2026-09-14 20:26:30
+@@ -18,6 +18,7 @@
+     CheckoutDiscovery,
+     CheckoutSession,
+     HistoricalCheckout,
++    ProviderSubscription,
+     SubscriptionEvent,
+ )
+ 
+@@ -98,13 +99,6 @@
+                 "success_url": success_url,
+                 "cancel_url": cancel_url,
+                 "client_reference_id": user.id,
+-                "subscription_data": {
+-                    "metadata": {
+-                        "user_id": user.id,
+-                        "plan": plan_id,
+-                        "checkout_operation_id": operation_id,
+-                    }
+-                },
+                 "metadata": {
+                     "user_id": user.id,
+                     "plan": plan_id,
+@@ -231,6 +225,9 @@
+         event = json.loads(payload.decode("utf-8"))
+         kind = event["type"]
+         obj = event["data"]["object"]
++        event_id = event.get("id")
++        if not isinstance(event_id, str) or not event_id:
++            raise BillingError("Verified Stripe event is missing its event identity.")
+ 
+         if kind == "checkout.session.completed":
+             # Delayed-notification payment methods complete the session
+@@ -240,13 +237,17 @@
+                 logger.info(
+                     "checkout completed but unpaid (payment_status=%s)", obj.get("payment_status")
+                 )
+-                return SubscriptionEvent(kind="ignored")
++                return SubscriptionEvent(kind="ignored", event_id=event_id)
+             # Links the user to the Stripe customer; the plan/period details
+             # arrive via customer.subscription.* events.
++            metadata_user_id = (obj.get("metadata") or {}).get("user_id")
++            client_reference_id = obj.get("client_reference_id")
++            if metadata_user_id and client_reference_id and metadata_user_id != client_reference_id:
++                raise BillingError("Checkout identity evidence conflicts.")
+             return SubscriptionEvent(
+-                kind="updated",
+-                user_id=obj.get("client_reference_id")
+-                or (obj.get("metadata") or {}).get("user_id"),
++                kind="checkout_completed",
++                event_id=event_id,
++                user_id=metadata_user_id or client_reference_id,
+                 stripe_customer_id=obj.get("customer"),
+                 data={
+                     "plan": (obj.get("metadata") or {}).get("plan"),
+@@ -265,6 +266,7 @@
+                 period_end = items[0].get("current_period_end")
+             return SubscriptionEvent(
+                 kind="deleted" if kind == "customer.subscription.deleted" else "updated",
++                event_id=event_id,
+                 user_id=(obj.get("metadata") or {}).get("user_id"),
+                 stripe_customer_id=obj.get("customer"),
+                 data={
+@@ -279,4 +281,30 @@
+             )
+ 
+         logger.info("ignoring stripe event type=%s", kind)
+-        return SubscriptionEvent(kind="ignored")
++        return SubscriptionEvent(kind="ignored", event_id=event_id)
++
++    def retrieve_subscription(self, stripe_subscription_id: str) -> ProviderSubscription:
++        stripe = self._client()
++        try:
++            subscription = stripe.Subscription.retrieve(
++                stripe_subscription_id,
++                expand=["items.data.price"],
++            )
++        except Exception as exc:
++            raise BillingError("Stripe subscription retrieval failed.", status_code=502) from exc
++        items = self._value(self._value(subscription, "items") or {}, "data") or []
++        first_item = items[0] if items else {}
++        price = self._value(first_item, "price") or {}
++        period_end = self._value(subscription, "current_period_end")
++        if period_end is None:
++            period_end = self._value(first_item, "current_period_end")
++        metadata = self._value(subscription, "metadata") or {}
++        return ProviderSubscription(
++            user_id=self._value(metadata, "user_id"),
++            stripe_customer_id=self._value(subscription, "customer"),
++            stripe_subscription_id=self._value(subscription, "id"),
++            plan=self._plan_by_price.get(self._value(price, "id")),
++            status=self._value(subscription, "status"),
++            current_period_end=period_end,
++            cancel_at=self._value(subscription, "cancel_at"),
++        )
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/accounts/billing/mock_billing.py	2026-09-14 20:27:39
++++ backend/accounts/billing/mock_billing.py	2026-09-14 20:13:58
+@@ -9,7 +9,13 @@
+ 
+ from accounts.models import User
+ from accounts.plans import PlanCatalog
+-from accounts.ports import BillingError, CheckoutDiscovery, CheckoutSession, SubscriptionEvent
++from accounts.ports import (
++    BillingError,
++    CheckoutDiscovery,
++    CheckoutSession,
++    ProviderSubscription,
++    SubscriptionEvent,
++)
+ 
+ 
+ class MockBillingProvider:
+@@ -56,3 +62,6 @@
+         raise BillingError(
+             "Webhooks are not supported by the mock billing provider.", status_code=400
+         )
++
++    def retrieve_subscription(self, stripe_subscription_id: str) -> ProviderSubscription:
++        raise BillingError("Mock billing has no provider subscriptions.", status_code=400)
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/accounts/services/billing_flow.py	2026-09-14 20:27:39
++++ backend/accounts/services/billing_flow.py	2026-09-14 20:25:29
+@@ -20,6 +20,7 @@
+     CheckoutDiscovery,
+     CheckoutSession,
+     HistoricalCheckout,
++    ProviderSubscription,
+     SubscriptionRepository,
+ )
+ 
+@@ -27,6 +28,20 @@
+ 
+ _CHECKOUT_KEY_RETENTION_SECONDS = 23 * 60 * 60
+ _TERMINAL_SUBSCRIPTION_STATUSES = frozenset({"canceled", "incomplete_expired"})
++_PROVIDER_SUBSCRIPTION_STATUSES = frozenset(
++    {
++        "active",
++        "trialing",
++        "canceled",
++        "incomplete_expired",
++        "past_due",
++        "incomplete",
++        "paused",
++        "unpaid",
++    }
++)
++_WEBHOOK_RECONCILIATION_ATTEMPTS = 3
++_EVENT_HISTORY_LIMIT = 64
+ 
+ 
+ def _record_revision(record: dict[str, Any] | None) -> int:
+@@ -496,10 +511,17 @@
+     provider: BillingProvider,
+     payload: bytes,
+     signature: str | None,
++    *,
++    plans: PlanCatalog | None = None,
+ ) -> str:
+     event = provider.parse_webhook_event(payload, signature)
+     if event.kind == "ignored":
+         return "ignored"
++    if not isinstance(event.event_id, str) or not event.event_id:
++        raise BillingError("Verified billing event is missing its event identity.")
++    subscription_id = event.data.get("stripe_subscription_id")
++    if not isinstance(subscription_id, str) or not subscription_id:
++        raise BillingError("Verified billing event is missing its subscription identity.")
+ 
+     user_id = event.user_id or subscription_repository.find_user_by_customer(
+         event.stripe_customer_id or ""
+@@ -513,51 +535,100 @@
+         )
+         return "unmatched"
+ 
+-    existing = subscription_repository.get(user_id) or {}
++    for _attempt in range(_WEBHOOK_RECONCILIATION_ATTEMPTS):
++        existing = subscription_repository.get(user_id) or {}
++        processed = existing.get("processed_billing_events", [])
++        if isinstance(processed, list) and event.event_id in processed:
++            return "duplicate"
+ 
+-    # Events for a different subscription than the one on record (stale
+-    # duplicates, dashboard experiments) must not cancel or mutate the
+-    # active entitlement. A different-id event only wins when it represents
+-    # a live subscription (e.g. re-subscribing after a cancellation).
+-    known_id = existing.get("stripe_subscription_id")
+-    event_id = event.data.get("stripe_subscription_id")
+-    if known_id and event_id and known_id != event_id:
+-        if event.kind == "deleted" or event.data.get("status") not in ("active", "trialing"):
+-            logger.info(
+-                "billing webhook ignored: subscription mismatch user=%s known=%s event=%s",
++        snapshot = provider.retrieve_subscription(subscription_id)
++        _validate_provider_snapshot(event, snapshot, existing, user_id, plans or PlanCatalog())
++        known_subscription_id = existing.get("stripe_subscription_id")
++        if (
++            isinstance(known_subscription_id, str)
++            and known_subscription_id
++            and known_subscription_id != snapshot.stripe_subscription_id
++            and existing.get("status") in {"active", "trialing"}
++        ):
++            if snapshot.status in {"active", "trialing"}:
++                raise _safe_checkout_conflict(
++                    "Concurrent live subscriptions require reconciliation."
++                )
++            return "ignored_mismatch"
++        candidate = {
++            **existing,
++            "plan": snapshot.plan,
++            "status": snapshot.status,
++            "stripe_customer_id": snapshot.stripe_customer_id,
++            "stripe_subscription_id": snapshot.stripe_subscription_id,
++            "current_period_end": snapshot.current_period_end,
++            "cancel_at": snapshot.cancel_at,
++            "processed_billing_events": [
++                *(processed if isinstance(processed, list) else []),
++                event.event_id,
++            ][-_EVENT_HISTORY_LIMIT:],
++        }
++        try:
++            persisted = subscription_repository.compare_and_swap(
+                 user_id,
+-                known_id,
+-                event_id,
++                candidate,
++                expected_revision=_record_revision(existing),
+             )
+-            return "ignored_mismatch"
+-
+-    merged: dict[str, Any] = {
+-        **existing,
+-        "stripe_customer_id": event.stripe_customer_id or existing.get("stripe_customer_id"),
+-    }
++        except ValueError as exc:
++            raise _safe_checkout_conflict(
++                "Subscription ownership changed; reconciliation is required."
++            ) from exc
++        if persisted is not None:
++            logger.info(
++                "billing webhook reconciled user=%s event=%s plan=%s status=%s",
++                user_id,
++                event.event_id,
++                snapshot.plan,
++                snapshot.status,
++            )
++            return "applied"
++    raise BillingError("Billing reconciliation conflicted; retry later.", status_code=503)
+ 
+-    if event.kind == "deleted":
+-        merged["status"] = "canceled"
+-    else:
+-        for field in ("plan", "status", "stripe_subscription_id", "current_period_end"):
+-            value = event.data.get(field)
+-            if value is not None:
+-                merged[field] = value
+-        # Scheduled cancellation: None clears it (the user resumed the
+-        # subscription in the portal), so it is written unconditionally on
+-        # subscription updates that carry the field.
+-        if "cancel_at" in event.data:
+-            merged["cancel_at"] = event.data.get("cancel_at")
+ 
+-    subscription_repository.upsert(user_id, merged)
+-    logger.info(
+-        "billing webhook applied user=%s kind=%s plan=%s status=%s",
+-        user_id,
+-        event.kind,
+-        merged.get("plan"),
+-        merged.get("status"),
+-    )
+-    return "applied"
++def _validate_provider_snapshot(
++    event: Any,
++    snapshot: ProviderSubscription,
++    existing: dict[str, Any],
++    user_id: str,
++    plans: PlanCatalog,
++) -> None:
++    if snapshot.stripe_subscription_id != event.data.get("stripe_subscription_id"):
++        raise _safe_checkout_conflict("Provider subscription identity conflicts.")
++    if not snapshot.stripe_customer_id or (
++        event.stripe_customer_id and snapshot.stripe_customer_id != event.stripe_customer_id
++    ):
++        raise _safe_checkout_conflict("Provider customer identity conflicts.")
++    known_customer_id = existing.get("stripe_customer_id")
++    if known_customer_id and known_customer_id != snapshot.stripe_customer_id:
++        raise _safe_checkout_conflict("Subscription customer ownership conflicts.")
++    if snapshot.user_id is not None:
++        if snapshot.user_id != user_id:
++            raise _safe_checkout_conflict("Provider subscription ownership conflicts.")
++    elif not (
++        known_customer_id == snapshot.stripe_customer_id
++        or (
++            event.kind == "checkout_completed"
++            and event.user_id == user_id
++            and event.stripe_customer_id == snapshot.stripe_customer_id
++        )
++    ):
++        raise _safe_checkout_conflict("Provider subscription ownership is unproven.")
++    if snapshot.status not in _PROVIDER_SUBSCRIPTION_STATUSES:
++        raise _safe_checkout_conflict("Provider subscription has an invalid status.")
++    if snapshot.status in {"active", "trialing"}:
++        if not isinstance(snapshot.plan, str) or not plans.is_paid(snapshot.plan):
++            raise _safe_checkout_conflict("Provider subscription has an unsupported plan.")
++        if (
++            not isinstance(snapshot.current_period_end, int)
++            or isinstance(snapshot.current_period_end, bool)
++            or snapshot.current_period_end <= 0
++        ):
++            raise _safe_checkout_conflict("Provider subscription has no finite period.")
+ 
+ 
+ def describe_subscription(
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/accounts/container.py	2026-09-14 20:27:39
++++ backend/accounts/container.py	2026-09-14 20:14:37
+@@ -94,7 +94,11 @@
+ 
+     def handle_webhook(self, payload: bytes, signature: str | None) -> str:
+         return billing_flow.handle_webhook(
+-            self.subscription_repository, self.billing_provider, payload, signature
++            self.subscription_repository,
++            self.billing_provider,
++            payload,
++            signature,
++            plans=self.plans,
+         )
+ 
+     def describe_subscription(self, user_id: str) -> SubscriptionState:
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/test_billing.py	2026-09-14 20:27:39
++++ backend/test_billing.py	2026-09-14 20:25:41
+@@ -2,6 +2,7 @@
+ import threading
+ import unittest
+ from concurrent.futures import ThreadPoolExecutor
++from dataclasses import replace
+ from datetime import UTC, datetime, timedelta, timezone
+ from pathlib import Path
+ from types import SimpleNamespace
+@@ -9,7 +10,12 @@
+ 
+ from accounts import BillingError, SubscriptionEvent, User
+ from accounts.billing import MockBillingProvider
+-from accounts.ports import CheckoutDiscovery, CheckoutSession, HistoricalCheckout
++from accounts.ports import (
++    CheckoutDiscovery,
++    CheckoutSession,
++    HistoricalCheckout,
++    ProviderSubscription,
++)
+ from accounts.services import billing_flow
+ from accounts.storage import (
+     InMemorySubscriptionRepository,
+@@ -227,9 +233,31 @@
+         self._event = event
+ 
+     def parse_webhook_event(self, payload, signature):
+-        return self._event
++        subscription_id = self._event.data.get("stripe_subscription_id") or "sub_stub"
++        derived_event_id = (
++            f"evt_stub_{subscription_id}_{self._event.kind}_"
++            f"{self._event.data.get('status')}_{self._event.data.get('cancel_at')}"
++        )
++        return replace(
++            self._event,
++            event_id=self._event.event_id or derived_event_id,
++            data={**self._event.data, "stripe_subscription_id": subscription_id},
++        )
+ 
++    def retrieve_subscription(self, stripe_subscription_id):
++        event = self.parse_webhook_event(b"", None)
++        return ProviderSubscription(
++            user_id=event.user_id or "u1",
++            stripe_customer_id=event.stripe_customer_id or "cus_1",
++            stripe_subscription_id=stripe_subscription_id,
++            plan=event.data.get("plan") or "pro",
++            status=event.data.get("status")
++            or ("canceled" if event.kind == "deleted" else "active"),
++            current_period_end=event.data.get("current_period_end") or 1_900_000_000,
++            cancel_at=event.data.get("cancel_at"),
++        )
+ 
++
+ class WebhookFlowTests(unittest.TestCase):
+     def setUp(self):
+         self._tmpdir = tempfile.TemporaryDirectory()
+@@ -262,8 +290,199 @@
+         event = SubscriptionEvent(kind="updated", stripe_customer_id="cus_unknown", data={})
+         result = billing_flow.handle_webhook(self.subs, _StubProvider(event), b"{}", "sig")
+         self.assertEqual(result, "unmatched")
++
++
++class _LifecycleProvider:
++    def __init__(self, event, snapshots):
++        self.event = event
++        self.snapshots = list(snapshots)
++        self.retrievals = 0
++
++    def parse_webhook_event(self, payload, signature):
++        return self.event
++
++    def retrieve_subscription(self, stripe_subscription_id):
++        self.retrievals += 1
++        snapshot = self.snapshots[min(self.retrievals - 1, len(self.snapshots) - 1)]
++        self.last_subscription_id = stripe_subscription_id
++        return snapshot
++
++
++class AuthoritativeWebhookReconciliationTests(unittest.TestCase):
++    def setUp(self):
++        self._tmpdir = tempfile.TemporaryDirectory()
++        self.subs = JsonSubscriptionRepository(Path(self._tmpdir.name) / "subs.json")
++
++    def tearDown(self):
++        self._tmpdir.cleanup()
++
++    def _event(self, event_id, subscription_id="sub_1"):
++        return SubscriptionEvent(
++            kind="updated",
++            event_id=event_id,
++            user_id="u1",
++            stripe_customer_id="cus_1",
++            data={"stripe_subscription_id": subscription_id},
++        )
++
++    @staticmethod
++    def _snapshot(*, plan="pro", status="active", subscription_id="sub_1", customer="cus_1"):
++        return ProviderSubscription(
++            user_id="u1",
++            stripe_customer_id=customer,
++            stripe_subscription_id=subscription_id,
++            plan=plan,
++            status=status,
++            current_period_end=1_900_000_000,
++        )
++
++    def test_deletion_then_old_active_event_keeps_authoritative_cancellation(self):
++        deleted = _LifecycleProvider(
++            self._event("evt_deleted"), [self._snapshot(status="canceled")]
++        )
++        billing_flow.handle_webhook(self.subs, deleted, b"{}", "sig", plans=PLAN_CATALOG)
++        old_active = _LifecycleProvider(
++            self._event("evt_old_active"), [self._snapshot(status="canceled")]
++        )
++        billing_flow.handle_webhook(self.subs, old_active, b"{}", "sig", plans=PLAN_CATALOG)
+ 
++        self.assertEqual(self.subs.get("u1")["status"], "canceled")
++        self.assertEqual(old_active.retrievals, 1)
+ 
++    def test_upgrade_uses_current_provider_plan_instead_of_event_payload(self):
++        event = self._event("evt_old_pro")
++        event = replace(event, data={"stripe_subscription_id": "sub_1", "plan": "pro"})
++        provider = _LifecycleProvider(event, [self._snapshot(plan="max")])
++
++        billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++
++        self.assertEqual(self.subs.get("u1")["plan"], "max")
++
++    def test_duplicate_event_is_deduplicated_after_one_authoritative_retrieval(self):
++        provider = _LifecycleProvider(self._event("evt_once"), [self._snapshot()])
++
++        self.assertEqual(
++            billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG),
++            "applied",
++        )
++        self.assertEqual(
++            billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG),
++            "duplicate",
++        )
++        self.assertEqual(provider.retrievals, 1)
++
++    def test_customer_identity_conflict_fails_closed(self):
++        provider = _LifecycleProvider(
++            self._event("evt_conflict"),
++            [self._snapshot(customer="cus_other")],
++        )
++
++        with self.assertRaises(BillingError) as context:
++            billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++        self.assertEqual(context.exception.status_code, 409)
++
++    def test_legacy_snapshot_without_metadata_user_reconciles_through_matching_customer_index(self):
++        self.subs.upsert("u1", {"stripe_customer_id": "cus_1"})
++        provider = _LifecycleProvider(
++            self._event("evt_legacy_index"),
++            [replace(self._snapshot(), user_id=None)],
++        )
++
++        billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++
++        self.assertEqual(self.subs.get("u1")["status"], "active")
++
++    def test_checkout_completion_reference_binds_a_legacy_snapshot_without_metadata_user(self):
++        event = replace(self._event("evt_checkout_completion"), kind="checkout_completed")
++        provider = _LifecycleProvider(event, [replace(self._snapshot(), user_id=None)])
++
++        billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++
++        self.assertEqual(self.subs.get("u1")["stripe_customer_id"], "cus_1")
++
++    def test_conflicting_legacy_snapshot_metadata_and_customer_index_fails_closed(self):
++        self.subs.upsert("u1", {"stripe_customer_id": "cus_1"})
++        provider = _LifecycleProvider(
++            self._event("evt_legacy_metadata_conflict"),
++            [replace(self._snapshot(), user_id="u2")],
++        )
++
++        with self.assertRaises(BillingError) as context:
++            billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++        self.assertEqual(context.exception.status_code, 409)
++
++    def test_terminal_snapshot_without_plan_or_period_revokes_the_same_subscription(self):
++        self.subs.upsert(
++            "u1",
++            {
++                "plan": "pro",
++                "status": "active",
++                "stripe_customer_id": "cus_1",
++                "stripe_subscription_id": "sub_1",
++            },
++        )
++        provider = _LifecycleProvider(
++            self._event("evt_terminal"),
++            [replace(self._snapshot(plan=None, status="canceled"), current_period_end=None)],
++        )
++
++        billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++
++        record = self.subs.get("u1")
++        self.assertEqual(record["status"], "canceled")
++        self.assertNotEqual(resolve_plan_id(record), "pro")
++
++    def test_cas_conflict_retrieves_a_fresh_provider_snapshot_before_commit(self):
++        class _ConflictOnceRepository(JsonSubscriptionRepository):
++            def __init__(self, path):
++                super().__init__(path)
++                self.conflicted = False
++
++            def compare_and_swap(self, user_id, record, *, expected_revision):
++                if not self.conflicted:
++                    self.conflicted = True
++                    return None
++                return super().compare_and_swap(
++                    user_id,
++                    record,
++                    expected_revision=expected_revision,
++                )
++
++        repository = _ConflictOnceRepository(Path(self._tmpdir.name) / "conflict.json")
++        provider = _LifecycleProvider(
++            self._event("evt_conflict_retry"),
++            [self._snapshot(plan="pro"), self._snapshot(plan="max")],
++        )
++
++        billing_flow.handle_webhook(repository, provider, b"{}", "sig", plans=PLAN_CATALOG)
++
++        self.assertEqual(provider.retrievals, 2)
++        self.assertEqual(repository.get("u1")["plan"], "max")
++
++    def test_failed_persistence_returns_retryable_outcome_without_payload_merge(self):
++        class _NeverPersistsRepository(JsonSubscriptionRepository):
++            def compare_and_swap(self, user_id, record, *, expected_revision):
++                return None
++
++        repository = _NeverPersistsRepository(Path(self._tmpdir.name) / "failed.json")
++        provider = _LifecycleProvider(self._event("evt_failed"), [self._snapshot()])
++
++        with self.assertRaises(BillingError) as context:
++            billing_flow.handle_webhook(repository, provider, b"{}", "sig", plans=PLAN_CATALOG)
++        self.assertEqual(context.exception.status_code, 503)
++        self.assertEqual(repository.get("u1"), None)
++        self.assertEqual(provider.retrievals, 3)
++
++    def test_customer_index_conflict_fails_closed_without_writing_the_snapshot(self):
++        self.subs.upsert("u2", {"stripe_customer_id": "cus_1"})
++        provider = _LifecycleProvider(self._event("evt_index_conflict"), [self._snapshot()])
++
++        with self.assertRaises(BillingError) as context:
++            billing_flow.handle_webhook(self.subs, provider, b"{}", "sig", plans=PLAN_CATALOG)
++        self.assertEqual(context.exception.status_code, 409)
++        self.assertIsNone(self.subs.get("u1"))
++
++
+ class StripeWebhookSecurityTests(unittest.TestCase):
+     def test_bad_signature_is_rejected(self):
+         try:
+@@ -471,13 +690,6 @@
+             cancel_url="http://c",
+             client_reference_id="u1",
+             customer_email="u1@example.com",
+-            subscription_data={
+-                "metadata": {
+-                    "user_id": "u1",
+-                    "plan": "pro",
+-                    "checkout_operation_id": "019c0000-0000-7000-8000-000000000001",
+-                }
+-            },
+             metadata={
+                 "user_id": "u1",
+                 "plan": "pro",
+@@ -598,8 +810,110 @@
+         self.assertEqual(discovery.sessions[0].stripe_subscription_id, "sub_active")
+         self.assertEqual(discovery.sessions[0].subscription_status, "active")
+         retrieve_subscription.assert_called_once_with("sub_active")
++
++    def test_current_subscription_normalizes_sdk_fields_for_authoritative_reconciliation(self):
++        retrieve = Mock(
++            return_value=SimpleNamespace(
++                id="sub_1",
++                customer="cus_1",
++                metadata={"user_id": "u1"},
++                status="active",
++                current_period_end=None,
++                cancel_at=None,
++                items=SimpleNamespace(
++                    data=[
++                        SimpleNamespace(
++                            price=SimpleNamespace(id="price_pro"),
++                            current_period_end=1_900_000_000,
++                        )
++                    ]
++                ),
++            )
++        )
++        stripe = SimpleNamespace(Subscription=SimpleNamespace(retrieve=retrieve))
++
++        with patch("accounts.billing.stripe_billing._import_stripe", return_value=stripe):
++            snapshot = self._provider().retrieve_subscription("sub_1")
++
++        self.assertEqual(snapshot.user_id, "u1")
++        self.assertEqual(snapshot.plan, "pro")
++        self.assertEqual(snapshot.current_period_end, 1_900_000_000)
++        retrieve.assert_called_once_with("sub_1", expand=["items.data.price"])
++
++    def test_legacy_pending_idempotency_replay_does_not_add_subscription_metadata(self):
++        with tempfile.TemporaryDirectory() as directory:
++            repository = JsonSubscriptionRepository(Path(directory) / "subscriptions.json")
++            repository.upsert(
++                "u1",
++                {
++                    "pending_checkout": {
++                        "operation_id": "019c0000-0000-7000-8000-000000000001",
++                        "user_id": "u1",
++                        "requested_plan": "pro",
++                        "price_id": "price_pro",
++                        "success_url": "https://app.example/success",
++                        "cancel_url": "https://app.example/cancel",
++                        "stripe_customer_id": None,
++                        "customer_choice": "email",
++                        "email": "u1@example.com",
++                        "idempotency_key": "legacy-key",
++                        "state": "attempted",
++                        "creation_attempted_at": 1_900_000_000,
++                    }
++                },
++            )
++            create_session = Mock(
++                return_value=SimpleNamespace(url="https://checkout.example", id="cs_legacy")
++            )
++            stripe = SimpleNamespace(
++                checkout=SimpleNamespace(Session=SimpleNamespace(create=create_session))
++            )
++            provider = self._provider()
+ 
++            with patch("accounts.billing.stripe_billing._import_stripe", return_value=stripe):
++                billing_flow.start_checkout(
++                    repository,
++                    provider,
++                    PLAN_CATALOG,
++                    User(id="u1", email="u1@example.com", display_name="U"),
++                    "pro",
++                    success_url="https://app.example/success",
++                    cancel_url="https://app.example/cancel",
++                )
+ 
++            self.assertNotIn("subscription_data", create_session.call_args.kwargs)
++
++    def test_checkout_completion_preserves_verified_reference_and_customer_identity(self):
++        stripe = SimpleNamespace(
++            Webhook=SimpleNamespace(construct_event=Mock()),
++        )
++        payload = (
++            b'{"id":"evt_checkout","type":"checkout.session.completed","data":{"object":'
++            b'{"payment_status":"paid","client_reference_id":"u1","customer":"cus_1",'
++            b'"subscription":"sub_1","metadata":{"user_id":"u1","plan":"pro"}}}}'
++        )
++        with patch("accounts.billing.stripe_billing._import_stripe", return_value=stripe):
++            event = self._provider().parse_webhook_event(payload, "sig")
++
++        self.assertEqual(event.kind, "checkout_completed")
++        self.assertEqual(event.user_id, "u1")
++        self.assertEqual(event.stripe_customer_id, "cus_1")
++        self.assertEqual(event.data["stripe_subscription_id"], "sub_1")
++
++    def test_checkout_completion_rejects_conflicting_reference_and_metadata_identity(self):
++        stripe = SimpleNamespace(
++            Webhook=SimpleNamespace(construct_event=Mock()),
++        )
++        payload = (
++            b'{"id":"evt_checkout","type":"checkout.session.completed","data":{"object":'
++            b'{"payment_status":"paid","client_reference_id":"u1","customer":"cus_1",'
++            b'"subscription":"sub_1","metadata":{"user_id":"u2"}}}}'
++        )
++        with patch("accounts.billing.stripe_billing._import_stripe", return_value=stripe):
++            with self.assertRaises(BillingError):
++                self._provider().parse_webhook_event(payload, "sig")
++
++
+ class _PendingCheckoutProvider:
+     """Deterministic provider double for checkout-ownership regressions."""
+ 
+@@ -1396,7 +1710,7 @@
+         billing_flow.handle_webhook(self.subs, _StubProvider(event), b"{}", "sig")
+         self.assertEqual(resolve_plan_id(self.subs.get("u1")), "basic")
+ 
+-    def test_new_live_subscription_replaces_the_record(self):
++    def test_new_live_subscription_conflicts_with_another_live_record(self):
+         event = SubscriptionEvent(
+             kind="updated",
+             stripe_customer_id="cus_1",
+@@ -1407,11 +1721,12 @@
+                 "current_period_end": 1900000000,
+             },
+         )
+-        result = billing_flow.handle_webhook(self.subs, _StubProvider(event), b"{}", "sig")
+-        self.assertEqual(result, "applied")
++        with self.assertRaises(BillingError) as context:
++            billing_flow.handle_webhook(self.subs, _StubProvider(event), b"{}", "sig")
++        self.assertEqual(context.exception.status_code, 409)
+         record = self.subs.get("u1")
+-        self.assertEqual(record["stripe_subscription_id"], "sub_new")
+-        self.assertEqual(record["plan"], "pro")
++        self.assertEqual(record["stripe_subscription_id"], "sub_active")
++        self.assertEqual(record["plan"], "max")
+ 
+ 
+ class AnalyzeMeteringTests(BillingApiTests):
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/test_accounts.py	2026-09-14 20:27:39
++++ backend/test_accounts.py	2026-09-14 20:16:34
+@@ -18,6 +18,7 @@
+ )
+ from accounts.billing import MockBillingProvider, StripeBillingProvider
+ from accounts.identity import GoogleIdentityProvider, MockIdentityProvider
++from accounts.ports import ProviderSubscription
+ from accounts.storage import InMemoryAuthService, InMemorySubscriptionRepository
+ from accounts.testing import build_test_accounts
+ 
+@@ -159,8 +160,31 @@
+             raise AssertionError("not used")
+ 
+         def parse_webhook_event(self, payload, signature):
+-            return self.event
++            subscription_id = self.event.data.get("stripe_subscription_id") or "sub_stub"
++            derived_event_id = (
++                f"evt_stub_{subscription_id}_{self.event.kind}_"
++                f"{self.event.data.get('status')}_{self.event.data.get('cancel_at')}"
++            )
++            return SubscriptionEvent(
++                kind=self.event.kind,
++                event_id=self.event.event_id or derived_event_id,
++                user_id=self.event.user_id,
++                stripe_customer_id=self.event.stripe_customer_id,
++                data={**self.event.data, "stripe_subscription_id": subscription_id},
++            )
+ 
++        def retrieve_subscription(self, stripe_subscription_id):
++            event = self.parse_webhook_event(b"", None)
++            return ProviderSubscription(
++                user_id=event.user_id or "user-1",
++                stripe_customer_id=event.stripe_customer_id or "cus_1",
++                stripe_subscription_id=stripe_subscription_id,
++                plan=event.data.get("plan") or "pro",
++                status=event.data.get("status")
++                or ("canceled" if event.kind == "deleted" else "active"),
++                current_period_end=1_900_000_000,
++            )
++
+     def _accounts(self, event):
+         self.subscriptions = InMemorySubscriptionRepository()
+         return build_test_accounts(
+--- docs/tasks/review-remediation/evidence/RM-09/B-runtime-01/base/backend/test_openapi_manual_contract.py	2026-09-14 20:27:39
++++ backend/test_openapi_manual_contract.py	2026-09-14 20:15:37
+@@ -11,6 +11,7 @@
+ import pytest
+ from accounts import BillingError, SubscriptionEvent, User
+ from accounts.billing import MockBillingProvider
++from accounts.ports import ProviderSubscription
+ from accounts.storage import JsonEmailAuthService, JsonSubscriptionRepository
+ from accounts.testing import build_test_accounts
+ from core.plans import PLAN_CATALOG
+@@ -244,9 +245,24 @@
+             raise BillingError("Invalid webhook signature.", status_code=400)
+         return SubscriptionEvent(
+             kind="updated",
++            event_id="evt_test_0001",
+             user_id=UUID7,
+             stripe_customer_id="cus_test_0001",
+-            data={"plan": "pro", "status": "active"},
++            data={
++                "plan": "pro",
++                "status": "active",
++                "stripe_subscription_id": "sub_test_0001",
++            },
++        )
++
++    def retrieve_subscription(self, stripe_subscription_id: str):
++        return ProviderSubscription(
++            user_id=UUID7,
++            stripe_customer_id="cus_test_0001",
++            stripe_subscription_id=stripe_subscription_id,
++            plan="pro",
++            status="active",
++            current_period_end=1_900_000_000,
+         )
+ 
+ 

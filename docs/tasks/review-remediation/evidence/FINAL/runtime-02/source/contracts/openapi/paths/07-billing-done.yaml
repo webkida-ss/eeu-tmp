@@ -1,0 +1,44 @@
+get:
+  summary: Billing Done
+  operationId: getBillingDonePage
+  parameters:
+  - name: state
+    in: query
+    required: false
+    schema:
+      type: string
+      default: success
+      title: State
+    example: success
+  responses:
+    '200':
+      description: Successful Response
+      content:
+        text/html:
+          schema:
+            type: string
+          examples:
+            happy:
+              summary: Deterministic local response
+              x-contract-test-case: happy
+              value: <html><body><h2>Untangle</h2><p>Subscription updated.</p></body></html>
+    '422':
+      description: Validation Error
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/HTTPValidationError.yaml
+          example:
+            detail:
+            - type: value_error
+              loc:
+              - body
+              - field
+              msg: Request validation failed.
+              input: null
+  x-contract-test:
+    mode: generic
+    auth: anonymous
+    setup: none
+    owner: billing
+  security: []

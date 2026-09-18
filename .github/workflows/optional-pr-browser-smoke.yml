@@ -1,0 +1,56 @@
+name: Optional PR Browser Smoke
+
+on:
+  pull_request:
+    types:
+      - labeled
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: optional-browser-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser-smoke:
+    name: Trusted browser smoke
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       contains(format(',{0},', vars.TRUSTED_BROWSER_AUTOMATION_ACTOR_IDS),
+                format(',{0},', github.actor_id))) ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'run-browser-smoke' &&
+       contains(format(',{0},', vars.TRUSTED_BROWSER_AUTOMATION_ACTOR_IDS),
+                format(',{0},', github.actor_id)) &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.pull_request.author_association))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout read-only source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bootstrap managed tools
+        run: ./scripts/bootstrap.sh
+
+      - name: Run canonical setup
+        run: ./scripts/bootstrap.sh --exec task setup
+
+      - name: Install managed Playwright Chromium
+        run: ./scripts/bootstrap.sh --exec task setup:browser
+
+      - name: Run browser smoke
+        run: ./scripts/bootstrap.sh --exec task test:extension:smoke
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: optional-pr-playwright-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/playwright/
+          if-no-files-found: warn
+          retention-days: 14

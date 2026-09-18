@@ -1,0 +1,1 @@
+This harmless local fixture exists only so Terraform can calculate a Lambda source hash during plan-time provider-guard tests.

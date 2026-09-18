@@ -1,0 +1,2 @@
+# Copy to backend.hcl and set the account state bucket. Do not commit backend.hcl.
+bucket = "replace-with-state-bucket"

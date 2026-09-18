@@ -1,0 +1,840 @@
+# Historical design proposal; not a supported runtime contract.
+CorrelationError:
+  type: object
+  required: [code, message, correlation_id]
+  properties:
+    code:
+      type: string
+      enum:
+        - unauthenticated
+        - admin_forbidden
+        - account_suspended
+        - user_not_found
+        - validation_error
+        - internal_error
+    message:
+      type: string
+      minLength: 1
+      maxLength: 500
+    correlation_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+  example:
+    code: admin_forbidden
+    message: Administrator access is required.
+    correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+
+AuthConfig:
+  type: object
+  required: [provider, google_client_id]
+  properties:
+    provider:
+      type: string
+      enum: [mock, google]
+    google_client_id:
+      type: [string, "null"]
+  example:
+    provider: google
+    google_client_id: 123456789.apps.googleusercontent.com
+
+SsoLoginRequest:
+  type: object
+  required: [credential]
+  properties:
+    credential:
+      type: string
+      minLength: 1
+      maxLength: 4096
+      description: Google ID token, or a mock credential in local development.
+  example:
+    credential: mock:admin@example.com:Local Admin
+
+AuthUser:
+  type: object
+  required: [id, email, display_name]
+  properties:
+    id:
+      type: string
+      minLength: 1
+    email:
+      type: string
+      format: email
+    display_name:
+      type: string
+  example:
+    id: user-admin-1
+    email: admin@example.com
+    display_name: Local Admin
+
+AuthSessionResponse:
+  type: object
+  required: [access_token, token_type, user]
+  properties:
+    access_token:
+      type: string
+      minLength: 1
+    token_type:
+      type: string
+      const: Bearer
+    user:
+      $ref: "#/AuthUser"
+  example:
+    access_token: local-session-token
+    token_type: Bearer
+    user:
+      id: user-admin-1
+      email: admin@example.com
+      display_name: Local Admin
+
+LogoutResponse:
+  type: object
+  required: [status]
+  properties:
+    status:
+      type: string
+      const: ok
+  example:
+    status: ok
+
+AdminSession:
+  type: object
+  required: [user_id, email, display_name]
+  properties:
+    user_id:
+      type: string
+      minLength: 1
+    email:
+      type: string
+      format: email
+    display_name:
+      type: string
+  example:
+    user_id: user-admin-1
+    email: admin@example.com
+    display_name: Local Admin
+
+SectionError:
+  type: object
+  required: [code, correlation_id]
+  properties:
+    code:
+      type: string
+      const: section_unavailable
+    correlation_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+
+MetricTotals:
+  type: object
+  required:
+    - total_users
+    - new_users
+    - suspended_users
+    - active_users
+    - active_user_percentage
+    - articles
+    - chats
+    - input_tokens
+    - output_tokens
+    - tokens
+    - actual_cost_micro_usd
+  properties:
+    total_users:
+      type: integer
+      minimum: 0
+    new_users:
+      type: integer
+      minimum: 0
+    suspended_users:
+      type: integer
+      minimum: 0
+    active_users:
+      type: integer
+      minimum: 0
+    active_user_percentage:
+      type: number
+      minimum: 0
+      maximum: 100
+    articles:
+      type: integer
+      minimum: 0
+    chats:
+      type: integer
+      minimum: 0
+    input_tokens:
+      type: integer
+      minimum: 0
+    output_tokens:
+      type: integer
+      minimum: 0
+    tokens:
+      type: integer
+      minimum: 0
+    actual_cost_micro_usd:
+      type: integer
+      minimum: 0
+  example:
+    total_users: 42
+    new_users: 6
+    suspended_users: 1
+    active_users: 28
+    active_user_percentage: 66.67
+    articles: 193
+    chats: 418
+    input_tokens: 920000
+    output_tokens: 185000
+    tokens: 1105000
+    actual_cost_micro_usd: 2845000
+
+DailyMetric:
+  type: object
+  required:
+    - date
+    - active_users
+    - articles
+    - chats
+    - input_tokens
+    - output_tokens
+    - tokens
+    - actual_cost_micro_usd
+  properties:
+    date:
+      type: string
+      format: date
+    active_users:
+      type: integer
+      minimum: 0
+    articles:
+      type: integer
+      minimum: 0
+    chats:
+      type: integer
+      minimum: 0
+    input_tokens:
+      type: integer
+      minimum: 0
+    output_tokens:
+      type: integer
+      minimum: 0
+    tokens:
+      type: integer
+      minimum: 0
+    actual_cost_micro_usd:
+      type: integer
+      minimum: 0
+  example:
+    date: "2026-07-19"
+    active_users: 12
+    articles: 17
+    chats: 39
+    input_tokens: 82000
+    output_tokens: 17000
+    tokens: 99000
+    actual_cost_micro_usd: 251000
+
+PlanCount:
+  type: object
+  required: [plan_id, subscription_status, count]
+  properties:
+    plan_id:
+      type: string
+      minLength: 1
+    subscription_status:
+      type: string
+      minLength: 1
+    count:
+      type: integer
+      minimum: 0
+  example:
+    plan_id: launch
+    subscription_status: active
+    count: 31
+
+TopUser:
+  type: object
+  required: [user_id, email, plan_id, tokens, quota_percentage]
+  properties:
+    user_id:
+      type: string
+      minLength: 1
+    email:
+      type: string
+      format: email
+    plan_id:
+      type: string
+      minLength: 1
+    tokens:
+      type: integer
+      minimum: 0
+    quota_percentage:
+      type: number
+      minimum: 0
+  example:
+    user_id: user-17
+    email: learner@example.com
+    plan_id: launch
+    tokens: 180400
+    quota_percentage: 72.16
+
+Alert:
+  type: object
+  required: [type, recorded_at, user_id, operation, message]
+  properties:
+    type:
+      type: string
+      enum:
+        - quota_pressure
+        - quota_blocked
+        - failure_spike
+        - elevated_failure_rate
+    recorded_at:
+      type: string
+      format: date-time
+    user_id:
+      type: [string, "null"]
+    operation:
+      type: [string, "null"]
+      enum: [article, chat, null]
+    message:
+      type: string
+      minLength: 1
+      maxLength: 500
+  example:
+    type: quota_pressure
+    recorded_at: "2026-07-19T12:30:00Z"
+    user_id: user-17
+    operation: chat
+    message: Chat token usage has reached 82 percent of the monthly limit.
+
+MetricTotalsSection:
+  oneOf:
+    - type: object
+      required: [status, data]
+      properties:
+        status:
+          type: string
+          const: ok
+        data:
+          $ref: "#/MetricTotals"
+    - type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          const: error
+        error:
+          $ref: "#/SectionError"
+
+DailyMetricsSection:
+  oneOf:
+    - type: object
+      required: [status, data]
+      properties:
+        status:
+          type: string
+          const: ok
+        data:
+          type: array
+          items:
+            $ref: "#/DailyMetric"
+    - type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          const: error
+        error:
+          $ref: "#/SectionError"
+
+PlanCountsSection:
+  oneOf:
+    - type: object
+      required: [status, data]
+      properties:
+        status:
+          type: string
+          const: ok
+        data:
+          type: array
+          items:
+            $ref: "#/PlanCount"
+    - type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          const: error
+        error:
+          $ref: "#/SectionError"
+
+TopUsersSection:
+  oneOf:
+    - type: object
+      required: [status, data]
+      properties:
+        status:
+          type: string
+          const: ok
+        data:
+          type: array
+          items:
+            $ref: "#/TopUser"
+    - type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          const: error
+        error:
+          $ref: "#/SectionError"
+
+AlertsSection:
+  oneOf:
+    - type: object
+      required: [status, data]
+      properties:
+        status:
+          type: string
+          const: ok
+        data:
+          type: array
+          items:
+            $ref: "#/Alert"
+    - type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          const: error
+        error:
+          $ref: "#/SectionError"
+
+DashboardResponse:
+  type: object
+  required: [totals, daily, plans, top_users, alerts]
+  properties:
+    totals:
+      $ref: "#/MetricTotalsSection"
+    daily:
+      $ref: "#/DailyMetricsSection"
+    plans:
+      $ref: "#/PlanCountsSection"
+    top_users:
+      $ref: "#/TopUsersSection"
+    alerts:
+      $ref: "#/AlertsSection"
+  example:
+    totals:
+      status: ok
+      data:
+        total_users: 42
+        new_users: 6
+        suspended_users: 1
+        active_users: 28
+        active_user_percentage: 66.67
+        articles: 193
+        chats: 418
+        input_tokens: 920000
+        output_tokens: 185000
+        tokens: 1105000
+        actual_cost_micro_usd: 2845000
+    daily:
+      status: ok
+      data: []
+    plans:
+      status: ok
+      data: []
+    top_users:
+      status: ok
+      data: []
+    alerts:
+      status: error
+      error:
+        code: section_unavailable
+        correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+
+AdminUserSummary:
+  type: object
+  required:
+    - id
+    - email
+    - display_name
+    - created_at
+    - account_status
+    - plan_id
+    - subscription_status
+    - tokens
+  properties:
+    id:
+      type: string
+      minLength: 1
+    email:
+      type: string
+      format: email
+    display_name:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    account_status:
+      type: string
+      enum: [active, suspended]
+    plan_id:
+      type: string
+      minLength: 1
+    subscription_status:
+      type: string
+      minLength: 1
+    tokens:
+      type: integer
+      minimum: 0
+  example:
+    id: user-17
+    email: learner@example.com
+    display_name: Example Learner
+    created_at: "2026-06-01T09:00:00Z"
+    account_status: active
+    plan_id: launch
+    subscription_status: active
+    tokens: 180400
+
+UserUsage:
+  type: object
+  required:
+    - period_start
+    - period_end
+    - articles
+    - chats
+    - input_tokens
+    - output_tokens
+    - tokens
+    - actual_cost_micro_usd
+    - article_limit
+    - chat_limit
+    - token_limit
+    - article_quota_percentage
+    - chat_quota_percentage
+    - token_quota_percentage
+  properties:
+    period_start:
+      type: string
+      format: date-time
+    period_end:
+      type: string
+      format: date-time
+    articles:
+      type: integer
+      minimum: 0
+    chats:
+      type: integer
+      minimum: 0
+    input_tokens:
+      type: integer
+      minimum: 0
+    output_tokens:
+      type: integer
+      minimum: 0
+    tokens:
+      type: integer
+      minimum: 0
+    actual_cost_micro_usd:
+      type: integer
+      minimum: 0
+    article_limit:
+      type: [integer, "null"]
+      minimum: 0
+    chat_limit:
+      type: [integer, "null"]
+      minimum: 0
+    token_limit:
+      type: [integer, "null"]
+      minimum: 0
+    article_quota_percentage:
+      type: number
+      minimum: 0
+    chat_quota_percentage:
+      type: number
+      minimum: 0
+    token_quota_percentage:
+      type: number
+      minimum: 0
+
+ActivityEvent:
+  type: object
+  required:
+    - id
+    - source_id
+    - user_id
+    - operation
+    - status
+    - recorded_at
+    - error_code
+    - input_tokens
+    - output_tokens
+    - tokens
+    - actual_cost_micro_usd
+    - model
+  properties:
+    id:
+      type: string
+      format: uuid
+      pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+      description: UUID version 7 primary identifier.
+    source_id:
+      type: string
+      minLength: 1
+      maxLength: 200
+      description: Idempotency key from the originating operation or preload.
+    user_id:
+      type: string
+      minLength: 1
+    operation:
+      type: string
+      enum: [article, chat]
+    status:
+      type: string
+      enum: [success, failed, quota_blocked]
+    recorded_at:
+      type: string
+      format: date-time
+    error_code:
+      type: [string, "null"]
+      maxLength: 100
+    input_tokens:
+      type: [integer, "null"]
+      minimum: 0
+    output_tokens:
+      type: [integer, "null"]
+      minimum: 0
+    tokens:
+      type: [integer, "null"]
+      minimum: 0
+    actual_cost_micro_usd:
+      type: [integer, "null"]
+      minimum: 0
+    model:
+      type: [string, "null"]
+      maxLength: 200
+  example:
+    id: 019bf000-0000-7000-8000-000000000001
+    source_id: 019bf000-0000-7000-8000-000000000002
+    user_id: user-17
+    operation: chat
+    status: success
+    recorded_at: "2026-07-19T12:30:00Z"
+    error_code: null
+    input_tokens: 320
+    output_tokens: 84
+    tokens: 404
+    actual_cost_micro_usd: 920
+    model: test-model
+
+AdminAuditEvent:
+  type: object
+  required:
+    - id
+    - actor_user_id
+    - actor_email
+    - target_user_id
+    - action
+    - reason
+    - recorded_at
+    - correlation_id
+  properties:
+    id:
+      type: string
+      format: uuid
+      pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+      description: UUID version 7 primary identifier.
+    actor_user_id:
+      type: string
+      minLength: 1
+    actor_email:
+      type: string
+      format: email
+    target_user_id:
+      type: string
+      minLength: 1
+    action:
+      type: string
+      enum: [user_suspended, user_reactivated]
+    reason:
+      type: string
+      minLength: 1
+      maxLength: 500
+    recorded_at:
+      type: string
+      format: date-time
+    correlation_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+  example:
+    id: 019bf000-0000-7000-8000-000000000003
+    actor_user_id: user-admin-1
+    actor_email: admin@example.com
+    target_user_id: user-17
+    action: user_suspended
+    reason: Investigating repeated automated traffic.
+    recorded_at: "2026-07-19T13:00:00Z"
+    correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+
+AdminUserDetail:
+  allOf:
+    - $ref: "#/AdminUserSummary"
+    - type: object
+      required:
+        - suspended_at
+        - suspended_reason
+        - current_usage
+        - recent_activity
+        - recent_audit_events
+      properties:
+        suspended_at:
+          type: [string, "null"]
+          format: date-time
+        suspended_reason:
+          type: [string, "null"]
+          maxLength: 500
+        current_usage:
+          $ref: "#/UserUsage"
+        recent_activity:
+          type: array
+          items:
+            $ref: "#/ActivityEvent"
+        recent_audit_events:
+          type: array
+          items:
+            $ref: "#/AdminAuditEvent"
+
+AccountTransitionRequest:
+  type: object
+  required: [reason]
+  properties:
+    reason:
+      type: string
+      minLength: 1
+      maxLength: 500
+      pattern: ".*\\S.*"
+  example:
+    reason: Investigating repeated automated traffic.
+
+AccountTransitionResponse:
+  type: object
+  required:
+    - user_id
+    - account_status
+    - changed
+    - suspended_at
+    - suspended_reason
+    - audit_event
+  properties:
+    user_id:
+      type: string
+      minLength: 1
+    account_status:
+      type: string
+      enum: [active, suspended]
+    changed:
+      type: boolean
+      description: False when the requested state was already effective.
+    suspended_at:
+      type: [string, "null"]
+      format: date-time
+    suspended_reason:
+      type: [string, "null"]
+      maxLength: 500
+    audit_event:
+      oneOf:
+        - $ref: "#/AdminAuditEvent"
+        - type: "null"
+  example:
+    user_id: user-17
+    account_status: suspended
+    changed: true
+    suspended_at: "2026-07-19T13:00:00Z"
+    suspended_reason: Investigating repeated automated traffic.
+    audit_event:
+      id: 019bf000-0000-7000-8000-000000000003
+      actor_user_id: user-admin-1
+      actor_email: admin@example.com
+      target_user_id: user-17
+      action: user_suspended
+      reason: Investigating repeated automated traffic.
+      recorded_at: "2026-07-19T13:00:00Z"
+      correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+
+CursorPage:
+  type: object
+  required: [next_cursor]
+  properties:
+    next_cursor:
+      type: [string, "null"]
+      minLength: 1
+      maxLength: 2048
+      description: Opaque cursor to pass unchanged to the next request.
+
+AdminUserPage:
+  allOf:
+    - $ref: "#/CursorPage"
+    - type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/AdminUserSummary"
+  example:
+    items:
+      - id: user-17
+        email: learner@example.com
+        display_name: Example Learner
+        created_at: "2026-06-01T09:00:00Z"
+        account_status: active
+        plan_id: launch
+        subscription_status: active
+        tokens: 180400
+    next_cursor: eyJpZCI6InVzZXItMTcifQ
+
+AlertPage:
+  allOf:
+    - $ref: "#/CursorPage"
+    - type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/Alert"
+  example:
+    items:
+      - type: quota_pressure
+        recorded_at: "2026-07-19T12:30:00Z"
+        user_id: user-17
+        operation: chat
+        message: Chat token usage has reached 82 percent of the monthly limit.
+    next_cursor: null
+
+AuditEventPage:
+  allOf:
+    - $ref: "#/CursorPage"
+    - type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/AdminAuditEvent"
+  example:
+    items:
+      - id: 019bf000-0000-7000-8000-000000000003
+        actor_user_id: user-admin-1
+        actor_email: admin@example.com
+        target_user_id: user-17
+        action: user_suspended
+        reason: Investigating repeated automated traffic.
+        recorded_at: "2026-07-19T13:00:00Z"
+        correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+    next_cursor: null

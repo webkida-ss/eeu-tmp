@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Configuring retries</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <p>Example Docs</p>
+    </header>
+
+    <main>
+      <h1 id="title">Configuring retries</h1>
+      <p id="body-1">
+        Every outbound call in the client library retries twice by default. The delay between
+        attempts doubles each time.
+      </p>
+      <p id="body-2">
+        Set the retry budget per client rather than per request. A shared budget is what stops a
+        slow dependency from amplifying traffic.
+      </p>
+      <p id="body-3">
+        Idempotency keys are required for any retried write. The library generates one automatically
+        when you do not supply it yourself.
+      </p>
+    </main>
+
+    <footer>
+      <p>Example Docs is generated from the client library source tree.</p>
+    </footer>
+  </body>
+</html>

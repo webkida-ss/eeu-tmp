@@ -1,0 +1,1 @@
+Parent canonical lint:backend,format:backend:check,infra:format:check,test:backend:unit passed against source-02;842passed6skipped33subtests, combinedexit0. Native provider checks remain blocked separately.

@@ -1,0 +1,186 @@
+--- ../B-shared-01/source/backend/repositories/usage_repository.py	2026-09-14 22:50:07
++++ source/backend/repositories/usage_repository.py	2026-09-14 22:55:29
+@@ -528,6 +528,8 @@
+         *,
+         result_ref: str | None = None,
+     ) -> UsageOperation:
++        if outcome not in ("success", "failed_before_dispatch", "failed_after_dispatch"):
++            raise UsageOperationConflict("Shadow settlement outcome is invalid")
+         with self._lock, json_list_lock(self._path):
+             items = self._load_items_with_cleanup()
+             record = _find_operation(items, user_id, operation_id)
+@@ -537,6 +539,11 @@
+             if operation.accounting_mode != "shadow":
+                 raise UsageOperationStateError("Operation is not shadow accounted")
+             if operation.state == "finalized":
++                if (
++                    operation.shadow_outcome != outcome
++                    or operation.result_ref != result_ref
++                ):
++                    raise UsageOperationConflict("Shadow settlement outcome conflicts")
+                 return operation
+             pending = _shadow_pending_values(operation, outcome, result_ref)
+             prepared = operation.with_shadow_pending(**pending)
+@@ -1036,6 +1043,8 @@
+         raise UsageOperationConflict("Dispatch evidence kind is invalid")
+     if operation.dispatch_kind and kind and operation.dispatch_kind != kind:
+         raise UsageOperationConflict("Dispatch evidence kind conflicts with the operation")
++    if operation.accounting_mode == "shadow" and operation.shadow_pending_outcome:
++        raise UsageOperationConflict("Prepared shadow settlement cannot accept later evidence")
+     if state == "dispatching":
+         if operation.dispatch_evidence_state != "not_dispatched":
+             raise UsageOperationStateError("Dispatch is already authorized or unavailable")
+@@ -1127,6 +1136,8 @@
+     outcome: ShadowSettlementOutcome,
+     result_ref: str | None,
+ ) -> dict[str, Any]:
++    if outcome not in ("success", "failed_before_dispatch", "failed_after_dispatch"):
++        raise UsageOperationConflict("Shadow settlement outcome is invalid")
+     if operation.accounting_mode != "shadow":
+         raise UsageOperationStateError("Operation is not shadow accounted")
+     if outcome == "failed_before_dispatch":
+--- ../B-shared-01/source/backend/repositories/dynamodb_billing_repositories.py	2026-09-14 22:50:07
++++ source/backend/repositories/dynamodb_billing_repositories.py	2026-09-14 22:55:29
+@@ -158,6 +158,8 @@
+         *,
+         result_ref: str | None = None,
+     ) -> UsageOperation:
++        if outcome not in ("success", "failed_before_dispatch", "failed_after_dispatch"):
++            raise UsageOperationConflict("Shadow settlement outcome is invalid")
+         for _attempt in range(4):
+             operation = self.get_operation(user_id, operation_id)
+             if operation is None:
+@@ -165,6 +167,11 @@
+             if operation.accounting_mode != "shadow":
+                 raise UsageOperationStateError("Operation is not shadow accounted")
+             if operation.state == "finalized":
++                if (
++                    operation.shadow_outcome != outcome
++                    or operation.result_ref != result_ref
++                ):
++                    raise UsageOperationConflict("Shadow settlement outcome conflicts")
+                 return operation
+             prepared = operation.with_shadow_pending(
+                 **_shadow_pending_values(operation, outcome, result_ref)
+@@ -640,33 +647,8 @@
+                 if operation is None or operation.state != "reserved":
+                     continue
+                 if operation.accounting_mode == "shadow":
+-                    execution = (
+-                        self._store.get_item(
+-                            user_pk(user_id),
+-                            usage_execution_sk(operation.operation_id),
+-                            consistent_read=True,
+-                        )
+-                        or {}
+-                    )
+-                    execution_expiry = execution.get("expires_at")
+-                    if execution_expiry and _parse_datetime(str(execution_expiry)) > now:
+-                        continue
+-                    try:
+-                        if not operation.shadow_pending_outcome:
+-                            if operation.dispatch_evidence_state == "not_dispatched":
+-                                outcome: ShadowSettlementOutcome = "failed_before_dispatch"
+-                            elif operation.dispatch_evidence_state in ("dispatched", "completed"):
+-                                outcome = "failed_after_dispatch"
+-                            else:
+-                                continue
+-                            operation = self.prepare_shadow_settlement(
+-                                user_id, operation.operation_id, outcome
+-                            )
+-                        if operation.state == "reserved":
+-                            self.settle_shadow(user_id, operation.operation_id)
+-                            reclaimed += 1
+-                    except UsageOperationStateError:
+-                        pass
++                    if self._reclaim_shadow(user_id, operation.operation_id, now):
++                        reclaimed += 1
+                     continue
+                 if operation.dispatch_evidence_state != "not_dispatched":
+                     if self._reclaim_finalize(user_id, operation.operation_id, now):
+@@ -685,6 +667,85 @@
+                     pass
+         return reclaimed
+ 
++    def _reclaim_shadow(self, user_id: str, operation_id: str, now: datetime) -> bool:
++        """Prepare then settle an expired shadow operation under lease fencing."""
++        for _attempt in range(4):
++            operation = self.get_operation(user_id, operation_id)
++            if (
++                operation is None
++                or operation.accounting_mode != "shadow"
++                or operation.state != "reserved"
++                or operation.expires_at > now
++            ):
++                return False
++            execution = self._store.get_item(
++                user_pk(user_id), usage_execution_sk(operation_id), consistent_read=True
++            ) or {}
++            execution_expiry = execution.get("expires_at")
++            if execution_expiry and _parse_datetime(str(execution_expiry)) > now:
++                return False
++            if not operation.shadow_pending_outcome:
++                if operation.dispatch_evidence_state == "not_dispatched":
++                    outcome: ShadowSettlementOutcome = "failed_before_dispatch"
++                elif operation.dispatch_evidence_state in ("dispatched", "completed"):
++                    outcome = "failed_after_dispatch"
++                else:
++                    return False
++                prepared = operation.with_shadow_pending(
++                    **_shadow_pending_values(operation, outcome, None)
++                )
++                try:
++                    self._store.transact_write(
++                        [
++                            self._operation_put(
++                                prepared,
++                                expected_state="reserved",
++                                expected_expires_at=operation.expires_at,
++                                expected_dispatch_evidence_version=operation.dispatch_evidence_version,
++                            ),
++                            self._event_put(prepared, "shadow_prepare"),
++                            self._expired_execution_check(user_id, operation_id, now),
++                        ]
++                    )
++                    continue
++                except ClientError as exc:
++                    if not _is_transaction_failure(exc):
++                        raise
++                    continue
++
++            month = self._load_month(operation.user_id, operation.month)
++            expected_version = int(month.get("version") or 0)
++            usage = operation.shadow_pending_usage or {}
++            _apply_amounts(
++                month,
++                {
++                    "articles": int(usage.get("actual_articles") or 0),
++                    "tokens": int(usage.get("total_tokens") or 0),
++                    "shadow_cost_micro_usd": int(usage.get("actual_cost_micro_usd") or 0),
++                },
++            )
++            month["version"] = expected_version + 1
++            settled = operation.settled_shadow()
++            try:
++                self._store.transact_write(
++                    [
++                        self._aggregate_put(month, expected_version),
++                        self._operation_put(
++                            settled,
++                            expected_state="reserved",
++                            expected_expires_at=operation.expires_at,
++                            expected_dispatch_evidence_version=operation.dispatch_evidence_version,
++                        ),
++                        self._event_put(settled, "shadow_settle"),
++                        self._expired_execution_check(user_id, operation_id, now),
++                    ]
++                )
++                return True
++            except ClientError as exc:
++                if not _is_transaction_failure(exc):
++                    raise
++        return False
++
+     def _reclaim_finalize(self, user_id: str, operation_id: str, now: datetime) -> bool:
+         """Settle only an operation that remains expired and unowned at commit."""
+         for _attempt in range(4):

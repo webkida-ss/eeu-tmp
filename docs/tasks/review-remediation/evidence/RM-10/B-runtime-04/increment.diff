@@ -1,0 +1,532 @@
+--- before/backend/services/preloading.py
++++ after/backend/services/preloading.py
+@@ -270,6 +270,19 @@
+             )
+         )
+     existing = repository.get_by_page_url(user_id, request.page_url)
++    if (
++        existing
++        and existing.get("operation_id") == request.operation_id
++        and (
++            existing.get("payload_hash") != payload_hash
++            or existing.get("learner_profile_fingerprint") != learner_profile_fingerprint
++        )
++    ):
++        raise EntitlementError(
++            "Operation ID was already used for a different payload.",
++            code="operation_payload_conflict",
++            status_code=409,
++        )
+     if existing and _is_fresh_processing(existing) and not reservation_enabled:
+         existing_fingerprint = existing.get(
+             "learner_profile_fingerprint"
+@@ -825,7 +838,29 @@
+             "failed",
+             "failed_pending_usage",
+         ):
+-            if record.get("status") == "processing":
++            recovery_lease_id = None
++            expected_status = "processing"
++            if record.get("status") == "running":
++                recovery_now = datetime.now(UTC)
++                if not _has_expired_preload_lease(record, recovery_now):
++                    return
++                recovery_lease_id = generate_uuid7()
++                recovery_lease_expires_at = recovery_now + timedelta(
++                    seconds=max(1, int(os.getenv("PRELOAD_WORKER_LEASE_SECONDS", "900")))
++                )
++                record = repository.claim_processing(
++                    user_id,
++                    preload_id,
++                    learner_profile_fingerprint,
++                    lease_id=recovery_lease_id,
++                    now=recovery_now,
++                    lease_expires_at=recovery_lease_expires_at,
++                )
++                if not record:
++                    return
++                record.pop("_claimed_from_unstarted_processing", None)
++                expected_status = "running"
++            if record.get("status") in ("processing", "running"):
+                 blocked = dict(record)
+                 blocked["status"] = "failed"
+                 blocked["content_retirement_pending"] = True
+@@ -839,7 +874,8 @@
+                     preload_id,
+                     learner_profile_fingerprint,
+                     blocked,
+-                    expected_status="processing",
++                    lease_id=recovery_lease_id,
++                    expected_status=expected_status,
+                 )
+                 if completed:
+                     _retire_terminal_content(
+@@ -1049,7 +1085,6 @@
+             return
+ 
+     latest = repository.get_by_page_url(user_id, page_url)
+-    was_unclaimed_processing = record.get("status") == "processing"
+ 
+     lease_id = generate_uuid7()
+     lease_now = datetime.now(UTC)
+@@ -1071,13 +1106,16 @@
+             preload_id,
+         )
+         return
++    claimed_from_unstarted_processing = bool(
++        record.pop("_claimed_from_unstarted_processing", False)
++    )
+     if reclaimed_worker_lease:
+         _log_recovery_event(
+             "execution_lease_recovered",
+             operation_id=operation_id or preload_id,
+             kind="preload",
+         )
+-    if was_unclaimed_processing and latest and latest.get("id") != preload_id:
++    if claimed_from_unstarted_processing and latest and latest.get("id") != preload_id:
+         superseded = dict(record)
+         superseded["status"] = "failed_pending_usage" if meter else "failed"
+         superseded["content_retirement_pending"] = True
+--- before/backend/repositories/page_preload_repository.py
++++ after/backend/repositories/page_preload_repository.py
+@@ -216,6 +216,7 @@
+                 **record,
+                 "id": preload_id,
+                 "status": "content_pending",
++                "worker_execution_started": False,
+                 "content_handoff_token": generate_uuid7(),
+                 "content_handoff_expires_at": (
+                     moment + timedelta(seconds=_CONTENT_HANDOFF_SECONDS)
+@@ -365,6 +366,7 @@
+                 return None
+             claimed = dict(record)
+             claimed["status"] = "running"
++            claimed["worker_execution_started"] = True
+             if lease_id:
+                 claimed["lease_id"] = lease_id
+                 claimed["lease_expires_at"] = (
+@@ -372,7 +374,14 @@
+                 )
+                 claimed["attempt_count"] = int(record.get("attempt_count") or 0) + 1
+             self._save_locked(records, user_id, claimed, make_latest=False)
+-            return claimed
++            return {
++                **claimed,
++                "_claimed_from_unstarted_processing": (
++                    status == "processing"
++                    and not record.get("lease_id")
++                    and record.get("worker_execution_started") is False
++                ),
++            }
+ 
+     def finish_processing(
+         self,
+--- before/backend/repositories/dynamodb_page_preload_repository.py
++++ after/backend/repositories/dynamodb_page_preload_repository.py
+@@ -106,6 +106,7 @@
+             "user_id": user_id,
+             "page_url": normalized_url,
+             "status": "content_pending",
++            "worker_execution_started": False,
+             "content_handoff_token": generate_uuid7(),
+             "content_handoff_expires_at": (
+                 moment + timedelta(seconds=_CONTENT_HANDOFF_SECONDS)
+@@ -376,6 +377,7 @@
+             return None
+         claimed = dict(record)
+         claimed["status"] = "running"
++        claimed["worker_execution_started"] = True
+         if lease_id:
+             claimed["lease_id"] = lease_id
+             claimed["lease_expires_at"] = (lease_expires_at or moment).astimezone(UTC).isoformat()
+@@ -388,6 +390,9 @@
+         if status == "running":
+             expected["lease_id"] = str(record.get("lease_id") or "")
+             expected["lease_expires_at"] = str(record.get("lease_expires_at") or "")
++        if record.get("worker_execution_started") is False:
++            expected["worker_execution_started"] = False
++            expected["lease_id"] = ""
+         if not self._store.conditional_put_document(
+             user_pk(user_id),
+             preload_id_sk(preload_id),
+@@ -396,7 +401,14 @@
+             expected_attributes=expected,
+         ):
+             return None
+-        return claimed
++        return {
++            **claimed,
++            "_claimed_from_unstarted_processing": (
++                status == "processing"
++                and not record.get("lease_id")
++                and record.get("worker_execution_started") is False
++            ),
++        }
+ 
+     def finish_processing(
+         self,
+@@ -467,6 +479,7 @@
+             "submitted": bool(record.get("submitted")),
+             "content_handoff_token": str(record.get("content_handoff_token") or ""),
+             "content_handoff_expires_at": str(record.get("content_handoff_expires_at") or ""),
++            "worker_execution_started": bool(record.get("worker_execution_started")),
+         }
+ 
+     def _conditional_put_item(
+--- before/backend/test_preload_handoff_workflow.py
++++ after/backend/test_preload_handoff_workflow.py
+@@ -110,6 +110,28 @@
+             if not self._continue_latest_lookup.wait(timeout=2):
+                 raise TimeoutError("Test did not release the stale worker")
+         return super().get_by_page_url(user_id, page_url)
++
++
++class PausingRequestedIdReadJsonRepository(JsonPagePreloadRepository):
++    def __init__(
++        self,
++        path: Path,
++        requested_read_seen: threading.Event,
++        continue_submit: threading.Event,
++    ) -> None:
++        super().__init__(path)
++        self._requested_read_seen = requested_read_seen
++        self._continue_submit = continue_submit
++        self._pause_once = True
++
++    def get_by_id(self, user_id: str, preload_id: str):
++        record = super().get_by_id(user_id, preload_id)
++        if self._pause_once:
++            self._pause_once = False
++            self._requested_read_seen.set()
++            if not self._continue_submit.wait(timeout=2):
++                raise TimeoutError("Test did not release the delayed shadow submitter")
++        return record
+ 
+ 
+ class CrashBeforePublicationContentStore(FilesystemPreloadContentStore):
+@@ -447,6 +469,57 @@
+         self.assertEqual(current["payload_hash"], winner["payload_hash"])
+         self.assertEqual(len(runner.calls), 1)
+         self.assertIsNone(shadow_meter.get_operation(_OPERATION_ID))
++        self.assertIsNone(self.usage.get_operation(_USER_ID, _OPERATION_ID))
++
++    def test_shadow_loser_rechecks_a_conflicting_same_id_winner_after_requested_read(self) -> None:
++        requested_read_seen = threading.Event()
++        continue_submit = threading.Event()
++        loser_repository = PausingRequestedIdReadJsonRepository(
++            self.preload_path,
++            requested_read_seen,
++            continue_submit,
++        )
++        winner_repository = JsonPagePreloadRepository(self.preload_path)
++        content = FilesystemPreloadContentStore(self.content_dir)
++        loser_runner = RecordingRunner()
++        winner_runner = RecordingRunner()
++        loser_meter = self._shadow_meter()
++        winner_meter = self._shadow_meter()
++        loser_errors: list[BaseException] = []
++        winner_request = self._request().model_copy(update={"html": _CONFLICTING_PAGE_HTML})
++
++        def delayed_loser_submit() -> None:
++            try:
++                self._submit(loser_repository, loser_runner, content, meter=loser_meter)
++            except BaseException as exc:
++                loser_errors.append(exc)
++
++        loser_thread = threading.Thread(target=delayed_loser_submit)
++        loser_thread.start()
++        try:
++            self.assertTrue(requested_read_seen.wait(timeout=2))
++            self._submit(
++                winner_repository,
++                winner_runner,
++                content,
++                request=winner_request,
++                meter=winner_meter,
++            )
++            winner = winner_repository.get_by_id(_USER_ID, _OPERATION_ID)
++        finally:
++            continue_submit.set()
++            loser_thread.join(timeout=2)
++
++        self.assertFalse(loser_thread.is_alive())
++        self.assertEqual(len(loser_errors), 1)
++        self.assertIsInstance(loser_errors[0], EntitlementError)
++        self.assertEqual(loser_errors[0].status_code, 409)
++        current = winner_repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(current["payload_hash"], winner["payload_hash"])
++        self.assertEqual(len(winner_runner.calls), 1)
++        self.assertEqual(loser_runner.calls, [])
++        self.assertIsNone(loser_meter.get_operation(_OPERATION_ID))
++        self.assertIsNone(winner_meter.get_operation(_OPERATION_ID))
+         self.assertIsNone(self.usage.get_operation(_USER_ID, _OPERATION_ID))
+ 
+     def test_shadow_failed_handoff_retries_retirement_without_usage_release(self) -> None:
+@@ -498,7 +571,238 @@
+         self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
+         self.assertEqual(runner.calls, [])
+         self.assertEqual(meter.get_operation(_OPERATION_ID).state, "reserved")
++
++    def test_released_usage_only_terminalizes_an_abandoned_running_lease(self) -> None:
++        for lease_state in ("expired", "live"):
++            with self.subTest(lease_state=lease_state):
++                operation_id = (
++                    "019b63f8-f600-7000-8000-000000000105"
++                    if lease_state == "expired"
++                    else "019b63f8-f600-7000-8000-000000000106"
++                )
++                request = self._request().model_copy(
++                    update={
++                        "operation_id": operation_id,
++                        "page_url": f"{_PAGE_URL}/released-{lease_state}",
++                    }
++                )
++                repository = JsonPagePreloadRepository(self.preload_path)
++                content = FilesystemPreloadContentStore(self.content_dir / lease_state)
++                runner = RecordingRunner()
++                meter = self._meter()
++                self._submit(repository, runner, content, request=request, meter=meter)
++                now = datetime.now(UTC)
++                claimed = repository.claim_processing(
++                    _USER_ID,
++                    operation_id,
++                    runner.calls[0][3],
++                    lease_id=f"{lease_state}-worker-lease",
++                    now=now,
++                    lease_expires_at=now + timedelta(minutes=1),
++                )
++                self.assertIsNotNone(claimed)
++                if lease_state == "expired":
++                    expired = dict(claimed)
++                    expired["lease_expires_at"] = (now - timedelta(minutes=1)).isoformat()
++                    repository.save(_USER_ID, expired, make_latest=False)
++                meter.release(operation_id, "simulated reservation expiration")
++
++                self._run_job_without_provider(repository, runner, content)
++
++                current = repository.get_by_id(_USER_ID, operation_id)
++                if lease_state == "expired":
++                    self.assertEqual(current["status"], "failed")
++                    self.assertEqual(current["usage_state"], "released")
++                    self.assertIsNone(content.get(_USER_ID, operation_id))
++                else:
++                    self.assertEqual(current["status"], "running")
++                    self.assertEqual(current["lease_id"], "live-worker-lease")
++                    self.assertIsNotNone(content.get(_USER_ID, operation_id))
++
++    def test_stale_superseded_worker_settles_a_reclaimed_dispatch_marker(self) -> None:
++        source_repository = JsonPagePreloadRepository(self.preload_path)
++        latest_lookup_seen = threading.Event()
++        continue_latest_lookup = threading.Event()
++        stale_repository = PausingLatestJsonRepository(
++            self.preload_path,
++            latest_lookup_seen,
++            continue_latest_lookup,
++        )
++        content = FilesystemPreloadContentStore(self.content_dir)
++        old_runner = RecordingRunner()
++        newest_runner = RecordingRunner()
++        stale_errors: list[BaseException] = []
++        self._submit(source_repository, old_runner, content)
++        original = source_repository.get_by_id(_USER_ID, _OPERATION_ID)
++
++        def stale_worker() -> None:
++            try:
++                with mock.patch.object(
++                    UsageMeter,
++                    "release",
++                    side_effect=AssertionError("a dispatch marker must not be released"),
++                ):
++                    self._run_job_without_provider(stale_repository, old_runner, content)
++            except BaseException as exc:
++                stale_errors.append(exc)
++
++        stale_thread = threading.Thread(target=stale_worker)
++        stale_thread.start()
++        try:
++            self.assertTrue(latest_lookup_seen.wait(timeout=2))
++            now = datetime.now(UTC)
++            claimed = source_repository.claim_processing(
++                _USER_ID,
++                _OPERATION_ID,
++                original["learner_profile_fingerprint"],
++                lease_id="dispatched-worker-lease",
++                now=now,
++                lease_expires_at=now + timedelta(minutes=1),
++            )
++            self.assertIsNotNone(claimed)
++            meter = self._meter()
++            operation = meter.get_operation(_OPERATION_ID)
++            self.assertTrue(
++                meter.claim_execution(
++                    _OPERATION_ID,
++                    "dispatched-execution-lease",
++                    now - timedelta(minutes=2),
++                    now - timedelta(minutes=1),
++                )
++            )
++            meter.save_result(
++                _OPERATION_ID,
++                {
++                    "kind": "preload",
++                    "state": "dispatching",
++                    "usage": {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
++                },
++            )
++            expired = dict(claimed)
++            expired["lease_expires_at"] = (now - timedelta(minutes=1)).isoformat()
++            source_repository.save(_USER_ID, expired, make_latest=False)
++            newest_request = self._request().model_copy(
++                update={
++                    "operation_id": "019b63f8-f600-7000-8000-000000000107",
++                    "learner_level": "Newer learner profile",
++                }
++            )
++            self._submit(source_repository, newest_runner, content, request=newest_request)
++        finally:
++            continue_latest_lookup.set()
++            stale_thread.join(timeout=2)
+ 
++        self.assertFalse(stale_thread.is_alive())
++        self.assertEqual(stale_errors, [])
++        current = source_repository.get_by_id(_USER_ID, _OPERATION_ID)
++        settled = self._meter().get_operation(_OPERATION_ID)
++        self.assertEqual(current["status"], "failed")
++        self.assertEqual(current["usage_state"], "finalized_conservative")
++        self.assertEqual(settled.state, "finalized")
++        self.assertEqual(
++            settled.actual_cost_micro_usd,
++            operation.reserved_cost_micro_usd,
++        )
++        self.assertIsNone(content.get(_USER_ID, _OPERATION_ID))
++
++    def test_stale_worker_recovers_a_returned_processing_dispatch_marker(self) -> None:
++        operation_id = "019b63f8-f600-7000-8000-000000000108"
++        request = self._request().model_copy(
++            update={
++                "operation_id": operation_id,
++                "page_url": f"{_PAGE_URL}/returned-processing",
++            }
++        )
++        source_repository = JsonPagePreloadRepository(self.preload_path)
++        latest_lookup_seen = threading.Event()
++        continue_latest_lookup = threading.Event()
++        stale_repository = PausingLatestJsonRepository(
++            self.preload_path,
++            latest_lookup_seen,
++            continue_latest_lookup,
++        )
++        content = FilesystemPreloadContentStore(self.content_dir)
++        old_runner = RecordingRunner()
++        newest_runner = RecordingRunner()
++        stale_errors: list[BaseException] = []
++        self._submit(source_repository, old_runner, content, request=request)
++        original = source_repository.get_by_id(_USER_ID, operation_id)
++
++        def stale_worker() -> None:
++            try:
++                with mock.patch.object(
++                    UsageMeter,
++                    "release",
++                    side_effect=AssertionError("a dispatch marker must not be released"),
++                ):
++                    self._run_job_without_provider(stale_repository, old_runner, content)
++            except BaseException as exc:
++                stale_errors.append(exc)
++
++        stale_thread = threading.Thread(target=stale_worker)
++        stale_thread.start()
++        try:
++            self.assertTrue(latest_lookup_seen.wait(timeout=2))
++            now = datetime.now(UTC)
++            claimed = source_repository.claim_processing(
++                _USER_ID,
++                operation_id,
++                original["learner_profile_fingerprint"],
++                lease_id="returned-processing-lease",
++                now=now,
++                lease_expires_at=now + timedelta(minutes=1),
++            )
++            self.assertIsNotNone(claimed)
++            meter = self._meter()
++            operation = meter.get_operation(operation_id)
++            self.assertTrue(
++                meter.claim_execution(
++                    operation_id,
++                    "returned-processing-execution-lease",
++                    now - timedelta(minutes=2),
++                    now - timedelta(minutes=1),
++                )
++            )
++            meter.save_result(
++                operation_id,
++                {
++                    "kind": "preload",
++                    "state": "dispatching",
++                    "usage": {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
++                },
++            )
++            returned_to_processing = {
++                **claimed,
++                "status": "processing",
++                "lease_expires_at": (now - timedelta(minutes=1)).isoformat(),
++            }
++            self.assertEqual(returned_to_processing["lease_id"], "returned-processing-lease")
++            self.assertGreaterEqual(int(returned_to_processing["attempt_count"]), 1)
++            source_repository.save(_USER_ID, returned_to_processing, make_latest=False)
++            newest_request = request.model_copy(
++                update={
++                    "operation_id": "019b63f8-f600-7000-8000-000000000109",
++                    "learner_level": "Newer learner profile",
++                }
++            )
++            self._submit(source_repository, newest_runner, content, request=newest_request)
++        finally:
++            continue_latest_lookup.set()
++            stale_thread.join(timeout=2)
++
++        self.assertFalse(stale_thread.is_alive())
++        self.assertEqual(stale_errors, [])
++        current = source_repository.get_by_id(_USER_ID, operation_id)
++        settled = self._meter().get_operation(operation_id)
++        self.assertEqual(current["status"], "failed")
++        self.assertEqual(current["usage_state"], "finalized_conservative")
++        self.assertEqual(settled.state, "finalized")
++        self.assertEqual(
++            settled.actual_cost_micro_usd,
++            operation.reserved_cost_micro_usd,
++        )
++        self.assertIsNone(content.get(_USER_ID, operation_id))
++
+     def test_stale_publication_cannot_recreate_content_after_winner_retires(self) -> None:
+         first_repository = JsonPagePreloadRepository(self.preload_path)
+         winner_repository = JsonPagePreloadRepository(self.preload_path)
+--- before/backend/test_admin_chat_activity.py
++++ after/backend/test_admin_chat_activity.py
+@@ -88,10 +88,15 @@
+         )
+         return "PRIVATE provider reply"
+ 
+-    def _submit(self, *, activity_repository=None):
++    def _submit(
++        self,
++        *,
++        activity_repository=None,
++        operation_id="019b63f8-f600-7000-8000-000000000102",
++    ):
+         runner = _Runner()
+         request = PagePreloadRequest(
+-            operation_id="019b63f8-f600-7000-8000-000000000102",
++            operation_id=operation_id,
+             page_url=_PAGE_URL,
+             page_title="PRIVATE title",
+             html=_PAGE_HTML,
+@@ -322,7 +327,7 @@
+             ["failed", "success"],
+         )
+ 
+-        _, second_runner, _ = self._submit()
++        _, second_runner, _ = self._submit(operation_id="019b63f8-f600-7000-8000-000000000106")
+         with (
+             mock.patch.object(preloading, "_split_sentences", return_value=["Sentence."]),
+             mock.patch.object(

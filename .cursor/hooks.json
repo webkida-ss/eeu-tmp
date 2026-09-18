@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "postToolUse": [
+      {
+        "command": ".rulesync/hooks/format.sh",
+        "timeout": 15,
+        "matcher": "Write|Edit"
+      }
+    ]
+  }
+}

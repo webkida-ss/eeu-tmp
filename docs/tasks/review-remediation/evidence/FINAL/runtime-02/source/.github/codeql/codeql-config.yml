@@ -1,0 +1,10 @@
+name: Repository CodeQL configuration
+
+paths-ignore:
+  - ".tools/**"
+  - "backend/build/**"
+  - "backend/dist/**"
+  - "backend/generated/**"
+  - "extension/generated/**"
+  - "extension/node_modules/**"
+  - "output/**"

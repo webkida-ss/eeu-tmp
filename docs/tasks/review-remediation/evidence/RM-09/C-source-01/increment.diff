@@ -1,0 +1,505 @@
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/accounts/plans.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/accounts/plans.py
+index bda8251..17321df 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/accounts/plans.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/accounts/plans.py
+@@ -19,6 +19,7 @@ ACTIVE_STATUSES = frozenset({"active", "trialing"})
+ # Grace period covering renewal-webhook delivery lag, so a subscriber is
+ # never locked out by a few minutes of Stripe latency.
+ _RENEWAL_GRACE_SECONDS = 86_400
++_MAX_UNIX_TIMESTAMP = 253_402_300_799
+ 
+ 
+ @dataclass(frozen=True)
+@@ -58,6 +59,8 @@ def resolve_plan_id(
+     subscription: dict[str, Any] | None,
+     catalog: PlanCatalog,
+     now: datetime | None = None,
++    *,
++    provider_mode: str = "stripe",
+ ) -> str:
+     """The effective plan: the paid one while the subscription is live,
+     otherwise the basic plan. Expiry is judged by current_period_end so a
+@@ -66,15 +69,29 @@ def resolve_plan_id(
+         return catalog.basic_plan_id
+     if subscription.get("status") not in ACTIVE_STATUSES:
+         return catalog.basic_plan_id
++    plan_id = subscription.get("plan")
++    if not isinstance(plan_id, str) or not catalog.is_paid(plan_id):
++        return catalog.basic_plan_id
++
++    provenance = subscription.get("entitlement_provider")
++    if provenance == "mock":
++        return plan_id if provider_mode == "mock" else catalog.basic_plan_id
++    if provenance not in (None, "stripe"):
++        return catalog.basic_plan_id
+ 
+     period_end = subscription.get("current_period_end")
+-    if period_end:
+-        moment = normalize_utc(now or datetime.now(UTC))
+-        try:
+-            expires = datetime.fromtimestamp(int(period_end), tz=UTC)
+-        except (TypeError, ValueError):
+-            return catalog.basic_plan_id
+-        if (moment - expires).total_seconds() > _RENEWAL_GRACE_SECONDS:
+-            return catalog.basic_plan_id
+-
+-    return subscription.get("plan") or catalog.basic_plan_id
++    if (
++        not isinstance(period_end, int)
++        or isinstance(period_end, bool)
++        or not 0 < period_end <= _MAX_UNIX_TIMESTAMP
++    ):
++        return catalog.basic_plan_id
++    moment = normalize_utc(now or datetime.now(UTC))
++    try:
++        expires = datetime.fromtimestamp(period_end, tz=UTC)
++    except (OverflowError, OSError, ValueError):
++        return catalog.basic_plan_id
++    if (moment - expires).total_seconds() > _RENEWAL_GRACE_SECONDS:
++        return catalog.basic_plan_id
++
++    return plan_id
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/accounts/container.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/accounts/container.py
+index a0f6676..cb41b9a 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/accounts/container.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/accounts/container.py
+@@ -82,6 +82,7 @@ class AccountsContainer:
+             plan_id,
+             success_url=self.settings.billing_success_url,
+             cancel_url=self.settings.billing_cancel_url,
++            provider_mode=self.settings.billing_provider,
+         )
+ 
+     def open_portal(self, user: User) -> str:
+@@ -99,10 +100,16 @@ class AccountsContainer:
+             payload,
+             signature,
+             plans=self.plans,
++            provider_mode=self.settings.billing_provider,
+         )
+ 
+     def describe_subscription(self, user_id: str) -> SubscriptionState:
+-        return billing_flow.describe_subscription(self.subscription_repository, self.plans, user_id)
++        return billing_flow.describe_subscription(
++            self.subscription_repository,
++            self.plans,
++            user_id,
++            provider_mode=self.settings.billing_provider,
++        )
+ 
+ 
+ def read_bearer_token(authorization: str | None) -> str | None:
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/accounts/services/billing_flow.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/accounts/services/billing_flow.py
+index e5f61d6..ccbbbc7 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/accounts/services/billing_flow.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/accounts/services/billing_flow.py
+@@ -263,6 +263,7 @@ def start_checkout(
+     *,
+     success_url: str,
+     cancel_url: str,
++    provider_mode: str = "stripe",
+ ) -> CheckoutSession:
+     if not plans.is_paid(plan_id):
+         raise BillingError(f"Unknown paid plan: {plan_id}")
+@@ -273,7 +274,7 @@ def start_checkout(
+         # Stripe Checkout always creates a NEW subscription; running it for a
+         # user who already has an active paid plan would double-bill. Plan
+         # changes for subscribers go through the customer portal instead.
+-        if resolve_plan_id(existing, plans) != plans.basic_plan_id:
++        if resolve_plan_id(existing, plans, provider_mode=provider_mode) != plans.basic_plan_id:
+             raise _safe_checkout_conflict(
+                 "An active subscription already exists. Use the billing portal to change plans."
+             )
+@@ -467,26 +468,41 @@ def start_checkout(
+         if persisted is None:
+             continue
+ 
+-        # The mock provider has no external checkout: the plan activates now.
+-        if session.activated_plan:
++        # Mock activation is explicit composition, not a provider-returned hint.
++        # Advance the pending operation with CAS so a stale provider result
++        # cannot activate a checkout that cancellation or recovery replaced.
++        if (
++            provider_mode == "mock"
++            and session.activated_plan == completed_pending["requested_plan"]
++            and plans.is_paid(session.activated_plan)
++        ):
+             activated = subscription_repository.get(user.id) or {}
+             activated_pending = activated.get("pending_checkout")
+-            if isinstance(activated_pending, dict) and activated_pending.get(
+-                "operation_id"
+-            ) == completed_pending.get("operation_id"):
+-                activated_pending = {**activated_pending, "state": "activated"}
+-            subscription_repository.upsert(
++            if (
++                not isinstance(activated_pending, dict)
++                or activated_pending.get("operation_id") != completed_pending.get("operation_id")
++                or activated_pending.get("state") != "created"
++                or activated_pending.get("stripe_checkout_session_id")
++                != completed_pending.get("stripe_checkout_session_id")
++            ):
++                continue
++            activated_pending = {**activated_pending, "state": "activated"}
++            activated_record = subscription_repository.compare_and_swap(
+                 user.id,
+                 {
+                     **activated,
+                     "pending_checkout": activated_pending,
+                     "plan": session.activated_plan,
+                     "status": "active",
++                    "entitlement_provider": "mock",
+                     "stripe_customer_id": session.stripe_customer_id
+                     or activated.get("stripe_customer_id"),
+                     "current_period_end": None,
+                 },
++                expected_revision=_record_revision(activated),
+             )
++            if activated_record is None:
++                continue
+         return session
+ 
+     raise _safe_checkout_conflict("Checkout ownership changed repeatedly; retry later.")
+@@ -513,7 +529,12 @@ def handle_webhook(
+     signature: str | None,
+     *,
+     plans: PlanCatalog | None = None,
++    provider_mode: str = "stripe",
+ ) -> str:
++    if provider_mode != "stripe":
++        raise BillingError(
++            "Webhook reconciliation requires the Stripe billing provider.", status_code=400
++        )
+     event = provider.parse_webhook_event(payload, signature)
+     if event.kind == "ignored":
+         return "ignored"
+@@ -563,6 +584,7 @@ def handle_webhook(
+             "stripe_subscription_id": snapshot.stripe_subscription_id,
+             "current_period_end": snapshot.current_period_end,
+             "cancel_at": snapshot.cancel_at,
++            "entitlement_provider": "stripe",
+             "processed_billing_events": [
+                 *(processed if isinstance(processed, list) else []),
+                 event.event_id,
+@@ -635,6 +657,8 @@ def describe_subscription(
+     subscription_repository: SubscriptionRepository,
+     plans: PlanCatalog,
+     user_id: str,
++    *,
++    provider_mode: str = "stripe",
+ ) -> SubscriptionState:
+     """The billing facts a host needs to build its own usage view.
+ 
+@@ -642,7 +666,7 @@ def describe_subscription(
+     host's entitlement layer, not to this package.
+     """
+     record = subscription_repository.get(user_id) or {}
+-    plan_id = resolve_plan_id(record, plans)
++    plan_id = resolve_plan_id(record, plans, provider_mode=provider_mode)
+     return SubscriptionState(
+         plan=plan_id,
+         status=record.get("status"),
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/services/entitlements.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/services/entitlements.py
+index 4ead5ea..06688f2 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/services/entitlements.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/services/entitlements.py
+@@ -40,14 +40,19 @@ def current_month(now: datetime | None = None) -> str:
+     return moment.strftime("%Y-%m")
+ 
+ 
+-def resolve_plan_id(subscription: dict[str, Any] | None, now: datetime | None = None) -> str:
++def resolve_plan_id(
++    subscription: dict[str, Any] | None,
++    now: datetime | None = None,
++    *,
++    provider_mode: str = "stripe",
++) -> str:
+     """The effective plan for a stored subscription record.
+ 
+     The rule itself (active status, period expiry, renewal grace) is
+     billing-generic and lives in `accounts`; this wrapper binds it to
+     Untangle's plan catalog so callers keep a two-argument signature.
+     """
+-    return _resolve_plan_id(subscription, PLAN_CATALOG, now)
++    return _resolve_plan_id(subscription, PLAN_CATALOG, now, provider_mode=provider_mode)
+ 
+ 
+ @dataclass
+@@ -111,9 +116,11 @@ def build_guard(
+     usage_repository: UsageRepository,
+     user_id: str,
+     now: datetime | None = None,
++    *,
++    provider_mode: str = "stripe",
+ ) -> EntitlementGuard:
+     subscription = subscription_repository.get(user_id)
+-    plan_id = resolve_plan_id(subscription, now)
++    plan_id = resolve_plan_id(subscription, now, provider_mode=provider_mode)
+     return EntitlementGuard(
+         plan=get_plan_limits(plan_id),
+         usage_repository=usage_repository,
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/services/usage_meter.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/services/usage_meter.py
+index e658cf7..43afcf2 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/services/usage_meter.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/services/usage_meter.py
+@@ -59,6 +59,7 @@ class UsageMeter:
+         plan_loader: Callable[[str | None], PlanLimits] = get_plan_limits,
+         reservation_ttl_seconds: int = 900,
+         reservation_enabled: bool = True,
++        provider_mode: str = "stripe",
+     ) -> None:
+         self.subscription_repository = subscription_repository
+         self.usage_repository = usage_repository
+@@ -89,6 +90,7 @@ class UsageMeter:
+         self.plan_loader = plan_loader
+         self.reservation_ttl_seconds = reservation_ttl_seconds
+         self.reservation_enabled = reservation_enabled
++        self.provider_mode = provider_mode
+         self._disabled_operations: dict[str, UsageOperation] = {}
+ 
+     def reserve(
+@@ -286,7 +288,9 @@ class UsageMeter:
+ 
+     def _current_plan(self, now: datetime) -> PlanLimits:
+         subscription = self.subscription_repository.get(self.user_id)
+-        return self.plan_loader(resolve_plan_id(subscription, now))
++        return self.plan_loader(
++            resolve_plan_id(subscription, now, provider_mode=self.provider_mode)
++        )
+ 
+     def current_plan(self, now: datetime | None = None) -> PlanLimits:
+         moment = normalize_utc(now or self.now or datetime.now(UTC))
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/deps.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/deps.py
+index 8790243..7275a8e 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/deps.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/deps.py
+@@ -181,6 +181,7 @@ def _create_preload_job_runner() -> PreloadJobRunner:
+         _usage_repository,
+         _preload_content_store,
+         _admin_activity_repository,
++        billing_provider_mode=_accounts.settings.billing_provider,
+     )
+ 
+ 
+@@ -264,14 +265,21 @@ def get_entitlement_guard(
+     current_user: User = Depends(get_active_learner_user),
+     subscription_repository: SubscriptionRepository = Depends(get_subscription_repository),
+     usage_repository: UsageRepository = Depends(get_usage_repository),
++    accounts: AccountsContainer = Depends(get_accounts),
+ ) -> EntitlementGuard:
+-    return build_guard(subscription_repository, usage_repository, current_user.id)
++    return build_guard(
++        subscription_repository,
++        usage_repository,
++        current_user.id,
++        provider_mode=accounts.settings.billing_provider,
++    )
+ 
+ 
+ def get_usage_meter(
+     current_user: User = Depends(get_active_learner_user),
+     subscription_repository: SubscriptionRepository = Depends(get_subscription_repository),
+     usage_repository: UsageRepository = Depends(get_usage_repository),
++    accounts: AccountsContainer = Depends(get_accounts),
+ ) -> UsageMeter:
+     return UsageMeter(
+         subscription_repository,
+@@ -279,4 +287,5 @@ def get_usage_meter(
+         current_user.id,
+         reservation_enabled=USAGE_RESERVATION_ENABLED,
+         reservation_ttl_seconds=USAGE_RESERVATION_TTL_SECONDS,
++        provider_mode=accounts.settings.billing_provider,
+     )
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/services/preloading.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/services/preloading.py
+index 522276d..a09de67 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/services/preloading.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/services/preloading.py
+@@ -610,6 +610,7 @@ def run_preload_job(
+     learner_profile_fingerprint: str,
+     usage_context: dict[str, Any] | None = None,
+     admin_activity_repository: AdminActivityRepository | None = None,
++    billing_provider_mode: str = "stripe",
+ ) -> None:
+     """Run the deferred analysis for a "processing" preload record.
+ 
+@@ -661,6 +662,7 @@ def run_preload_job(
+                 version=str(shadow_context.get("rate_card_version") or ""),
+             ),
+             reservation_enabled=False,
++            provider_mode=billing_provider_mode,
+         )
+     if operation_id:
+         rate = ModelRate(
+@@ -675,6 +677,7 @@ def run_preload_job(
+             user_id,
+             rate=rate,
+             reservation_enabled=True,
++            provider_mode=billing_provider_mode,
+         )
+         operation = meter.get_operation(operation_id)
+         if operation is None:
+@@ -1025,7 +1028,16 @@ def run_preload_job(
+         )
+         return
+ 
+-    guard = None if meter else build_guard(subscription_repository, usage_repository, user_id)
++    guard = (
++        None
++        if meter
++        else build_guard(
++            subscription_repository,
++            usage_repository,
++            user_id,
++            provider_mode=billing_provider_mode,
++        )
++    )
+     tally = (
+         UsageTally(rate=meter.rate)
+         if meter
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/jobs/inline_runner.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/jobs/inline_runner.py
+index eb0919e..8bd7324 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/jobs/inline_runner.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/jobs/inline_runner.py
+@@ -40,12 +40,14 @@ class InlinePreloadJobRunner:
+         *,
+         max_workers: int | None = None,
+         queue_capacity: int | None = None,
++        billing_provider_mode: str = "stripe",
+     ) -> None:
+         self._repository = repository
+         self._subscription_repository = subscription_repository
+         self._usage_repository = usage_repository
+         self._content_store = content_store
+         self._admin_activity_repository = admin_activity_repository
++        self._billing_provider_mode = billing_provider_mode
+         workers = max(
+             1,
+             max_workers
+@@ -121,6 +123,7 @@ class InlinePreloadJobRunner:
+                 learner_profile_fingerprint,
+                 usage_context,
+                 admin_activity_repository=self._admin_activity_repository,
++                billing_provider_mode=self._billing_provider_mode,
+             )
+         except Exception:  # pragma: no cover - defensive; run_preload_job self-guards
+             logger.exception("inline preload job crashed user=%s url=%s", user_id, page_url)
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/worker_handler.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/worker_handler.py
+index 8b59e95..c33cd09 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/worker_handler.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/worker_handler.py
+@@ -22,6 +22,7 @@ import logging
+ from typing import Any
+ 
+ from deps import (
++    get_accounts,
+     get_page_preload_repository,
+     get_preload_content_store,
+     get_subscription_repository,
+@@ -38,6 +39,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+     subscription_repository = get_subscription_repository()
+     usage_repository = get_usage_repository()
+     content_store = get_preload_content_store()
++    billing_provider_mode = get_accounts().settings.billing_provider
+ 
+     batch_item_failures: list[dict[str, str]] = []
+     for message in event.get("Records", []):
+@@ -66,6 +68,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+                 body["preload_id"],
+                 body["learner_profile_fingerprint"],
+                 body.get("usage_context") or None,
++                billing_provider_mode=billing_provider_mode,
+             )
+         except Exception:  # noqa: BLE001 - report the message for SQS redelivery
+             logger.exception("preload worker failed for message %s", message_id)
+diff --git a/private/tmp/untangle-remediation-20260914/c-base/backend/test_accounts.py b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/test_accounts.py
+index 04d1b72..b815ca0 100644
+--- a/private/tmp/untangle-remediation-20260914/c-base/backend/test_accounts.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-source-01/source/backend/test_accounts.py
+@@ -6,6 +6,7 @@ it, so a copy of this file travels with the package.
+ """
+ 
+ import unittest
++from datetime import UTC, datetime
+ 
+ from accounts import (
+     AccountsSettings,
+@@ -48,9 +49,51 @@ class ResolvePlanIdTests(unittest.TestCase):
+         self.assertEqual(resolve_plan_id(record, PLANS), "basic")
+ 
+     def test_active_subscription_grants_its_plan(self):
+-        record = {"plan": "pro", "status": "active"}
++        record = {
++            "plan": "pro",
++            "status": "active",
++            "current_period_end": 1_900_000_000,
++        }
+         self.assertEqual(resolve_plan_id(record, PLANS), "pro")
+ 
++    def test_active_subscription_without_a_finite_period_falls_back_to_basic(self):
++        for period_end in (None, True, False, "1900000000", float("inf"), 0, -1):
++            with self.subTest(period_end=period_end):
++                record = {
++                    "plan": "pro",
++                    "status": "active",
++                    "current_period_end": period_end,
++                }
++                self.assertEqual(resolve_plan_id(record, PLANS), "basic")
++
++    def test_unknown_paid_plan_never_grants_access(self):
++        record = {
++            "plan": "unknown",
++            "status": "trialing",
++            "current_period_end": 1_900_000_000,
++        }
++        self.assertEqual(resolve_plan_id(record, PLANS), "basic")
++
++    def test_mock_entitlement_requires_an_explicit_mock_mode(self):
++        record = {
++            "plan": "pro",
++            "status": "active",
++            "current_period_end": None,
++            "entitlement_provider": "mock",
++        }
++        self.assertEqual(resolve_plan_id(record, PLANS), "basic")
++        self.assertEqual(resolve_plan_id(record, PLANS, provider_mode="stripe"), "basic")
++        self.assertEqual(resolve_plan_id(record, PLANS, provider_mode="mock"), "pro")
++
++    def test_valid_finite_legacy_stripe_record_remains_compatible(self):
++        now = datetime(2026, 9, 14, tzinfo=UTC)
++        record = {
++            "plan": "pro",
++            "status": "active",
++            "current_period_end": int(datetime(2026, 9, 15, tzinfo=UTC).timestamp()),
++        }
++        self.assertEqual(resolve_plan_id(record, PLANS, now), "pro")
++
+     def test_long_expired_period_falls_back_even_while_marked_active(self):
+         # A missed deletion webhook must not grant service forever.
+         record = {"plan": "pro", "status": "active", "current_period_end": 1_000_000_000}
+@@ -129,6 +172,27 @@ class CheckoutTests(unittest.TestCase):
+         session = self.accounts.start_checkout(self.user, "pro")
+         self.assertEqual(session.activated_plan, "pro")
+         self.assertEqual(self.accounts.describe_subscription(self.user.id).plan, "pro")
++        record = self.subscriptions.get(self.user.id)
++        self.assertEqual(record["entitlement_provider"], "mock")
++        self.assertEqual(record["pending_checkout"]["state"], "activated")
++
++    def test_mock_marker_cannot_grant_after_the_container_switches_to_stripe(self):
++        self.subscriptions.upsert(
++            self.user.id,
++            {
++                "plan": "pro",
++                "status": "active",
++                "entitlement_provider": "mock",
++                "current_period_end": 1_900_000_000,
++            },
++        )
++        stripe_accounts = build_accounts_container(
++            AccountsSettings(billing_provider="stripe", stripe_secret_key="sk_test"),
++            plans=PLANS,
++            subscription_repository=self.subscriptions,
++        )
++
++        self.assertEqual(stripe_accounts.describe_subscription(self.user.id).plan, "basic")
+ 
+     def test_checkout_refuses_a_plan_that_is_not_sold(self):
+         with self.assertRaises(BillingError):

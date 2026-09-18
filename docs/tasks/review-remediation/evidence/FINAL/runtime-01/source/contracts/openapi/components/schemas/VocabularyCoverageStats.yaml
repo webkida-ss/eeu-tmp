@@ -1,0 +1,24 @@
+properties:
+  coverage_percent:
+    type: number
+    title: Coverage Percent
+  pool_size:
+    type: integer
+    title: Pool Size
+  target_count:
+    type: integer
+    title: Target Count
+  item_count:
+    type: integer
+    title: Item Count
+  candidate_count:
+    type: integer
+    title: Candidate Count
+type: object
+required:
+- coverage_percent
+- pool_size
+- target_count
+- item_count
+- candidate_count
+title: VocabularyCoverageStats

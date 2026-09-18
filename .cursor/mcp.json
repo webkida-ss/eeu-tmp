@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "context7": {
+      "type": "stdio",
+      "command": "./node_modules/.bin/context7-mcp",
+      "args": [],
+      "env": {}
+    },
+    "playwright": {
+      "type": "stdio",
+      "command": "./node_modules/.bin/playwright-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

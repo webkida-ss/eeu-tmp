@@ -1,0 +1,615 @@
+# Exact-plan deployment. Repository variables and external AWS/GitHub controls
+# documented in docs/GITHUB_SETUP.md must exist before either role is assumed.
+name: Deploy Reading Assistant
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      operation:
+        description: Plan only, or plan then request environment-gated apply
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+        default: plan
+      production_confirmation:
+        description: For prod apply only, enter APPLY-PROD-<current-main-SHA>
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-reading-assistant-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Create exact plan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      commit_sha: ${{ steps.gate-dev.outputs.commit_sha || steps.gate-prod.outputs.commit_sha }}
+      plan_key: ${{ steps.record.outputs.plan_key }}
+      plan_version_id: ${{ steps.record.outputs.plan_version_id }}
+      plan_digest: ${{ steps.record.outputs.plan_digest }}
+      plan_bucket: ${{ steps.record.outputs.plan_bucket }}
+      plan_kms_key_arn: ${{ steps.record.outputs.plan_kms_key_arn }}
+      apply_role_arn: ${{ steps.record.outputs.apply_role_arn }}
+      apply_role_digest: ${{ steps.record.outputs.apply_role_digest }}
+      plan_record_digest: ${{ steps.record.outputs.plan_record_digest }}
+      classification_sha256: ${{ steps.record.outputs.classification_sha256 }}
+      presentation_limits_sha256: ${{ steps.record.outputs.presentation_limits_sha256 }}
+      review_summary_sha256: ${{ steps.record.outputs.review_summary_sha256 }}
+      resource_count: ${{ steps.record.outputs.resource_count }}
+      drift_count: ${{ steps.record.outputs.drift_count }}
+      output_count: ${{ steps.record.outputs.output_count }}
+      high_risk_resource_count: ${{ steps.record.outputs.high_risk_resource_count }}
+      high_risk_drift_count: ${{ steps.record.outputs.high_risk_drift_count }}
+      replacement_path_count: ${{ steps.record.outputs.replacement_path_count }}
+      sensitive_path_count: ${{ steps.record.outputs.sensitive_path_count }}
+      sensitive_output_count: ${{ steps.record.outputs.sensitive_output_count }}
+      package_key: ${{ steps.record.outputs.package_key }}
+      package_digest: ${{ steps.record.outputs.package_digest }}
+      package_version_id: ${{ steps.record.outputs.package_version_id }}
+      package_destination: ${{ steps.record.outputs.package_destination }}
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      AWS_REGION: ap-northeast-1
+      PLAN_PREFIX: terraform-plans
+      TF_VAR_google_oauth_client_id: ${{ vars.READING_ASSISTANT_GOOGLE_OAUTH_CLIENT_ID }}
+      TF_VAR_alert_email: ${{ vars.READING_ASSISTANT_ALERT_EMAIL }}
+      TF_VAR_stripe_price_id_pro: ${{ vars.READING_ASSISTANT_STRIPE_PRICE_ID_PRO }}
+      TF_VAR_stripe_price_id_max: ${{ vars.READING_ASSISTANT_STRIPE_PRICE_ID_MAX }}
+      TF_VAR_app_extra_environment: ${{ vars.READING_ASSISTANT_APP_EXTRA_ENVIRONMENT || '{}' }}
+    steps:
+      - name: Checkout protected default branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Record checked-out commit
+        id: checkout
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Gate dev actor, branch, roles, storage, and operation
+        id: gate-dev
+        if: ${{ inputs.environment == 'dev' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTED_DEPLOY_ACTOR_IDS: ${{ vars.TRUSTED_DEPLOY_ACTOR_IDS }}
+          AWS_PLAN_ROLE_ARN: ${{ vars.AWS_PLAN_ROLE_ARN_DEV }}
+          AWS_APPLY_ROLE_ARN: ${{ vars.AWS_APPLY_ROLE_ARN_DEV }}
+          TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+          TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
+          POLICY_ACTOR_ID: ${{ github.actor_id }}
+          POLICY_REPOSITORY: ${{ github.repository }}
+          POLICY_GIT_REF: ${{ github.ref }}
+          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
+          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
+          POLICY_RUN_ID: ${{ github.run_id }}
+          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          DEPLOY_OPERATION: ${{ inputs.operation }}
+          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+        run: |
+          python scripts/exact_plan_policy.py gate-deploy \
+            --trusted-actor-ids "${TRUSTED_DEPLOY_ACTOR_IDS}" \
+            --actor-id "${POLICY_ACTOR_ID}" \
+            --repository "${POLICY_REPOSITORY}" \
+            --git-ref "${POLICY_GIT_REF}" \
+            --workflow-ref "${POLICY_WORKFLOW_REF}" \
+            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
+            --run-id "${POLICY_RUN_ID}" \
+            --run-attempt "${POLICY_RUN_ATTEMPT}" \
+            --ref-protected "${POLICY_REF_PROTECTED}" \
+            --environment "${DEPLOY_ENVIRONMENT}" \
+            --operation "${DEPLOY_OPERATION}" \
+            --production-confirmation "${PRODUCTION_CONFIRMATION}" \
+            --plan-role-arn "${AWS_PLAN_ROLE_ARN}" \
+            --apply-role-arn "${AWS_APPLY_ROLE_ARN}" \
+            --bucket "${TERRAFORM_PLAN_BUCKET}" \
+            --prefix "${PLAN_PREFIX}" \
+            --kms-key-arn "${TERRAFORM_PLAN_KMS_KEY_ARN}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Gate prod actor, branch, roles, storage, and operation
+        id: gate-prod
+        if: ${{ inputs.environment == 'prod' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTED_DEPLOY_ACTOR_IDS: ${{ vars.TRUSTED_DEPLOY_ACTOR_IDS }}
+          AWS_PLAN_ROLE_ARN: ${{ vars.AWS_PLAN_ROLE_ARN_PROD }}
+          AWS_APPLY_ROLE_ARN: ${{ vars.AWS_APPLY_ROLE_ARN_PROD }}
+          TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+          TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
+          POLICY_ACTOR_ID: ${{ github.actor_id }}
+          POLICY_REPOSITORY: ${{ github.repository }}
+          POLICY_GIT_REF: ${{ github.ref }}
+          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
+          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
+          POLICY_RUN_ID: ${{ github.run_id }}
+          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          DEPLOY_OPERATION: ${{ inputs.operation }}
+          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+        run: |
+          python scripts/exact_plan_policy.py gate-deploy \
+            --trusted-actor-ids "${TRUSTED_DEPLOY_ACTOR_IDS}" \
+            --actor-id "${POLICY_ACTOR_ID}" \
+            --repository "${POLICY_REPOSITORY}" \
+            --git-ref "${POLICY_GIT_REF}" \
+            --workflow-ref "${POLICY_WORKFLOW_REF}" \
+            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
+            --run-id "${POLICY_RUN_ID}" \
+            --run-attempt "${POLICY_RUN_ATTEMPT}" \
+            --ref-protected "${POLICY_REF_PROTECTED}" \
+            --environment "${DEPLOY_ENVIRONMENT}" \
+            --operation "${DEPLOY_OPERATION}" \
+            --production-confirmation "${PRODUCTION_CONFIRMATION}" \
+            --plan-role-arn "${AWS_PLAN_ROLE_ARN}" \
+            --apply-role-arn "${AWS_APPLY_ROLE_ARN}" \
+            --bucket "${TERRAFORM_PLAN_BUCKET}" \
+            --prefix "${PLAN_PREFIX}" \
+            --kms-key-arn "${TERRAFORM_PLAN_KMS_KEY_ARN}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Build Lambda package from trusted commit
+        working-directory: backend
+        run: scripts/build_lambda.sh
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.15.5"
+
+      - name: Configure read-only AWS plan credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ steps.gate-dev.outputs.plan_role_arn || steps.gate-prod.outputs.plan_role_arn }}
+          role-session-name: plan-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+
+      - name: Fail closed unless private plan storage is ready
+        env:
+          TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+          TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
+        run: |
+          aws s3api get-bucket-versioning \
+            --bucket "${TERRAFORM_PLAN_BUCKET}" > "${RUNNER_TEMP}/versioning.json"
+          aws s3api get-bucket-encryption \
+            --bucket "${TERRAFORM_PLAN_BUCKET}" > "${RUNNER_TEMP}/encryption.json"
+          python scripts/exact_plan_policy.py verify-storage \
+            --versioning-response "${RUNNER_TEMP}/versioning.json" \
+            --encryption-response "${RUNNER_TEMP}/encryption.json" \
+            --kms-key-arn "${TERRAFORM_PLAN_KMS_KEY_ARN}"
+
+      - name: Terraform init
+        working-directory: infra/envs/${{ inputs.environment }}
+        env:
+          TERRAFORM_STATE_BUCKET: ${{ vars.TERRAFORM_STATE_BUCKET }}
+        run: |
+          if [[ ! "${TERRAFORM_STATE_BUCKET}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
+            echo "TERRAFORM_STATE_BUCKET is missing or not a valid bucket name." >&2
+            exit 1
+          fi
+          if ! terraform init -input=false \
+            -backend-config="bucket=${TERRAFORM_STATE_BUCKET}" \
+            > "${RUNNER_TEMP}/terraform-init.stdout" \
+            2> "${RUNNER_TEMP}/terraform-init.stderr"; then
+            python ../../../scripts/exact_plan_policy.py summarize-failure \
+              --input "${RUNNER_TEMP}/terraform-init.stderr" \
+              --command terraform-init
+            rm -f "${RUNNER_TEMP}/terraform-init.stdout" \
+              "${RUNNER_TEMP}/terraform-init.stderr"
+            exit 1
+          fi
+          rm -f "${RUNNER_TEMP}/terraform-init.stdout" \
+            "${RUNNER_TEMP}/terraform-init.stderr"
+
+      - name: Create binary Terraform plan
+        working-directory: infra/envs/${{ inputs.environment }}
+        run: |
+          if ! terraform plan -input=false -lock=false -no-color -out=tfplan \
+            > "${RUNNER_TEMP}/terraform-plan.stdout" \
+            2> "${RUNNER_TEMP}/terraform-plan.stderr"; then
+            python ../../../scripts/exact_plan_policy.py summarize-failure \
+              --input "${RUNNER_TEMP}/terraform-plan.stderr" \
+              --command terraform-plan
+            rm -f "${RUNNER_TEMP}/terraform-plan.stdout" \
+              "${RUNNER_TEMP}/terraform-plan.stderr"
+            exit 1
+          fi
+          rm -f "${RUNNER_TEMP}/terraform-plan.stdout" \
+            "${RUNNER_TEMP}/terraform-plan.stderr"
+
+      - name: Print deterministic value-free plan summary
+        id: summary
+        working-directory: infra/envs/${{ inputs.environment }}
+        run: |
+          if ! terraform show -json tfplan \
+            > "${RUNNER_TEMP}/terraform-plan.json" \
+            2> "${RUNNER_TEMP}/terraform-show.stderr"; then
+            python ../../../scripts/exact_plan_policy.py summarize-failure \
+              --input "${RUNNER_TEMP}/terraform-show.stderr" \
+              --command terraform-show
+            rm -f "${RUNNER_TEMP}/terraform-plan.json" \
+              "${RUNNER_TEMP}/terraform-show.stderr"
+            exit 1
+          fi
+          python ../../../scripts/exact_plan_policy.py summarize-plan \
+            --input "${RUNNER_TEMP}/terraform-plan.json" \
+            --output "${RUNNER_TEMP}/terraform-plan-summary.json" \
+            --classification-output "${RUNNER_TEMP}/terraform-plan-classification.json" \
+            --github-output "${GITHUB_OUTPUT}"
+          rm -f "${RUNNER_TEMP}/terraform-plan.json" \
+            "${RUNNER_TEMP}/terraform-show.stderr"
+
+      - name: Compute exact plan identity
+        id: descriptor
+        working-directory: infra/envs/${{ inputs.environment }}
+        env:
+          TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+          TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
+        run: |
+          python ../../../scripts/exact_plan_policy.py describe \
+            --bucket "${TERRAFORM_PLAN_BUCKET}" \
+            --prefix "${PLAN_PREFIX}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --environment "${{ inputs.environment }}" \
+            --commit-sha "${{ steps.gate-dev.outputs.commit_sha || steps.gate-prod.outputs.commit_sha }}" \
+            --workflow-ref "${{ github.workflow_ref }}" \
+            --kms-key-arn "${TERRAFORM_PLAN_KMS_KEY_ARN}" \
+            --apply-role-arn "${{ steps.gate-dev.outputs.apply_role_arn || steps.gate-prod.outputs.apply_role_arn }}" \
+            --plan-file tfplan \
+            --package-file ../../../backend/dist/reading-assistant-lambda.zip \
+            --classification "${RUNNER_TEMP}/terraform-plan-classification.json" \
+            --output "${RUNNER_TEMP}/plan-descriptor.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Store exact encrypted versioned Lambda package
+        working-directory: infra/envs/${{ inputs.environment }}
+        env:
+          TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+          TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
+        run: |
+          aws s3api put-object \
+            --bucket "${TERRAFORM_PLAN_BUCKET}" \
+            --key "${{ steps.descriptor.outputs.package_key }}" \
+            --body ../../../backend/dist/reading-assistant-lambda.zip \
+            --server-side-encryption aws:kms \
+            --ssekms-key-id "${TERRAFORM_PLAN_KMS_KEY_ARN}" \
+            --metadata "commit-sha=${{ steps.gate-dev.outputs.commit_sha || steps.gate-prod.outputs.commit_sha }},environment=${{ inputs.environment }},run-id=${{ github.run_id }},run-attempt=${{ github.run_attempt }},plan-sha256=${{ steps.descriptor.outputs.plan_digest }},apply-role-sha256=${{ steps.descriptor.outputs.apply_role_digest }},workflow-ref-sha256=${{ steps.descriptor.outputs.workflow_ref_digest }},classification-sha256=${{ steps.summary.outputs.classification_sha256 }},presentation-limits-sha256=${{ steps.summary.outputs.presentation_limits_sha256 }},review-summary-sha256=${{ steps.summary.outputs.review_summary_sha256 }},resource-count=${{ steps.summary.outputs.resource_count }},drift-count=${{ steps.summary.outputs.drift_count }},output-count=${{ steps.summary.outputs.output_count }},high-risk-resource-count=${{ steps.summary.outputs.high_risk_resource_count }},high-risk-drift-count=${{ steps.summary.outputs.high_risk_drift_count }},replacement-path-count=${{ steps.summary.outputs.replacement_path_count }},sensitive-path-count=${{ steps.summary.outputs.sensitive_path_count }},sensitive-output-count=${{ steps.summary.outputs.sensitive_output_count }},package-sha256=${{ steps.descriptor.outputs.package_digest }}" \
+            > "${RUNNER_TEMP}/put-package.json"
+
+      - name: Store exact encrypted versioned plan
+        working-directory: infra/envs/${{ inputs.environment }}
+        env:
+          TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+          TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
+        run: |
+          aws s3api put-object \
+            --bucket "${TERRAFORM_PLAN_BUCKET}" \
+            --key "${{ steps.descriptor.outputs.plan_key }}" \
+            --body tfplan \
+            --server-side-encryption aws:kms \
+            --ssekms-key-id "${TERRAFORM_PLAN_KMS_KEY_ARN}" \
+            --metadata "commit-sha=${{ steps.gate-dev.outputs.commit_sha || steps.gate-prod.outputs.commit_sha }},environment=${{ inputs.environment }},run-id=${{ github.run_id }},run-attempt=${{ github.run_attempt }},plan-sha256=${{ steps.descriptor.outputs.plan_digest }},apply-role-sha256=${{ steps.descriptor.outputs.apply_role_digest }},workflow-ref-sha256=${{ steps.descriptor.outputs.workflow_ref_digest }},classification-sha256=${{ steps.summary.outputs.classification_sha256 }},presentation-limits-sha256=${{ steps.summary.outputs.presentation_limits_sha256 }},review-summary-sha256=${{ steps.summary.outputs.review_summary_sha256 }},resource-count=${{ steps.summary.outputs.resource_count }},drift-count=${{ steps.summary.outputs.drift_count }},output-count=${{ steps.summary.outputs.output_count }},high-risk-resource-count=${{ steps.summary.outputs.high_risk_resource_count }},high-risk-drift-count=${{ steps.summary.outputs.high_risk_drift_count }},replacement-path-count=${{ steps.summary.outputs.replacement_path_count }},sensitive-path-count=${{ steps.summary.outputs.sensitive_path_count }},sensitive-output-count=${{ steps.summary.outputs.sensitive_output_count }}" \
+            > "${RUNNER_TEMP}/put-object.json"
+
+      - name: Record immutable object version
+        id: record
+        run: |
+          python scripts/exact_plan_policy.py record-version \
+            --descriptor "${RUNNER_TEMP}/plan-descriptor.json" \
+            --upload-response "${RUNNER_TEMP}/put-object.json" \
+            --package-upload-response "${RUNNER_TEMP}/put-package.json" \
+            --output "${RUNNER_TEMP}/plan-record.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Create non-sensitive plan evidence
+        env:
+          EVIDENCE_COMMIT: ${{ steps.gate-dev.outputs.commit_sha || steps.gate-prod.outputs.commit_sha }}
+          EVIDENCE_DIGEST: ${{ steps.record.outputs.plan_digest }}
+          EVIDENCE_RECORD_DIGEST: ${{ steps.record.outputs.plan_record_digest }}
+          EVIDENCE_APPLY_ROLE_DIGEST: ${{ steps.record.outputs.apply_role_digest }}
+          EVIDENCE_CLASSIFICATION_DIGEST: ${{ steps.record.outputs.classification_sha256 }}
+          EVIDENCE_RESOURCE_COUNT: ${{ steps.record.outputs.resource_count }}
+          EVIDENCE_DRIFT_COUNT: ${{ steps.record.outputs.drift_count }}
+          EVIDENCE_OUTPUT_COUNT: ${{ steps.record.outputs.output_count }}
+          EVIDENCE_ENVIRONMENT: ${{ inputs.environment }}
+          EVIDENCE_OPERATION: ${{ inputs.operation }}
+          EVIDENCE_RUN_ID: ${{ github.run_id }}
+          EVIDENCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = {
+              "commit_sha": os.environ["EVIDENCE_COMMIT"],
+              "environment": os.environ["EVIDENCE_ENVIRONMENT"],
+              "operation": os.environ["EVIDENCE_OPERATION"],
+              "plan_sha256": os.environ["EVIDENCE_DIGEST"],
+              "plan_record_sha256": os.environ["EVIDENCE_RECORD_DIGEST"],
+              "apply_role_sha256": os.environ["EVIDENCE_APPLY_ROLE_DIGEST"],
+              "classification_sha256": os.environ["EVIDENCE_CLASSIFICATION_DIGEST"],
+              "resource_count": int(os.environ["EVIDENCE_RESOURCE_COUNT"]),
+              "drift_count": int(os.environ["EVIDENCE_DRIFT_COUNT"]),
+              "output_count": int(os.environ["EVIDENCE_OUTPUT_COUNT"]),
+              "run_id": os.environ["EVIDENCE_RUN_ID"],
+              "run_attempt": os.environ["EVIDENCE_RUN_ATTEMPT"],
+              "binary_plan_in_artifact": False,
+          }
+          Path("release-evidence").mkdir()
+          Path("release-evidence/plan.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload metadata-only release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-evidence-${{ inputs.environment }}-${{ github.run_id }}
+          path: release-evidence/plan.json
+          if-no-files-found: error
+          retention-days: 14
+
+  apply:
+    name: Apply exact approved plan (${{ inputs.environment }})
+    if: ${{ inputs.operation == 'apply' }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      AWS_REGION: ap-northeast-1
+      PLAN_PREFIX: terraform-plans
+    steps:
+      - name: Checkout exact planned protected commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.plan.outputs.commit_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Reject arbitrary plan identity before AWS access
+        run: |
+          python scripts/exact_plan_policy.py assert-record \
+            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
+            --prefix "${PLAN_PREFIX}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --environment "${{ inputs.environment }}" \
+            --commit-sha "${{ needs.plan.outputs.commit_sha }}" \
+            --workflow-ref "${{ github.workflow_ref }}" \
+            --kms-key-arn "${{ needs.plan.outputs.plan_kms_key_arn }}" \
+            --apply-role-arn "${{ needs.plan.outputs.apply_role_arn }}" \
+            --key "${{ needs.plan.outputs.plan_key }}" \
+            --version-id "${{ needs.plan.outputs.plan_version_id }}" \
+            --digest "${{ needs.plan.outputs.plan_digest }}" \
+            --apply-role-digest "${{ needs.plan.outputs.apply_role_digest }}" \
+            --record-digest "${{ needs.plan.outputs.plan_record_digest }}" \
+            --require-package \
+            --package-key "${{ needs.plan.outputs.package_key }}" \
+            --package-version-id "${{ needs.plan.outputs.package_version_id }}" \
+            --package-digest "${{ needs.plan.outputs.package_digest }}" \
+            --package-destination "${{ needs.plan.outputs.package_destination }}" \
+            --classification-sha256 "${{ needs.plan.outputs.classification_sha256 }}" \
+            --presentation-limits-sha256 "${{ needs.plan.outputs.presentation_limits_sha256 }}" \
+            --review-summary-sha256 "${{ needs.plan.outputs.review_summary_sha256 }}" \
+            --resource-count "${{ needs.plan.outputs.resource_count }}" \
+            --drift-count "${{ needs.plan.outputs.drift_count }}" \
+            --output-count "${{ needs.plan.outputs.output_count }}" \
+            --high-risk-resource-count "${{ needs.plan.outputs.high_risk_resource_count }}" \
+            --high-risk-drift-count "${{ needs.plan.outputs.high_risk_drift_count }}" \
+            --replacement-path-count "${{ needs.plan.outputs.replacement_path_count }}" \
+            --sensitive-path-count "${{ needs.plan.outputs.sensitive_path_count }}" \
+            --sensitive-output-count "${{ needs.plan.outputs.sensitive_output_count }}"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.15.5"
+
+      - name: Configure write-capable AWS apply credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ needs.plan.outputs.apply_role_arn }}
+          role-session-name: apply-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+
+      - name: Download exact object version and metadata
+        run: |
+          aws s3api head-object \
+            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
+            --key "${{ needs.plan.outputs.plan_key }}" \
+            --version-id "${{ needs.plan.outputs.plan_version_id }}" \
+            > "${RUNNER_TEMP}/head-object.json"
+          aws s3api head-object \
+            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
+            --key "${{ needs.plan.outputs.package_key }}" \
+            --version-id "${{ needs.plan.outputs.package_version_id }}" \
+            > "${RUNNER_TEMP}/head-package.json"
+          mkdir -p backend/dist
+          aws s3api get-object \
+            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
+            --key "${{ needs.plan.outputs.plan_key }}" \
+            --version-id "${{ needs.plan.outputs.plan_version_id }}" \
+            "infra/envs/${{ inputs.environment }}/tfplan" \
+            > "${RUNNER_TEMP}/get-object.json"
+          aws s3api get-object \
+            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
+            --key "${{ needs.plan.outputs.package_key }}" \
+            --version-id "${{ needs.plan.outputs.package_version_id }}" \
+            "backend/dist/reading-assistant-lambda.zip" \
+            > "${RUNNER_TEMP}/get-package.json"
+
+      - name: Verify exact version metadata environment commit and digest
+        run: |
+          python scripts/exact_plan_policy.py verify-download \
+            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
+            --prefix "${PLAN_PREFIX}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --environment "${{ inputs.environment }}" \
+            --commit-sha "${{ needs.plan.outputs.commit_sha }}" \
+            --workflow-ref "${{ github.workflow_ref }}" \
+            --kms-key-arn "${{ needs.plan.outputs.plan_kms_key_arn }}" \
+            --apply-role-arn "${{ needs.plan.outputs.apply_role_arn }}" \
+            --key "${{ needs.plan.outputs.plan_key }}" \
+            --version-id "${{ needs.plan.outputs.plan_version_id }}" \
+            --digest "${{ needs.plan.outputs.plan_digest }}" \
+            --apply-role-digest "${{ needs.plan.outputs.apply_role_digest }}" \
+            --record-digest "${{ needs.plan.outputs.plan_record_digest }}" \
+            --require-package \
+            --package-key "${{ needs.plan.outputs.package_key }}" \
+            --package-version-id "${{ needs.plan.outputs.package_version_id }}" \
+            --package-digest "${{ needs.plan.outputs.package_digest }}" \
+            --package-destination "${{ needs.plan.outputs.package_destination }}" \
+            --classification-sha256 "${{ needs.plan.outputs.classification_sha256 }}" \
+            --presentation-limits-sha256 "${{ needs.plan.outputs.presentation_limits_sha256 }}" \
+            --review-summary-sha256 "${{ needs.plan.outputs.review_summary_sha256 }}" \
+            --resource-count "${{ needs.plan.outputs.resource_count }}" \
+            --drift-count "${{ needs.plan.outputs.drift_count }}" \
+            --output-count "${{ needs.plan.outputs.output_count }}" \
+            --high-risk-resource-count "${{ needs.plan.outputs.high_risk_resource_count }}" \
+            --high-risk-drift-count "${{ needs.plan.outputs.high_risk_drift_count }}" \
+            --replacement-path-count "${{ needs.plan.outputs.replacement_path_count }}" \
+            --sensitive-path-count "${{ needs.plan.outputs.sensitive_path_count }}" \
+            --sensitive-output-count "${{ needs.plan.outputs.sensitive_output_count }}" \
+            --head-response "${RUNNER_TEMP}/head-object.json" \
+            --get-response "${RUNNER_TEMP}/get-object.json" \
+            --plan-file "infra/envs/${{ inputs.environment }}/tfplan" \
+            --package-head-response "${RUNNER_TEMP}/head-package.json" \
+            --package-get-response "${RUNNER_TEMP}/get-package.json" \
+            --package-file "backend/dist/reading-assistant-lambda.zip"
+
+      - name: Terraform init
+        working-directory: infra/envs/${{ inputs.environment }}
+        env:
+          TERRAFORM_STATE_BUCKET: ${{ vars.TERRAFORM_STATE_BUCKET }}
+        run: |
+          if [[ ! "${TERRAFORM_STATE_BUCKET}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
+            echo "TERRAFORM_STATE_BUCKET is missing or not a valid bucket name." >&2
+            exit 1
+          fi
+          if ! terraform init -input=false \
+            -backend-config="bucket=${TERRAFORM_STATE_BUCKET}" \
+            > "${RUNNER_TEMP}/terraform-init.stdout" \
+            2> "${RUNNER_TEMP}/terraform-init.stderr"; then
+            python ../../../scripts/exact_plan_policy.py summarize-failure \
+              --input "${RUNNER_TEMP}/terraform-init.stderr" \
+              --command terraform-init
+            rm -f "${RUNNER_TEMP}/terraform-init.stdout" \
+              "${RUNNER_TEMP}/terraform-init.stderr"
+            exit 1
+          fi
+          rm -f "${RUNNER_TEMP}/terraform-init.stdout" \
+            "${RUNNER_TEMP}/terraform-init.stderr"
+
+      - name: Verify complete plan classification before apply
+        working-directory: infra/envs/${{ inputs.environment }}
+        run: |
+          if ! terraform show -json tfplan \
+            > "${RUNNER_TEMP}/terraform-apply-plan.json" \
+            2> "${RUNNER_TEMP}/terraform-apply-show.stderr"; then
+            python ../../../scripts/exact_plan_policy.py summarize-failure \
+              --input "${RUNNER_TEMP}/terraform-apply-show.stderr" \
+              --command terraform-show
+            rm -f "${RUNNER_TEMP}/terraform-apply-plan.json" \
+              "${RUNNER_TEMP}/terraform-apply-show.stderr"
+            exit 1
+          fi
+          if ! python ../../../scripts/exact_plan_policy.py verify-classification \
+            --input "${RUNNER_TEMP}/terraform-apply-plan.json" \
+            --classification-sha256 "${{ needs.plan.outputs.classification_sha256 }}" \
+            --presentation-limits-sha256 "${{ needs.plan.outputs.presentation_limits_sha256 }}" \
+            --review-summary-sha256 "${{ needs.plan.outputs.review_summary_sha256 }}" \
+            --resource-count "${{ needs.plan.outputs.resource_count }}" \
+            --drift-count "${{ needs.plan.outputs.drift_count }}" \
+            --output-count "${{ needs.plan.outputs.output_count }}" \
+            --high-risk-resource-count "${{ needs.plan.outputs.high_risk_resource_count }}" \
+            --high-risk-drift-count "${{ needs.plan.outputs.high_risk_drift_count }}" \
+            --replacement-path-count "${{ needs.plan.outputs.replacement_path_count }}" \
+            --sensitive-path-count "${{ needs.plan.outputs.sensitive_path_count }}" \
+            --sensitive-output-count "${{ needs.plan.outputs.sensitive_output_count }}"; then
+            rm -f "${RUNNER_TEMP}/terraform-apply-plan.json" \
+              "${RUNNER_TEMP}/terraform-apply-show.stderr"
+            exit 1
+          fi
+          python ../../../scripts/exact_plan_policy.py verify-lambda-package \
+            --plan "${RUNNER_TEMP}/terraform-apply-plan.json" \
+            --package-file ../../../backend/dist/reading-assistant-lambda.zip \
+            --package-digest "${{ needs.plan.outputs.package_digest }}"
+          rm -f "${RUNNER_TEMP}/terraform-apply-plan.json" \
+            "${RUNNER_TEMP}/terraform-apply-show.stderr"
+
+      - name: Apply exact previously reviewed plan
+        working-directory: infra/envs/${{ inputs.environment }}
+        run: |
+          if ! terraform apply -input=false -auto-approve tfplan \
+            > "${RUNNER_TEMP}/terraform-apply.stdout" \
+            2> "${RUNNER_TEMP}/terraform-apply.stderr"; then
+            python ../../../scripts/exact_plan_policy.py summarize-failure \
+              --input "${RUNNER_TEMP}/terraform-apply.stderr" \
+              --command terraform-apply
+            rm -f "${RUNNER_TEMP}/terraform-apply.stdout" \
+              "${RUNNER_TEMP}/terraform-apply.stderr"
+            exit 1
+          fi
+          rm -f "${RUNNER_TEMP}/terraform-apply.stdout" \
+            "${RUNNER_TEMP}/terraform-apply.stderr"
+          echo "Exact previously reviewed Terraform plan applied."
+
+      - name: Capture API endpoint
+        id: deployment
+        working-directory: infra/envs/${{ inputs.environment }}
+        run: echo "api_endpoint=$(terraform output -raw api_endpoint)" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify backend health
+        working-directory: backend
+        env:
+          API_ENDPOINT: ${{ steps.deployment.outputs.api_endpoint }}
+        run: |
+          python scripts/check_health.py \
+            --api-endpoint "${API_ENDPOINT}" \
+            --attempts 12 \
+            --delay-seconds 5 \
+            --timeout-seconds 10

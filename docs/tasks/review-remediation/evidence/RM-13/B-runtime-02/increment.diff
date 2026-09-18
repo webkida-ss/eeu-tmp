@@ -1,0 +1,30 @@
+diff --git a/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/test_session_repository.py b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-02/source/backend/test_session_repository.py
+index 4fd2c3d..38f2ca2 100644
+--- a/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/test_session_repository.py
++++ b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-02/source/backend/test_session_repository.py
+@@ -170,6 +170,8 @@ class JsonSessionRepositoryTests(SessionRepositoryContract, unittest.TestCase):
+         sessions_read = threading.Event()
+         continue_sessions_read = threading.Event()
+         revocation_started = threading.Event()
++        alias = Path(self._tempdir.name) / "auth_sessions_admin_alias.json"
++        alias.symlink_to(self.path)
+         cleanup_auth = PausingJsonEmailAuthService(
+             self.users_path,
+             self.path,
+@@ -177,7 +179,7 @@ class JsonSessionRepositoryTests(SessionRepositoryContract, unittest.TestCase):
+             continue_sessions_read=continue_sessions_read,
+         )
+         sessions = RecordingJsonSessionRepository(
+-            self.path,
++            alias,
+             revocation_started=revocation_started,
+         )
+         controls = JsonAdminAccountControlRepository(
+@@ -226,6 +228,7 @@ class JsonSessionRepositoryTests(SessionRepositoryContract, unittest.TestCase):
+         self.assertFalse(cleanup_thread.is_alive())
+         self.assertFalse(admin_thread.is_alive())
+         self.assertTrue(admin_finished.is_set())
++        self.assertEqual(sessions._path, self.path.resolve())
+         self.assertEqual(controls.get_control("target-1").status, "active")
+         self.assertEqual(
+             sessions.sessions,

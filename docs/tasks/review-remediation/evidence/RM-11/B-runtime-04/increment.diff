@@ -1,0 +1,631 @@
+--- ../B-review-03/source/backend/services/preloading.py	2026-09-14 23:11:33
++++ source/backend/services/preloading.py	2026-09-14 23:18:54
+@@ -912,6 +912,9 @@
+     """Build the exact ready representation before its immutable success decision."""
+     ready = dict(record)
+     ready.pop("content", None)
++    for field in tuple(ready):
++        if field.startswith("shadow_pending_") or field.startswith("_claimed_"):
++            ready.pop(field)
+     ready.update(response)
+     ready.update(
+         {
+@@ -925,17 +928,50 @@
+         }
+     )
+     return ready
++
++
++def _shadow_unavailable_record(record: dict[str, Any]) -> dict[str, Any]:
++    """Publish a bounded failure when a settled response cannot be represented."""
++    failed = dict(record)
++    failed.pop("content", None)
++    for field in tuple(failed):
++        if (
++            field.startswith("shadow_pending_")
++            or field.startswith("_claimed_")
++            or field
++            in {
++                "summary",
++                "topics",
++                "sentences",
++                "study_items",
++                "vocabulary_coverage",
++            }
++        ):
++            failed.pop(field)
++    failed.update(
++        {
++            "status": "failed",
++            "error": (
++                "The saved analysis result is no longer available. Please submit the article again."
++            ),
++            "content_retirement_pending": True,
++        }
++    )
++    return failed
+ 
+ 
+ def _durable_shadow_usage(tally: UsageTally, operation: Any) -> dict[str, Any]:
+-    """Keep known partial usage above the pinned conservative cost floor."""
++    """Use exact measured cost, preserving a floor only for uncertain usage."""
+     usage = _settlement_usage(tally, operation)
+     snapshot = tally.snapshot()
+-    usage["actual_cost_micro_usd"] = max(
+-        int(usage.get("actual_cost_micro_usd") or 0),
+-        int(snapshot.cost_micro_usd or 0),
+-        int(operation.reserved_cost_micro_usd),
+-    )
++    if snapshot.missing_usage or operation.pricing_available is not True:
++        usage["actual_cost_micro_usd"] = max(
++            int(usage.get("actual_cost_micro_usd") or 0),
++            int(snapshot.cost_micro_usd or 0),
++            int(operation.reserved_cost_micro_usd),
++        )
++    else:
++        usage["actual_cost_micro_usd"] = int(snapshot.cost_micro_usd or 0)
+     return usage
+ 
+ 
+@@ -985,31 +1021,56 @@
+     terminal.pop("content", None)
+     if is_success:
+         terminal = _shadow_ready_record(record, response)
++        try:
++            repository.validate_publication(user_id, terminal)
++        except PreloadResultTooLarge:
++            # The accounting outcome is immutable already. Avoid publishing an
++            # oversized private response while retaining its canonical usage.
++            is_success = False
++            terminal = _shadow_unavailable_record(record)
+     else:
+-        terminal.update(
+-            {
+-                "status": "failed",
+-                "error": (
+-                    "The saved analysis result is no longer available. "
+-                    "Please submit the article again."
+-                    if operation.shadow_outcome == "success"
+-                    else "Article analysis failed. Please try again."
+-                ),
+-                "content_retirement_pending": True,
+-            }
+-        )
++        if operation.shadow_outcome == "success":
++            terminal = _shadow_unavailable_record(record)
++        else:
++            terminal.update(
++                {
++                    "status": "failed",
++                    "error": "Article analysis failed. Please try again.",
++                    "content_retirement_pending": True,
++                }
++            )
+     terminal["accounting_mode"] = "shadow"
+     terminal["shadow_version"] = 1
+     terminal["usage_state"] = "finalized"
+     terminal["shadow_outcome"] = operation.shadow_outcome
+-    completed = repository.finish_processing(
+-        user_id,
+-        preload_id,
+-        learner_profile_fingerprint,
+-        terminal,
+-        lease_id=lease_id,
+-        expected_status=expected_status,
+-    )
++    try:
++        completed = repository.finish_processing(
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            terminal,
++            lease_id=lease_id,
++            expected_status=expected_status,
++        )
++    except PreloadResultTooLarge:
++        if not is_success:
++            raise
++        # The adapter remains authoritative at the write boundary. A late
++        # size rejection may only downgrade publication, never its settlement.
++        is_success = False
++        terminal = _shadow_unavailable_record(record)
++        terminal["accounting_mode"] = "shadow"
++        terminal["shadow_version"] = 1
++        terminal["usage_state"] = "finalized"
++        terminal["shadow_outcome"] = operation.shadow_outcome
++        completed = repository.finish_processing(
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            terminal,
++            lease_id=lease_id,
++            expected_status=expected_status,
++        )
+     if not completed:
+         return False
+     terminal = _retire_terminal_content(
+@@ -1166,9 +1227,10 @@
+             "failed_after_dispatch",
+         ):
+             return
+-        if intended_outcome == "success" and _valid_shadow_ready_payload(
+-            meter.get_result(operation_id)
+-        ) is None:
++        if (
++            intended_outcome == "success"
++            and _valid_shadow_ready_payload(meter.get_result(operation_id)) is None
++        ):
+             intended_outcome = "failed_after_dispatch"
+         try:
+             operation = _settle_durable_shadow(
+@@ -1405,6 +1467,7 @@
+             pending["shadow_pending_outcome"] = desired_outcome
+             pending["shadow_pending_result_ref"] = preload_id
+             pending["content_retirement_pending"] = True
++            pending.pop("_claimed_from_unstarted_processing", None)
+             repository.finish_processing(
+                 user_id,
+                 preload_id,
+--- ../B-review-03/source/backend/test_preload_jobs.py	2026-09-14 23:11:32
++++ source/backend/test_preload_jobs.py	2026-09-14 23:11:49
+@@ -472,8 +472,17 @@
+     def __init__(self):
+         self.calls = []
+ 
+-    def enqueue(self, user_id, page_url, preload_id, learner_profile_fingerprint):
+-        self.calls.append((user_id, page_url, preload_id, learner_profile_fingerprint))
++    def enqueue(
++        self,
++        user_id,
++        page_url,
++        preload_id,
++        learner_profile_fingerprint,
++        usage_context=None,
++    ):
++        self.calls.append(
++            (user_id, page_url, preload_id, learner_profile_fingerprint, usage_context)
++        )
+ 
+ 
+ class _UsageAwareRunner(_RecordingRunner):
+--- ../B-review-03/source/backend/test_preload_shadow_accounting.py	2026-09-14 23:11:33
++++ source/backend/test_preload_shadow_accounting.py	2026-09-14 23:17:37
+@@ -411,6 +411,25 @@
+         self.assertEqual(month["tokens"], 5)
+         self.assertGreater(month["shadow_cost_micro_usd"], 0)
+ 
++    def test_shadow_measured_usage_keeps_exact_cost_below_the_estimated_floor(self) -> None:
++        meter = UsageMeter(
++            self.subscriptions,
++            self.usage,
++            _USER_ID,
++            rate=ModelRate(pipeline.OPENAI_MODEL, 1_000_000, 1_000_000, "shadow-test"),
++            reservation_enabled=False,
++            durable_shadow=True,
++        )
++        with mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13):
++            self._submit(meter=meter)
++
++        self._run_success()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(operation.actual_cost_micro_usd, 5)
++        self.assertEqual(month["shadow_cost_micro_usd"], 5)
++
+     def test_shadow_incomplete_usage_keeps_known_cost_above_the_estimated_floor(self) -> None:
+         meter = UsageMeter(
+             self.subscriptions,
+@@ -423,7 +442,34 @@
+         with mock.patch.object(preloading, "estimate_article_cost_micro_usd", return_value=13):
+             self._submit(meter=meter)
+ 
+-        self._run_success()
++        def split(*_args, **kwargs):
++            tally = kwargs["tally"]
++            tally.mark_dispatch_attempt()
++            tally.add_response(
++                types.SimpleNamespace(
++                    model=pipeline.OPENAI_MODEL,
++                    usage=types.SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
++                )
++            )
++            tally.add_response(types.SimpleNamespace(model=pipeline.OPENAI_MODEL, usage=None))
++            return ["A durable shadow sentence."]
++
++        with (
++            mock.patch.object(preloading, "_split_sentences", side_effect=split),
++            mock.patch.object(
++                preloading,
++                "_analyze_sentences",
++                return_value=("summary", [], []),
++            ),
++            mock.patch.object(preloading, "_extract_study_items", return_value=([], {})),
++        ):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *self.runner.calls[0][:4],
++            )
+ 
+         operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
+         month = self.usage.get_month(_USER_ID, operation.month)
+@@ -498,6 +544,99 @@
+         self.assertEqual(month["articles"], 0)
+         self.assertEqual(month["tokens"], 5)
+ 
++    def test_dynamo_near_limit_recovery_discards_pending_metadata_before_ready(self) -> None:
++        self.preloads = DynamoPagePreloadRepository(_DynamoPreloadStore())
++        self.runner = _RecordingRunner()
++        self._submit()
++        summary = "x" * 2_000
++        original_prepare = UsageMeter.prepare_shadow_settlement
++        prepare_attempts = 0
++
++        def analyze(*_args, **_kwargs):
++            current = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++            self.assertIsNotNone(current)
++            candidate = preloading._shadow_ready_record(
++                current,
++                {
++                    "summary": summary,
++                    "topics": [],
++                    "sentences": [],
++                    "study_items": [],
++                    "vocabulary_coverage": {},
++                    "sentences_detected": current.get("sentences_detected")
++                    or preloading._estimate_sentence_count(_HTML),
++                    "created_at": datetime.now(UTC).isoformat(),
++                },
++            )
++            normalized = DynamoPagePreloadRepository._publication_record(_USER_ID, candidate)
++            os.environ["DYNAMODB_PRELOAD_MAX_BYTES"] = str(
++                len(
++                    json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode(
++                        "utf-8"
++                    )
++                )
++                + 16
++            )
++            return (summary, [], [])
++
++        def fail_prepare_once(meter, operation_id, **kwargs):
++            nonlocal prepare_attempts
++            prepare_attempts += 1
++            if prepare_attempts == 1:
++                raise OSError("temporary settlement write failure")
++            return original_prepare(meter, operation_id, **kwargs)
++
++        def split(*_args, **kwargs):
++            tally = kwargs["tally"]
++            tally.mark_dispatch_attempt()
++            tally.add_response(
++                types.SimpleNamespace(
++                    model=pipeline.OPENAI_MODEL,
++                    usage=types.SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
++                )
++            )
++            return ["A sentence."]
++
++        with (
++            mock.patch.dict(os.environ, {"DYNAMODB_PRELOAD_MAX_BYTES": "350000"}),
++            mock.patch.object(preloading, "_split_sentences", side_effect=split),
++            mock.patch.object(preloading, "_analyze_sentences", side_effect=analyze),
++            mock.patch.object(preloading, "_extract_study_items", return_value=([], {})),
++            mock.patch.object(
++                UsageMeter,
++                "prepare_shadow_settlement",
++                new=fail_prepare_once,
++            ),
++        ):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *self.runner.calls[0][:4],
++            )
++            pending = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++            self.assertEqual(pending["status"], "ready_pending_usage")
++            self.assertEqual(pending["shadow_pending_outcome"], "success")
++
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *self.runner.calls[0][:4],
++            )
++
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(record["status"], "ready")
++        self.assertEqual(record["summary"], summary)
++        self.assertNotIn("shadow_pending_outcome", record)
++        self.assertNotIn("shadow_pending_result_ref", record)
++        self.assertEqual(operation.shadow_outcome, "success")
++        self.assertEqual(month["articles"], 1)
++
+     def test_json_publication_does_not_inherit_the_dynamo_size_ceiling(self) -> None:
+         self._submit()
+ 
+--- ../B-review-03/source/backend/test_shadow_recovery_windows.py	2026-09-14 23:11:32
++++ source/backend/test_shadow_recovery_windows.py	2026-09-14 23:11:30
+@@ -216,14 +216,15 @@
+         write_json_list(Path(self._temporary_directory.name) / "usage.json", records)
+         self.assertIsNone(self.usage.get_result(_USER_ID, _OPERATION_ID))
+         self._expire_preload_lease()
++        reclaim_now = datetime.now(UTC)
+         self.assertEqual(
+             self._meter().claim_execution(
+                 _OPERATION_ID,
+                 "expired-shadow-execution",
+-                datetime.now(UTC) - timedelta(minutes=2),
+-                datetime.now(UTC) - timedelta(seconds=1),
++                reclaim_now,
++                reclaim_now - timedelta(seconds=1),
+             ),
+-            "claimed",
++            "recovered",
+         )
+ 
+         provider = mock.Mock(side_effect=AssertionError("TTL recovery must not redispatch"))
+--- ../B-review-03/source/backend/test_preload_handoff_workflow.py	2026-09-14 23:11:32
++++ source/backend/test_preload_handoff_workflow.py	2026-09-14 23:11:49
+@@ -469,7 +469,11 @@
+         self.assertEqual(current["payload_hash"], winner["payload_hash"])
+         self.assertEqual(len(runner.calls), 1)
+         self.assertIsNone(shadow_meter.get_operation(_OPERATION_ID))
+-        self.assertIsNone(self.usage.get_operation(_USER_ID, _OPERATION_ID))
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(operation.accounting_mode, "shadow")
++        self.assertEqual(operation.payload_hash, winner["payload_hash"])
++        self.assertEqual(operation.state, "reserved")
++        self.assertEqual(self.usage.get_month(_USER_ID, operation.month)["articles"], 0)
+ 
+     def test_shadow_loser_rechecks_a_conflicting_same_id_winner_after_requested_read(self) -> None:
+         requested_read_seen = threading.Event()
+@@ -520,7 +524,11 @@
+         self.assertEqual(loser_runner.calls, [])
+         self.assertIsNone(loser_meter.get_operation(_OPERATION_ID))
+         self.assertIsNone(winner_meter.get_operation(_OPERATION_ID))
+-        self.assertIsNone(self.usage.get_operation(_USER_ID, _OPERATION_ID))
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(operation.accounting_mode, "shadow")
++        self.assertEqual(operation.payload_hash, winner["payload_hash"])
++        self.assertEqual(operation.state, "reserved")
++        self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
+ 
+     def test_shadow_failed_handoff_retries_retirement_without_usage_release(self) -> None:
+         repository = JsonPagePreloadRepository(self.preload_path)
+@@ -534,23 +542,31 @@
+             self.assertIn("simulated", str(exc))
+ 
+         pending = repository.get_by_id(_USER_ID, _OPERATION_ID)
+-        self.assertEqual(pending["status"], "failed_pending_release")
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(pending["status"], "failed")
++        self.assertTrue(pending["content_retirement_pending"])
++        self.assertEqual(operation.accounting_mode, "shadow")
++        self.assertEqual(operation.shadow_outcome, "failed_before_dispatch")
++        self.assertEqual(self.usage.get_month(_USER_ID, operation.month)["articles"], 0)
+         self.assertEqual(content.retirement_calls, 1)
+-        with mock.patch.object(
+-            shadow_meter,
+-            "release",
+-            side_effect=AssertionError("shadow mode must not release a reservation"),
+-        ):
+-            replay = self._submit(repository, runner, content, meter=shadow_meter)
++        preloading.run_preload_job(
++            repository,
++            self.subscriptions,
++            self.usage,
++            content,
++            _USER_ID,
++            _PAGE_URL,
++            _OPERATION_ID,
++            pending["learner_profile_fingerprint"],
++        )
+ 
+         recovered = repository.get_by_id(_USER_ID, _OPERATION_ID)
+-        self.assertEqual(replay.status, "failed")
+         self.assertEqual(recovered["status"], "failed")
+         self.assertFalse(recovered["content_retirement_pending"])
+         self.assertEqual(content.retirement_calls, 2)
+         self.assertIsNone(content.get(_USER_ID, _OPERATION_ID))
+         self.assertIsNone(shadow_meter.get_operation(_OPERATION_ID))
+-        self.assertIsNone(self.usage.get_operation(_USER_ID, _OPERATION_ID))
++        self.assertEqual(self.usage.get_operation(_USER_ID, _OPERATION_ID).state, "finalized")
+ 
+     def test_advanced_winner_rejects_stale_submitter_release_and_retirement(self) -> None:
+         repository = AdvancedWinnerOnEnqueueJsonRepository(self.preload_path)
+--- ../B-review-03/source/backend/test_usage_repository.py	2026-09-14 23:11:32
++++ source/backend/test_usage_repository.py	2026-09-14 23:15:05
+@@ -2304,7 +2304,184 @@
+                     ),
+                     (other.user_id, other.month, other.rate_card_version),
+                 )
++
++    def test_json_conflicting_prepares_keep_the_lock_owner_outcome(self) -> None:
++        for winner_outcome, loser_outcome in (
++            ("success", "failed_after_dispatch"),
++            ("failed_after_dispatch", "success"),
++        ):
++            with self.subTest(winner=winner_outcome):
++                path = Path(self._tmpdir.name) / f"prepare-{winner_outcome}.json"
++                first_repository = JsonUsageRepository(path)
++                second_repository = JsonUsageRepository(path)
++                request = self._request(f"shadow-json-prepare-{winner_outcome}")
++                first_repository.start_shadow(request)
++                self._complete(first_repository, request)
++                winner_persisting = threading.Event()
++                release_winner = threading.Event()
++                loser_started = threading.Event()
++                outcomes: dict[str, object] = {}
++
++                def pause_persisted_prepare(
++                    target,
++                    records,
++                    winner_persisting=winner_persisting,
++                    release_winner=release_winner,
++                ) -> None:
++                    winner_persisting.set()
++                    if not release_winner.wait(timeout=2):
++                        raise RuntimeError("prepare winner was not released")
++                    write_json_list(target, records)
++
++                def prepare(
++                    repository,
++                    label: str,
++                    outcome: str,
++                    request=request,
++                    loser_started=loser_started,
++                    outcomes=outcomes,
++                ) -> None:
++                    if label == "loser":
++                        loser_started.set()
++                    try:
++                        outcomes[label] = repository.prepare_shadow_settlement(
++                            request.user_id,
++                            request.operation_id,
++                            outcome,
++                            result_ref=f"result-{outcome}",
++                        )
++                    except Exception as exc:  # The loser must observe the durable winner.
++                        outcomes[label] = exc
+ 
++                with patch(
++                    "repositories.usage_repository.write_json_list",
++                    side_effect=pause_persisted_prepare,
++                ):
++                    winner = threading.Thread(
++                        target=prepare,
++                        args=(first_repository, "winner", winner_outcome),
++                    )
++                    loser = threading.Thread(
++                        target=prepare,
++                        args=(second_repository, "loser", loser_outcome),
++                    )
++                    winner_started = False
++                    loser_started_thread = False
++                    try:
++                        winner.start()
++                        winner_started = True
++                        self.assertTrue(winner_persisting.wait(timeout=2))
++                        loser.start()
++                        loser_started_thread = True
++                        self.assertTrue(loser_started.wait(timeout=2))
++                    finally:
++                        release_winner.set()
++                        if winner_started:
++                            winner.join(timeout=2)
++                        if loser_started_thread:
++                            loser.join(timeout=2)
++
++                self.assertFalse(winner.is_alive())
++                self.assertFalse(loser.is_alive())
++                self.assertEqual(outcomes["winner"].shadow_pending_outcome, winner_outcome)
++                self.assertIsInstance(outcomes["loser"], UsageOperationConflict)
++                settled = second_repository.settle_shadow(request.user_id, request.operation_id)
++                month = second_repository.get_month(request.user_id, request.month)
++                self.assertEqual(settled.shadow_outcome, winner_outcome)
++                self.assertEqual(month["articles"], int(winner_outcome == "success"))
++                self.assertEqual(
++                    self._shadow_settle_event_count(
++                        "json", second_repository, None, request.operation_id
++                    ),
++                    1,
++                )
++
++    def test_dynamo_conflicting_prepares_keep_the_condition_winner_outcome(self) -> None:
++        for first_outcome, winner_outcome in (
++            ("success", "failed_after_dispatch"),
++            ("failed_after_dispatch", "success"),
++        ):
++            with self.subTest(winner=winner_outcome):
++                store = _MemoryDynamoStore()
++                first_repository = DynamoUsageRepository(store)
++                second_repository = DynamoUsageRepository(store)
++                request = self._request(f"shadow-dynamo-prepare-{winner_outcome}")
++                first_repository.start_shadow(request)
++                self._complete(first_repository, request)
++                winner: list[object] = []
++
++                def commit_second_prepare_before_first_condition(
++                    winner=winner,
++                    second_repository=second_repository,
++                    request=request,
++                    winner_outcome=winner_outcome,
++                ) -> None:
++                    winner.append(
++                        second_repository.prepare_shadow_settlement(
++                            request.user_id,
++                            request.operation_id,
++                            winner_outcome,
++                            result_ref=f"result-{winner_outcome}",
++                        )
++                    )
++
++                store.before_conditions = commit_second_prepare_before_first_condition
++                with self.assertRaises(UsageOperationConflict):
++                    first_repository.prepare_shadow_settlement(
++                        request.user_id,
++                        request.operation_id,
++                        first_outcome,
++                        result_ref=f"result-{first_outcome}",
++                    )
++
++                self.assertEqual(len(winner), 1)
++                self.assertEqual(winner[0].shadow_pending_outcome, winner_outcome)
++                settled = first_repository.settle_shadow(request.user_id, request.operation_id)
++                month = first_repository.get_month(request.user_id, request.month)
++                self.assertEqual(settled.shadow_outcome, winner_outcome)
++                self.assertEqual(month["articles"], int(winner_outcome == "success"))
++                self.assertEqual(
++                    self._shadow_settle_event_count(
++                        "dynamo", first_repository, store, request.operation_id
++                    ),
++                    1,
++                )
++
++    def test_dynamo_rejects_cross_mode_replays_and_late_evidence_after_prepare(self) -> None:
++        repository = DynamoUsageRepository(_MemoryDynamoStore())
++        enforced = reservation("shadow-mode-enforced", cost_micro_usd=13)
++        repository.reserve(enforced)
++        with self.assertRaises(UsageOperationConflict):
++            repository.start_shadow(replace(enforced, accounting_mode="shadow"))
++
++        shadow = self._request("shadow-mode-shadow")
++        repository.start_shadow(shadow)
++        with self.assertRaises(UsageOperationConflict):
++            repository.reserve(replace(shadow, accounting_mode="enforced"))
++
++        self._complete(repository, shadow, cost=17, tokens=5)
++        pending = repository.prepare_shadow_settlement(
++            shadow.user_id,
++            shadow.operation_id,
++            "success",
++            result_ref="result-original",
++        )
++        with self.assertRaises(UsageOperationConflict):
++            self._complete(repository, shadow, cost=23, tokens=9)
++        self.assertEqual(repository.get_operation(shadow.user_id, shadow.operation_id), pending)
++        self.assertEqual(
++            repository.get_result(shadow.user_id, shadow.operation_id)["usage"][
++                "actual_cost_micro_usd"
++            ],
++            17,
++        )
++        settled = repository.settle_shadow(shadow.user_id, shadow.operation_id)
++        month = repository.get_month(shadow.user_id, shadow.month)
++        self.assertEqual(
++            (settled.actual_cost_micro_usd, settled.tokens, month["shadow_cost_micro_usd"]),
++            (17, 5, 17),
++        )
++
+     def test_unpriced_partial_usage_preserves_known_floor_and_tokens(self) -> None:
+         for name, repository, _store in self._repositories():
+             with self.subTest(adapter=name):

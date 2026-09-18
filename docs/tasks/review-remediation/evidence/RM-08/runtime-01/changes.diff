@@ -1,0 +1,452 @@
+diff --git a/Taskfile.yaml b/Taskfile.yaml
+index 91d5150..f0aacdb 100644
+--- a/Taskfile.yaml
++++ b/Taskfile.yaml
+@@ -579,6 +579,12 @@ tasks:
+       - task: infra:validate:dev
+       - task: infra:validate:prod
+ 
++  infra:test:provider-guards:
++    desc: Run offline Terraform plan-time provider guard tests with mocked AWS
++    dir: "{{.ROOT_DIR}}"
++    cmds:
++      - bash ./scripts/test_terraform_provider_guards.sh
++
+ # ====================================================================================
+ # Build
+ # ====================================================================================
+diff --git a/backend/test_online_agent_policy_helpers.py b/backend/test_online_agent_policy_helpers.py
+index 68e7377..b6a51e4 100644
+--- a/backend/test_online_agent_policy_helpers.py
++++ b/backend/test_online_agent_policy_helpers.py
+@@ -573,9 +573,52 @@ def test_environment_plan_policies_are_structurally_least_privilege() -> None:
+             f"{state_key}.*",
+         ]
+         plan_resource = resources_for_action(policy, "s3:PutObject")
+-        assert plan_resource == [
+-            (f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan")
++        expected_plan_objects = [
++            f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++                f"*/*/{environment}/*/reading-assistant-lambda.zip"
++            ),
++        ]
++        assert plan_resource == expected_plan_objects
++        preload_bucket = next(
++            statement
++            for statement in statements
++            if statement["Sid"] == f"ReadOnly{environment.title()}PreloadBucket"
++        )
++        preload_actions = preload_bucket["Action"]
++        assert "s3:GetEncryptionConfiguration" in preload_actions
++        assert "s3:GetBucketEncryption" not in preload_actions
++        assert preload_bucket["Resource"] == (
++            f"arn:aws:s3:::english-{environment}-reading-assistant-preload-content-ACCOUNT_ID"
++        )
++        tagged_api = next(
++            statement
++            for statement in statements
++            if statement["Sid"] == f"ReadOnlyTagged{environment.title()}HttpApi"
++        )
++        assert tagged_api["Condition"]["StringEquals"] == {
++            "aws:ResourceTag/Environment": environment,
++            "aws:ResourceTag/Project": "english-reading-assistant",
++        }
++        plan_bucket_controls = next(
++            statement
++            for statement in statements
++            if statement["Sid"] == "InspectPrivatePlanBucketControls"
++        )
++        assert plan_bucket_controls["Action"] == [
++            "s3:GetEncryptionConfiguration",
++            "s3:GetBucketVersioning",
+         ]
++        plan_kms = next(
++            statement
++            for statement in statements
++            if statement["Sid"] == f"EncryptOnlyRunDerived{environment.title()}PlanObject"
++        )
++        assert (
++            plan_kms["Condition"]["StringLike"]["kms:EncryptionContext:aws:s3:arn"]
++            == expected_plan_objects
++        )
+         kms = next(
+             statement
+             for statement in statements
+@@ -630,15 +673,45 @@ def test_plan_policy_validation_script_accepts_only_split_templates() -> None:
+             ).read_text(encoding="utf-8")
+         )
+         resources = resources_for_action(apply_policy, "s3:GetObjectVersion")
+-        assert resources == [
+-            (f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan")
++        expected_objects = [
++            f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++                f"*/*/{environment}/*/reading-assistant-lambda.zip"
++            ),
+         ]
++        assert resources == expected_objects
++        decrypt = next(
++            statement
++            for statement in apply_policy["Statement"]
++            if statement["Sid"] == f"DecryptOnly{environment.title()}PlanObjects"
++        )
++        assert (
++            decrypt["Condition"]["StringLike"]["kms:EncryptionContext:aws:s3:arn"]
++            == expected_objects
++        )
+         other = "prod" if environment == "dev" else "dev"
+         assert not policy_resource_matches(
+             apply_policy,
+             "s3:GetObjectVersion",
+             (f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/100/1/{other}/{'a' * 40}/tfplan"),
+         )
++        assert policy_resource_matches(
++            apply_policy,
++            "s3:GetObjectVersion",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/100/1/"
++                f"{environment}/{'a' * 40}/reading-assistant-lambda.zip"
++            ),
++        )
++        assert not policy_resource_matches(
++            apply_policy,
++            "s3:GetObjectVersion",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/100/1/"
++                f"{other}/{'a' * 40}/reading-assistant-lambda.zip"
++            ),
++        )
+     result = subprocess.run(
+         [
+             sys.executable,
+diff --git a/docs/examples/aws-plan-role-policy-dev.json b/docs/examples/aws-plan-role-policy-dev.json
+index 78fd9e0..869f972 100644
+--- a/docs/examples/aws-plan-role-policy-dev.json
++++ b/docs/examples/aws-plan-role-policy-dev.json
+@@ -138,7 +138,7 @@
+       "Condition": {
+         "StringEquals": {
+           "aws:ResourceTag/Environment": "dev",
+-          "aws:ResourceTag/Project": "english"
++          "aws:ResourceTag/Project": "english-reading-assistant"
+         }
+       }
+     },
+@@ -171,7 +171,10 @@
+       "Sid": "WriteOnlyRunDerivedEncryptedDevPlanObject",
+       "Effect": "Allow",
+       "Action": "s3:PutObject",
+-      "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++      "Resource": [
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
++      ],
+       "Condition": {
+         "StringEquals": {
+           "s3:x-amz-server-side-encryption": "aws:kms",
+@@ -182,7 +185,7 @@
+     {
+       "Sid": "InspectPrivatePlanBucketControls",
+       "Effect": "Allow",
+-      "Action": ["s3:GetBucketEncryption", "s3:GetBucketVersioning"],
++      "Action": ["s3:GetEncryptionConfiguration", "s3:GetBucketVersioning"],
+       "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET"
+     },
+     {
+@@ -195,7 +198,10 @@
+           "kms:ViaService": "s3.REGION.amazonaws.com"
+         },
+         "StringLike": {
+-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan"
++          "kms:EncryptionContext:aws:s3:arn": [
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
++          ]
+         }
+       }
+     },
+diff --git a/docs/examples/aws-plan-role-policy-prod.json b/docs/examples/aws-plan-role-policy-prod.json
+index 7d6a05f..8309474 100644
+--- a/docs/examples/aws-plan-role-policy-prod.json
++++ b/docs/examples/aws-plan-role-policy-prod.json
+@@ -138,7 +138,7 @@
+       "Condition": {
+         "StringEquals": {
+           "aws:ResourceTag/Environment": "prod",
+-          "aws:ResourceTag/Project": "english"
++          "aws:ResourceTag/Project": "english-reading-assistant"
+         }
+       }
+     },
+@@ -171,7 +171,10 @@
+       "Sid": "WriteOnlyRunDerivedEncryptedProdPlanObject",
+       "Effect": "Allow",
+       "Action": "s3:PutObject",
+-      "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++      "Resource": [
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/reading-assistant-lambda.zip"
++      ],
+       "Condition": {
+         "StringEquals": {
+           "s3:x-amz-server-side-encryption": "aws:kms",
+@@ -182,7 +185,7 @@
+     {
+       "Sid": "InspectPrivatePlanBucketControls",
+       "Effect": "Allow",
+-      "Action": ["s3:GetBucketEncryption", "s3:GetBucketVersioning"],
++      "Action": ["s3:GetEncryptionConfiguration", "s3:GetBucketVersioning"],
+       "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET"
+     },
+     {
+@@ -195,7 +198,10 @@
+           "kms:ViaService": "s3.REGION.amazonaws.com"
+         },
+         "StringLike": {
+-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan"
++          "kms:EncryptionContext:aws:s3:arn": [
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/reading-assistant-lambda.zip"
++          ]
+         }
+       }
+     },
+diff --git a/infra/modules/reading-assistant-api/main.tf b/infra/modules/reading-assistant-api/main.tf
+index 28ec786..6bca1ce 100644
+--- a/infra/modules/reading-assistant-api/main.tf
++++ b/infra/modules/reading-assistant-api/main.tf
+@@ -51,6 +51,26 @@ locals {
+     local.usage_environment,
+     local.secret_environment,
+   )
++
++  provider_environment_is_preserved = (
++    local.lambda_environment["STORAGE_BACKEND"] == "dynamodb" &&
++    local.lambda_environment["READING_ASSISTANT_DYNAMODB_TABLE_NAME"] == var.table_name &&
++    local.lambda_environment["AUTH_PROVIDER"] == var.auth_provider &&
++    local.lambda_environment["GOOGLE_OAUTH_CLIENT_ID"] == var.google_oauth_client_id &&
++    local.lambda_environment["BILLING_PROVIDER"] == var.billing_provider &&
++    local.lambda_environment["STRIPE_PRICE_ID_PRO"] == var.stripe_price_id_pro &&
++    local.lambda_environment["STRIPE_PRICE_ID_MAX"] == var.stripe_price_id_max &&
++    local.lambda_environment["JOB_RUNNER"] == "sqs" &&
++    local.lambda_environment["PRELOAD_JOBS_QUEUE_URL"] == aws_sqs_queue.preload_jobs.id &&
++    local.lambda_environment["PRELOAD_CONTENT_BUCKET"] == var.preload_content_bucket_name &&
++    local.lambda_environment["ALLOWED_ORIGINS"] == join(",", var.allowed_origins)
++  )
++
++  production_provider_environment_is_safe = var.environment != "prod" || (
++    local.lambda_environment["STORAGE_BACKEND"] == "dynamodb" &&
++    local.lambda_environment["AUTH_PROVIDER"] == "google" &&
++    local.lambda_environment["BILLING_PROVIDER"] == "stripe"
++  )
+ }
+ 
+ check "usage_pricing_required_when_enforced" {
+@@ -180,6 +200,14 @@ resource "aws_lambda_function" "this" {
+       )
+       error_message = "Usage reservation enforcement requires configured positive OpenAI rates and a rate-card version."
+     }
++
++    precondition {
++      condition = (
++        local.provider_environment_is_preserved &&
++        local.production_provider_environment_is_safe
++      )
++      error_message = "Final API Lambda environment must preserve typed provider and storage settings and use dynamodb, google, and stripe in prod."
++    }
+   }
+ 
+   depends_on = [aws_cloudwatch_log_group.lambda]
+@@ -345,6 +373,16 @@ resource "aws_lambda_function" "worker" {
+     variables = local.lambda_environment
+   }
+ 
++  lifecycle {
++    precondition {
++      condition = (
++        local.provider_environment_is_preserved &&
++        local.production_provider_environment_is_safe
++      )
++      error_message = "Final worker Lambda environment must preserve typed provider and storage settings and use dynamodb, google, and stripe in prod."
++    }
++  }
++
+   depends_on = [aws_cloudwatch_log_group.worker]
+ }
+ 
+diff --git a/infra/modules/reading-assistant-api/variables.tf b/infra/modules/reading-assistant-api/variables.tf
+index b900a5a..2cc10da 100644
+--- a/infra/modules/reading-assistant-api/variables.tf
++++ b/infra/modules/reading-assistant-api/variables.tf
+@@ -135,14 +135,22 @@ variable "allowed_origins" {
+ }
+ 
+ variable "extra_environment" {
+-  description = "Additional non-secret environment variables for the app. Usage, pricing, plan, lease, and replay-retention keys must use their typed variables."
++  description = "Additional non-secret environment variables for the app. Provider, storage, identity, billing, usage, pricing, plan, lease, and replay-retention keys must use their typed inputs."
+   type        = map(string)
+   default     = {}
+   sensitive   = true
+ 
+-  # RESERVED_USAGE_ENVIRONMENT_KEYS are owned by typed module inputs.
++  # These keys are owned by typed module inputs or the base environment.
+   validation {
+     condition = length(setintersection(toset(keys(var.extra_environment)), toset([
++      "STORAGE_BACKEND", "READING_ASSISTANT_DYNAMODB_TABLE_NAME",
++      "AUTH_PROVIDER", "GOOGLE_OAUTH_CLIENT_ID", "AUTH_SESSION_TTL_DAYS",
++      "BILLING_PROVIDER", "STRIPE_PRICE_ID_PRO", "STRIPE_PRICE_ID_MAX",
++      "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
++      "OPENAI_API_KEY", "OPENAI_API_KEY_SSM_PARAMETER",
++      "STRIPE_SECRET_KEY_SSM_PARAMETER", "STRIPE_WEBHOOK_SECRET_SSM_PARAMETER",
++      "JOB_RUNNER", "PRELOAD_JOBS_QUEUE_URL", "PRELOAD_CONTENT_BUCKET",
++      "PRELOAD_CONTENT_DIR", "ALLOWED_ORIGINS",
+       "USAGE_RESERVATION_ENABLED", "USAGE_RESERVATION_TTL_SECONDS",
+       "SYNC_RESULT_TTL_SECONDS", "SYNC_RESULT_MAX_BYTES",
+       "SYNC_RESULT_CLEANUP_BATCH_SIZE", "SYNC_EXECUTION_LEASE_SECONDS",
+@@ -161,7 +169,7 @@ variable "extra_environment" {
+       "PLAN_MAX_SENTENCES_PER_ARTICLE", "PLAN_MAX_SOURCE_TOKENS_PER_ARTICLE",
+       "PLAN_MAX_COST_MICRO_USD_PER_MONTH", "PLAN_MAX_TOKENS_PER_MONTH",
+     ]))) == 0
+-    error_message = "extra_environment cannot override reserved usage, pricing, plan, lease, or replay-retention keys."
++    error_message = "extra_environment cannot override reserved provider, storage, identity, billing, security, usage, pricing, plan, lease, or replay-retention keys."
+   }
+ }
+ 
+@@ -262,6 +270,24 @@ variable "usage_pricing_and_plan_environment" {
+     PLAN_MAX_COST_MICRO_USD_PER_MONTH         = "7000000"
+     PLAN_MAX_TOKENS_PER_MONTH                 = "10000000"
+   }
++
++  validation {
++    condition = length(setsubtract(toset(keys(var.usage_pricing_and_plan_environment)), toset([
++      "OPENAI_TOKEN_ENCODING", "OPENAI_RATE_CARD_VERSION",
++      "OPENAI_MODEL_INPUT_MICRO_USD_PER_MILLION",
++      "OPENAI_MODEL_OUTPUT_MICRO_USD_PER_MILLION",
++      "PLAN_BASIC_ARTICLES_PER_MONTH", "PLAN_BASIC_CHATS_PER_MONTH",
++      "PLAN_BASIC_SENTENCES_PER_ARTICLE", "PLAN_BASIC_SOURCE_TOKENS_PER_ARTICLE",
++      "PLAN_BASIC_COST_MICRO_USD_PER_MONTH", "PLAN_BASIC_TOKENS_PER_MONTH",
++      "PLAN_PRO_ARTICLES_PER_MONTH", "PLAN_PRO_CHATS_PER_MONTH",
++      "PLAN_PRO_SENTENCES_PER_ARTICLE", "PLAN_PRO_SOURCE_TOKENS_PER_ARTICLE",
++      "PLAN_PRO_COST_MICRO_USD_PER_MONTH", "PLAN_PRO_TOKENS_PER_MONTH",
++      "PLAN_MAX_ARTICLES_PER_MONTH", "PLAN_MAX_CHATS_PER_MONTH",
++      "PLAN_MAX_SENTENCES_PER_ARTICLE", "PLAN_MAX_SOURCE_TOKENS_PER_ARTICLE",
++      "PLAN_MAX_COST_MICRO_USD_PER_MONTH", "PLAN_MAX_TOKENS_PER_MONTH",
++    ]))) == 0
++    error_message = "usage_pricing_and_plan_environment only accepts documented tokenizer, rate-card, and PLAN_* entries."
++  }
+ }
+ 
+ variable "lambda_memory_size" {
+diff --git a/scripts/validate_aws_plan_policies.py b/scripts/validate_aws_plan_policies.py
+index 9040e15..4dbd125 100644
+--- a/scripts/validate_aws_plan_policies.py
++++ b/scripts/validate_aws_plan_policies.py
+@@ -127,13 +127,71 @@ def validate_policy(environment: str) -> None:
+     ):
+         raise ValidationError("State decrypt lacks exact encryption context")
+ 
++    preload_bucket = statement_by_sid(policy, f"ReadOnly{environment.title()}PreloadBucket")
++    expected_preload_bucket = (
++        f"arn:aws:s3:::english-{environment}-reading-assistant-preload-content-ACCOUNT_ID"
++    )
++    if preload_bucket.get("Resource") != expected_preload_bucket:
++        raise ValidationError("Preload bucket read is not environment-bound")
++    preload_actions = set(as_strings(preload_bucket.get("Action"), "Preload bucket Action"))
++    if (
++        "s3:GetEncryptionConfiguration" not in preload_actions
++        or "s3:GetBucketEncryption" in preload_actions
++    ):
++        raise ValidationError("Preload bucket encryption read must use s3:GetEncryptionConfiguration")
++
++    tagged_api = statement_by_sid(policy, f"ReadOnlyTagged{environment.title()}HttpApi")
++    if (
++        tagged_api.get("Resource") != "arn:aws:apigateway:REGION::/apis/*"
++        or tagged_api.get("Condition", {}).get("StringEquals")
++        != {
++            "aws:ResourceTag/Environment": environment,
++            "aws:ResourceTag/Project": "english-reading-assistant",
++        }
++    ):
++        raise ValidationError("HTTP API reads must require the provisioned Project and Environment tags")
++
++    plan_bucket_controls = statement_by_sid(policy, "InspectPrivatePlanBucketControls")
++    if (
++        plan_bucket_controls.get("Resource") != "arn:aws:s3:::PRIVATE_PLAN_BUCKET"
++        or set(as_strings(plan_bucket_controls.get("Action"), "Private plan bucket Action"))
++        != {"s3:GetEncryptionConfiguration", "s3:GetBucketVersioning"}
++    ):
++        raise ValidationError("Private plan bucket controls must use the exact encryption-read action")
++
+     write = statement_by_sid(
+         policy,
+         f"WriteOnlyRunDerivedEncrypted{environment.title()}PlanObject",
+     )
+-    expected_plan = f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan"
+-    if write.get("Resource") != expected_plan:
+-        raise ValidationError("Plan write is not bound to the run-derived key shape")
++    expected_objects = [
++        f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++        (
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++            f"*/*/{environment}/*/reading-assistant-lambda.zip"
++        ),
++    ]
++    if as_strings(write.get("Resource"), "Plan write Resource") != expected_objects:
++        raise ValidationError("Plan write is not bound to the two exact run-derived objects")
++    if write.get("Condition", {}).get("StringEquals") != {
++        "s3:x-amz-server-side-encryption": "aws:kms",
++        "s3:x-amz-server-side-encryption-aws-kms-key-id": "PLAN_KMS_KEY_ARN",
++    }:
++        raise ValidationError("Plan write lacks exact SSE-KMS requirements")
++    plan_kms = statement_by_sid(
++        policy,
++        f"EncryptOnlyRunDerived{environment.title()}PlanObject",
++    )
++    if plan_kms.get("Resource") != "PLAN_KMS_KEY_ARN":
++        raise ValidationError("Plan encryption is not bound to PLAN_KMS_KEY_ARN")
++    if (
++        plan_kms.get("Condition", {}).get("StringEquals")
++        != {"kms:ViaService": "s3.REGION.amazonaws.com"}
++        or plan_kms.get("Condition", {})
++        .get("StringLike", {})
++        .get("kms:EncryptionContext:aws:s3:arn")
++        != expected_objects
++    ):
++        raise ValidationError("Plan encryption context is not bound to the two exact objects")
+ 
+     deny = statement_by_sid(policy, DENY_SID)
+     deny_actions = set(as_strings(deny.get("Action"), "Deny Action"))
+@@ -153,12 +211,18 @@ def validate_apply_plan_read_policy(environment: str) -> None:
+     path = EXAMPLES / f"aws-apply-plan-read-policy-{environment}.json"
+     raw = path.read_text(encoding="utf-8")
+     policy = json.loads(raw)
+-    expected_plan = f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan"
++    expected_objects = [
++        f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++        (
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++            f"*/*/{environment}/*/reading-assistant-lambda.zip"
++        ),
++    ]
+     other = "prod" if environment == "dev" else "dev"
+     if f"/*/{other}/*/tfplan" in raw:
+         raise ValidationError(f"{path.name} contains a cross-environment marker")
+     read = statement_by_sid(policy, f"ReadOnlyVersioned{environment.title()}PlanObjects")
+-    if read.get("Resource") != expected_plan or set(
++    if as_strings(read.get("Resource"), "Apply plan read Resource") != expected_objects or set(
+         as_strings(read.get("Action"), "Apply plan read Action")
+     ) != {"s3:GetObjectVersion", "s3:GetObjectVersionAttributes"}:
+         raise ValidationError("Apply plan read is not versioned and environment-bound")
+@@ -168,7 +232,8 @@ def validate_apply_plan_read_policy(environment: str) -> None:
+     condition = decrypt.get("Condition", {})
+     if (
+         condition.get("StringEquals", {}).get("kms:ViaService") != ("s3.REGION.amazonaws.com")
+-        or condition.get("StringLike", {}).get("kms:EncryptionContext:aws:s3:arn") != expected_plan
++        or condition.get("StringLike", {}).get("kms:EncryptionContext:aws:s3:arn")
++        != expected_objects
+     ):
+         raise ValidationError("Apply plan decrypt lacks exact S3 context")
+ 

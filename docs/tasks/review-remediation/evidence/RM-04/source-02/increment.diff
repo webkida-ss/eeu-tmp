@@ -1,0 +1,247 @@
+--- docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/reading-panel.js	2026-09-13 18:45:24
++++ extension/reading-panel.js	2026-09-13 18:58:25
+@@ -5,6 +5,7 @@
+   let activePreload = null;
+   let activePageUrl = '';
+   let activePageTitle = '';
++  let activeReadingOwner = null;
+   let sentenceDomLinks = new Map();
+   let activeSentenceId = null;
+   let hoveredSentenceId = null;
+@@ -161,20 +162,34 @@
+       .catch(() => {});
+   }
+ 
+-  function persistReadingUiState() {
+-    chrome.storage.local.get(READING_SESSION_KEY).then((storage) => {
+-      const session = storage[READING_SESSION_KEY];
+-      if (!session || !pageUrlsMatch(session.pageUrl, activePageUrl)) {
+-        return;
+-      }
+-      session.ui = {
+-        ...session.ui,
+-        activeSentenceId,
+-        hoveredSentenceId,
+-        activeSentenceScreen,
+-      };
+-      chrome.storage.local.set({ [READING_SESSION_KEY]: session });
+-    });
++  async function persistReadingUiState() {
++    const pageUrl = activePageUrl;
++    const owner = activeReadingOwner;
++    const ui = {
++      activeSentenceId,
++      hoveredSentenceId,
++      activeSentenceScreen,
++    };
++    if (!pageUrl || !isAuthScope(owner)) return;
++
++    const session = await getReadingSession(pageUrl, owner);
++    if (
++      !session ||
++      !pageUrlsMatch(session.pageUrl, pageUrl) ||
++      !authScopesMatch(activeReadingOwner, owner) ||
++      !pageUrlsMatch(activePageUrl, pageUrl)
++    ) {
++      return;
++    }
++
++    await setReadingSession(
++      {
++        ...session,
++        ui: { ...session.ui, ...ui },
++        updatedAt: Date.now(),
++      },
++      owner,
++    );
+   }
+ 
+   function domLinksFromStatus(domLinkStatus = {}) {
+@@ -501,6 +516,9 @@
+       activePreload = session.preload;
+       activePageUrl = session.pageUrl;
+       activePageTitle = session.pageTitle || '';
++      activeReadingOwner = isAuthScope(session.owner)
++        ? { userId: session.owner.userId, loginId: session.owner.loginId }
++        : null;
+       sentenceDomLinks = domLinksFromStatus(session.domLinkStatus);
+ 
+       const ui = session.ui || {};
+@@ -575,6 +593,7 @@
+     activePreload = null;
+     activePageUrl = '';
+     activePageTitle = '';
++    activeReadingOwner = null;
+     sentenceDomLinks = new Map();
+     activeSentenceId = null;
+     hoveredSentenceId = null;
+@@ -1111,7 +1130,7 @@
+     mountReadingPanel,
+     clearReadingPanel,
+     refreshContextChatActions,
+-    mountFromPreload: async (preload, pageUrl, pageTitle = '') => {
++    mountFromPreload: async (preload, pageUrl, pageTitle = '', owner = null) => {
+       const rawPageUrl = pageUrl || preload?.page_url || '';
+       const normalizedPageUrl =
+         typeof normalizePageUrl === 'function' ? normalizePageUrl(rawPageUrl) : rawPageUrl;
+@@ -1119,23 +1138,33 @@
+         console.warn('[Untangle] mountFromPreload skipped: missing preload or page URL');
+         return false;
+       }
++      const resolvedOwner = isAuthScope(owner) ? owner : await getAuthScope();
++      if (!isAuthScope(resolvedOwner)) {
++        return false;
++      }
+ 
+       return mountReadingPanel({
+         pageUrl: normalizedPageUrl,
+         pageTitle,
+         preload,
++        owner: resolvedOwner,
+         domLinkStatus: {},
+         ui: {},
+       });
+     },
+-    mountFromStorage: async (expectedPageUrl = '') => {
+-      const storage = await chrome.storage.local.get(READING_SESSION_KEY);
+-      const session = storage[READING_SESSION_KEY];
++    mountFromStorage: async (expectedPageUrl = '', expectedOwner = null) => {
++      const pageUrl = expectedPageUrl || activePageUrl;
++      const owner = expectedOwner || (await getAuthScope());
++      if (!pageUrl || !isAuthScope(owner)) {
++        return false;
++      }
++
++      const session = await getReadingSession(pageUrl, owner);
+       if (!session?.preload?.sentences?.length) {
+         return false;
+       }
+ 
+-      if (expectedPageUrl && !pageUrlsMatch(session.pageUrl, expectedPageUrl)) {
++      if (!pageUrlsMatch(session.pageUrl, pageUrl)) {
+         return false;
+       }
+ 
+--- docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/panel-ui.js	2026-09-13 18:45:24
++++ extension/panel-ui.js	2026-09-13 18:52:13
+@@ -689,6 +689,7 @@
+           pageUrl: resolvedPageUrl,
+           pageTitle: pageTitle || preload.page_title || '',
+           preload,
++          owner: authScope,
+           domLinkStatus: storedSession?.domLinkStatus || {},
+           ui: storedSession?.ui || {},
+         };
+--- docs/tasks/review-remediation/evidence/RM-04/source-01/source/extension/test/smoke.mjs	2026-09-13 18:45:24
++++ extension/test/smoke.mjs	2026-09-13 18:52:59
+@@ -1289,6 +1289,13 @@
+           'rm04-first-sentence',
+           'The quick brown fox jumps over the lazy dog.',
+         );
++        firstSession.preload.sentences.push({
++          id: 'rm04-first-sentence-selected',
++          index: 1,
++          text: 'It happens every day.',
++          analysis: {},
++        });
++        firstSession.domLinkStatus['rm04-first-sentence-selected'] = true;
+         const secondSession = createSession(
+           secondUrl,
+           'rm04-second-preload',
+@@ -1445,6 +1452,40 @@
+       readPanelState(secondPanel),
+     ]);
+ 
++    await firstPanel.locator('.era-panel-nav-button[data-nav="next"]').click();
++    const firstSelectionStored = await worker.evaluate(
++      async ({ key, sentenceId }) => {
++        for (let attempt = 0; attempt < 100; attempt += 1) {
++          const session = (await chrome.storage.local.get(key))[key];
++          if (session?.ui?.activeSentenceId === sentenceId) return true;
++          await new Promise((resolve) => setTimeout(resolve, 50));
++        }
++        return false;
++      },
++      { key: rm04Sessions.firstKey, sentenceId: 'rm04-first-sentence-selected' },
++    );
++    const firstRestored = await firstPanel.evaluate(async (pageUrl) => {
++      window.ReadingPanel.clearReadingPanel();
++      return window.ReadingPanel.mountFromStorage(pageUrl);
++    }, originalArticleUrl);
++    await Promise.all([
++      waitForContentState(
++        firstContent.tabId,
++        'rm04-first-preload',
++        'rm04-first-sentence-selected',
++      ),
++      waitForPanelState(
++        firstPanel,
++        originalArticleUrl,
++        'rm04-first-preload',
++        'It happens every day.',
++      ),
++    ]);
++    const [firstPanelSelected, secondPanelSelected] = await Promise.all([
++      readPanelState(firstPanel),
++      readPanelState(secondPanel),
++    ]);
++
+     rm04SecondSession = {
+       ...rm04Sessions.secondSession,
+       ui: {
+@@ -1523,7 +1564,7 @@
+       secondBefore.activeSentenceId !== 'rm04-second-sentence' ||
+       secondBefore.anchorCount === 0 ||
+       firstAfter.preloadId !== 'rm04-first-preload' ||
+-      firstAfter.activeSentenceId !== 'rm04-first-sentence' ||
++      firstAfter.activeSentenceId !== 'rm04-first-sentence-selected' ||
+       firstAfter.anchorCount === 0 ||
+       secondAfter.preloadId !== 'rm04-second-preload-updated' ||
+       secondAfter.activeSentenceId !== 'rm04-second-sentence-updated' ||
+@@ -1533,6 +1574,16 @@
+       firstPanelBefore.cachedPreloadId !== 'rm04-first-preload' ||
+       firstPanelBefore.pageUrl !== originalArticleUrl ||
+       !firstPanelBefore.detailText.includes('The quick brown fox jumps over the lazy dog.') ||
++      !firstSelectionStored ||
++      !firstRestored ||
++      firstPanelSelected.cachedPreloadId !== 'rm04-first-preload' ||
++      firstPanelSelected.pageUrl !== originalArticleUrl ||
++      !firstPanelSelected.detailText.includes('It happens every day.') ||
++      secondPanelSelected.cachedPreloadId !== 'rm04-second-preload' ||
++      secondPanelSelected.pageUrl !== secondArticleUrl ||
++      !secondPanelSelected.detailText.includes(
++        'Reading assistants should not break simple pages like this one.',
++      ) ||
+       secondPanelBefore.cachedPreloadId !== 'rm04-second-preload' ||
+       secondPanelBefore.pageUrl !== secondArticleUrl ||
+       !secondPanelBefore.detailText.includes(
+@@ -1540,14 +1591,14 @@
+       ) ||
+       firstPanelAfter.cachedPreloadId !== 'rm04-first-preload' ||
+       firstPanelAfter.pageUrl !== originalArticleUrl ||
+-      !firstPanelAfter.detailText.includes('The quick brown fox jumps over the lazy dog.') ||
++      !firstPanelAfter.detailText.includes('It happens every day.') ||
+       secondPanelAfter.cachedPreloadId !== 'rm04-second-preload-updated' ||
+       secondPanelAfter.pageUrl !== secondArticleUrl ||
+       !secondPanelAfter.detailText.includes('It happens every day.') ||
+       !onlySecondWrite
+     ) {
+       errors.push(
+-        `RM04 interleaved article state crossed contexts: ${JSON.stringify({ firstBefore, secondBefore, firstAfter, secondAfter, firstMounted, secondMounted, firstPanelBefore, secondPanelBefore, firstPanelAfter, secondPanelAfter, rm04WriteEvents })}`,
++        `RM04 interleaved article state crossed contexts: ${JSON.stringify({ firstBefore, secondBefore, firstAfter, secondAfter, firstMounted, secondMounted, firstPanelBefore, secondPanelBefore, firstSelectionStored, firstRestored, firstPanelSelected, secondPanelSelected, firstPanelAfter, secondPanelAfter, rm04WriteEvents })}`,
+       );
+     }
+     await worker.evaluate(
+diff --git a/extension/package.json b/extension/package.json
+index c40dea7..ff39c51 100644
+--- a/extension/package.json
++++ b/extension/package.json
+@@ -9,7 +9,7 @@
+     "format:check": "prettier --check .",
+     "lint": "eslint .",
+     "test": "npm run test:unit",
+-    "test:unit": "node --test test/shared.test.mjs test/signin-methods.test.mjs test/content-parsing.test.mjs test/content-highlighting.test.mjs test/api-contract.test.mjs test/background-api.test.mjs",
++    "test:unit": "node --test test/shared.test.mjs test/signin-methods.test.mjs test/content-parsing.test.mjs test/content-highlighting.test.mjs test/reading-panel.test.mjs test/api-contract.test.mjs test/background-api.test.mjs",
+     "test:coverage": "c8 --all --include='*.js' --exclude='generated/**' --exclude='eslint.config.js' --reporter=text --reporter=json-summary --reporter=lcov --reporter=html --reports-dir=../output/coverage/extension npm run test:unit",
+     "test:smoke": "node test/smoke.mjs",
+     "test:package:smoke": "node test/package-smoke.mjs",

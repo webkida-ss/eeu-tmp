@@ -1,0 +1,31 @@
+--- docs/tasks/review-remediation/evidence/RM-08/source-02/source/infra/modules/reading-assistant-api/variables.tf	2026-09-13 18:15:50
++++ infra/modules/reading-assistant-api/variables.tf	2026-09-13 18:40:02
+@@ -50,7 +50,7 @@
+   validation {
+     condition = (
+       length(var.secret_parameter_arns) > 0 &&
+-      setequal(keys(var.secret_parameter_names), keys(var.secret_parameter_arns))
++      toset(keys(var.secret_parameter_names)) == toset(keys(var.secret_parameter_arns))
+     )
+     error_message = "secret_parameter_arns must be a non-empty map with the same keys as secret_parameter_names."
+   }
+--- docs/tasks/review-remediation/evidence/RM-08/source-02/source/infra/modules/reading-assistant-api/tests/provider-guards.tftest.hcl	2026-09-13 18:15:50
++++ infra/modules/reading-assistant-api/tests/provider-guards.tftest.hcl	2026-09-13 18:41:09
+@@ -1,9 +1,15 @@
+-mock_provider "aws" {}
++mock_provider "aws" {
++  mock_data "aws_iam_policy_document" {
++    defaults = {
++      json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
++    }
++  }
++}
+ 
+ variables {
+   project                     = "provider-guard-test"
+   environment                 = "prod"
+-  lambda_zip_path             = "${path.module}/tests/fixtures/lambda-package.fixture"
++  lambda_zip_path             = "tests/fixtures/lambda-package.fixture"
+   table_name                  = "provider-guard-test-table"
+   table_arn                   = "arn:aws:dynamodb:ap-northeast-1:123456789012:table/provider-guard-test-table"
+   preload_content_bucket_name = "provider-guard-test-preload-content"

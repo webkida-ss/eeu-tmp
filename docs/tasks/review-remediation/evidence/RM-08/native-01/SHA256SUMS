@@ -1,0 +1,7 @@
+13ace05cbb9966849fad0c27b85a4909f045e9928eebc08801cac5f18fb3cf04  infra/modules/reading-assistant-api/variables.tf
+a5ec93ee50a838ee76a4e84c9c97ce2870c965525fea1404ff63627eb1823516  infra/modules/reading-assistant-api/tests/provider-guards.tftest.hcl
+490c8c2d5d166ae94879a67e0bc35eac43d8de72e9e5d9a0c70bf865445d44f9  infra/envs/dev/.terraform.lock.hcl
+490c8c2d5d166ae94879a67e0bc35eac43d8de72e9e5d9a0c70bf865445d44f9  infra/envs/prod/.terraform.lock.hcl
+72982c7c92974c35d486e5451ce25ecf2bce544c223552938ed5abcd2c3c3baf  docs/tasks/review-remediation/evidence/RM-08/native-01/increment.diff
+3b7c54b0c3b9ca12a9dd9e8525bbcfd03afea39a13086eacc764cf8fa107644a  docs/tasks/review-remediation/evidence/RM-08/native-01/native.log
+d79e2953dfe74086e920036d03ed12a9421986e29e6dee059e1eba86ed793edb  docs/tasks/review-remediation/evidence/RM-08/native-01/validate.log

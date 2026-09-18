@@ -1,0 +1,22 @@
+properties:
+  ready:
+    type: boolean
+    title: Ready
+  preload:
+    anyOf:
+    - $ref: ./PagePreloadResponse.yaml
+    - type: 'null'
+  status:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Status
+  error:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Error
+type: object
+required:
+- ready
+title: PagePreloadStatusResponse

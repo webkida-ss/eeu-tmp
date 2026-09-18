@@ -1,0 +1,1925 @@
+--- /private/tmp/untangle-remediation-20260914/rm11b-base/backend/repositories/usage_repository.py	2026-09-14 22:41:37
++++ source/backend/repositories/usage_repository.py	2026-09-14 22:58:23
+@@ -28,6 +28,8 @@
+ ExecutionClaimStatus = Literal["claimed", "owned", "recovered"]
+ DispatchEvidenceState = Literal["unknown", "not_dispatched", "dispatched", "completed", "settled"]
+ UsageCompleteness = Literal["unknown", "measured", "conservative"]
++AccountingMode = Literal["enforced", "shadow"]
++ShadowSettlementOutcome = Literal["success", "failed_before_dispatch", "failed_after_dispatch"]
+ 
+ 
+ class UsageRepositoryError(RuntimeError):
+@@ -83,6 +85,8 @@
+     model: str = ""
+     input_micro_usd_per_million: int = 0
+     output_micro_usd_per_million: int = 0
++    accounting_mode: AccountingMode = "enforced"
++    pricing_available: bool | None = None
+ 
+     def __post_init__(self) -> None:
+         for field in (
+@@ -100,6 +104,8 @@
+             _nonnegative(field, getattr(self, field))
+         if not isinstance(self.expires_at, datetime):
+             raise ValueError("expires_at must be a datetime")
++        if self.accounting_mode not in ("enforced", "shadow"):
++            raise ValueError("accounting_mode is invalid")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -156,6 +162,13 @@
+     dispatch_kind: str | None = None
+     dispatch_usage_completeness: UsageCompleteness = "unknown"
+     dispatch_usage: dict[str, int] | None = None
++    accounting_mode: AccountingMode = "enforced"
++    pricing_available: bool | None = None
++    shadow_pending_outcome: ShadowSettlementOutcome | None = None
++    shadow_pending_usage: dict[str, int] | None = None
++    shadow_pending_completeness: UsageCompleteness = "unknown"
++    shadow_pending_result_ref: str | None = None
++    shadow_outcome: ShadowSettlementOutcome | None = None
+ 
+     @classmethod
+     def reserved(cls, request: UsageReservationRequest) -> UsageOperation:
+@@ -183,6 +196,8 @@
+             expires_at=request.expires_at,
+             dispatch_evidence_state="not_dispatched",
+             dispatch_evidence_version=1,
++            accounting_mode=request.accounting_mode,
++            pricing_available=request.pricing_available,
+         )
+ 
+     def finalized(
+@@ -247,6 +262,54 @@
+             dispatch_kind=kind or self.dispatch_kind,
+             dispatch_usage_completeness=completeness,
+             dispatch_usage=usage if usage is not None else self.dispatch_usage,
++        )
++
++    def with_shadow_pending(
++        self,
++        *,
++        outcome: ShadowSettlementOutcome,
++        usage: dict[str, int],
++        completeness: UsageCompleteness,
++        result_ref: str | None,
++    ) -> UsageOperation:
++        if self.accounting_mode != "shadow" or self.state != "reserved":
++            raise UsageOperationStateError("Cannot prepare settlement for this operation")
++        if self.shadow_pending_outcome:
++            if (
++                self.shadow_pending_outcome != outcome
++                or self.shadow_pending_usage != usage
++                or self.shadow_pending_completeness != completeness
++                or self.shadow_pending_result_ref != result_ref
++            ):
++                raise UsageOperationConflict("Shadow settlement outcome conflicts")
++            return self
++        return replace(
++            self,
++            shadow_pending_outcome=outcome,
++            shadow_pending_usage=usage,
++            shadow_pending_completeness=completeness,
++            shadow_pending_result_ref=result_ref,
++            dispatch_evidence_version=self.dispatch_evidence_version + 1,
++        )
++
++    def settled_shadow(self) -> UsageOperation:
++        if self.accounting_mode != "shadow" or not self.shadow_pending_outcome:
++            raise UsageOperationStateError("Shadow settlement is not prepared")
++        usage = self.shadow_pending_usage or {}
++        return replace(
++            self,
++            state="finalized",
++            result_ref=self.shadow_pending_result_ref,
++            actual_articles=int(usage.get("actual_articles") or 0),
++            actual_cost_micro_usd=int(usage.get("actual_cost_micro_usd") or 0),
++            input_tokens=int(usage.get("input_tokens") or 0),
++            output_tokens=int(usage.get("output_tokens") or 0),
++            tokens=int(usage.get("total_tokens") or 0),
++            dispatch_evidence_state="settled",
++            dispatch_evidence_version=self.dispatch_evidence_version + 1,
++            dispatch_usage_completeness=self.shadow_pending_completeness,
++            dispatch_usage={key: value for key, value in usage.items() if key != "actual_articles"},
++            shadow_outcome=self.shadow_pending_outcome,
+         )
+ 
+     @property
+@@ -292,6 +355,19 @@
+ 
+     def reserve(self, request: UsageReservationRequest) -> UsageOperation: ...
+ 
++    def start_shadow(self, request: UsageReservationRequest) -> UsageOperation: ...
++
++    def prepare_shadow_settlement(
++        self,
++        user_id: str,
++        operation_id: str,
++        outcome: ShadowSettlementOutcome,
++        *,
++        result_ref: str | None = None,
++    ) -> UsageOperation: ...
++
++    def settle_shadow(self, user_id: str, operation_id: str) -> UsageOperation: ...
++
+     def finalize(self, request: UsageFinalizeRequest) -> UsageOperation: ...
+ 
+     def release(self, user_id: str, operation_id: str, *, reason: str) -> UsageOperation: ...
+@@ -395,15 +471,21 @@
+             return _normalized_month(record, user_id, month)
+ 
+     def reserve(self, request: UsageReservationRequest) -> UsageOperation:
++        if request.accounting_mode != "enforced":
++            raise UsageOperationStateError("Shadow operations require start_shadow")
+         with self._lock, json_list_lock(self._path):
+             items = self._load_items_with_cleanup()
+             existing = _find_operation(items, request.user_id, request.operation_id)
+             if existing is not None:
+-                if existing.get("payload_hash") != request.payload_hash:
++                operation = _operation_from_record(existing)
++                if (
++                    operation.accounting_mode != "enforced"
++                    or operation.payload_hash != request.payload_hash
++                ):
+                     raise UsageOperationConflict(
+                         f"Operation {request.operation_id} has a different payload"
+                     )
+-                return _operation_from_record(existing)
++                return operation
+ 
+             month = _get_or_add_month(items, request.user_id, request.month)
+             _ratchet_limits(month, request)
+@@ -418,6 +500,72 @@
+             write_json_list(self._path, items)
+             return operation
+ 
++    def start_shadow(self, request: UsageReservationRequest) -> UsageOperation:
++        if request.accounting_mode != "shadow":
++            raise UsageOperationStateError("Shadow operation mode is required")
++        with self._lock, json_list_lock(self._path):
++            items = self._load_items_with_cleanup()
++            existing = _find_operation(items, request.user_id, request.operation_id)
++            if existing is not None:
++                operation = _operation_from_record(existing)
++                if (
++                    operation.accounting_mode != "shadow"
++                    or operation.payload_hash != request.payload_hash
++                ):
++                    raise UsageOperationConflict("Shadow operation identity conflicts")
++                return operation
++            operation = UsageOperation.reserved(request)
++            items.append(_operation_to_record(operation))
++            items.append(_event_record(operation, "shadow_start"))
++            write_json_list(self._path, items)
++            return operation
++
++    def prepare_shadow_settlement(
++        self,
++        user_id: str,
++        operation_id: str,
++        outcome: ShadowSettlementOutcome,
++        *,
++        result_ref: str | None = None,
++    ) -> UsageOperation:
++        if outcome not in ("success", "failed_before_dispatch", "failed_after_dispatch"):
++            raise UsageOperationConflict("Shadow settlement outcome is invalid")
++        with self._lock, json_list_lock(self._path):
++            items = self._load_items_with_cleanup()
++            record = _find_operation(items, user_id, operation_id)
++            if record is None:
++                raise UsageOperationNotFound(operation_id)
++            operation = _operation_from_record(record)
++            if operation.accounting_mode != "shadow":
++                raise UsageOperationStateError("Operation is not shadow accounted")
++            if operation.state == "finalized":
++                if operation.shadow_outcome != outcome or operation.result_ref != result_ref:
++                    raise UsageOperationConflict("Shadow settlement outcome conflicts")
++                return operation
++            pending = _shadow_pending_values(operation, outcome, result_ref)
++            prepared = operation.with_shadow_pending(**pending)
++            if prepared != operation:
++                record.clear()
++                record.update(_operation_to_record(prepared))
++                items.append(_event_record(prepared, "shadow_prepare"))
++                write_json_list(self._path, items)
++            return prepared
++
++    def settle_shadow(self, user_id: str, operation_id: str) -> UsageOperation:
++        with self._lock, json_list_lock(self._path):
++            items = self._load_items_with_cleanup()
++            record = _find_operation(items, user_id, operation_id)
++            if record is None:
++                raise UsageOperationNotFound(operation_id)
++            operation = _operation_from_record(record)
++            if operation.accounting_mode != "shadow":
++                raise UsageOperationStateError("Operation is not shadow accounted")
++            if operation.state == "finalized":
++                return operation
++            settled = _settle_shadow_operation_in_items(items, record, operation)
++            write_json_list(self._path, items)
++            return settled
++
+     def finalize(self, request: UsageFinalizeRequest) -> UsageOperation:
+         with self._lock, json_list_lock(self._path):
+             items = self._load_items_with_cleanup()
+@@ -425,6 +573,8 @@
+             if record is None:
+                 raise UsageOperationNotFound(request.operation_id)
+             operation = _operation_from_record(record)
++            if operation.accounting_mode != "enforced":
++                raise UsageOperationStateError("Shadow operations require settle_shadow")
+             if operation.state == "finalized":
+                 return operation
+             if operation.state != "reserved":
+@@ -444,6 +594,8 @@
+             if record is None:
+                 raise UsageOperationNotFound(operation_id)
+             operation = _operation_from_record(record)
++            if operation.accounting_mode != "enforced":
++                raise UsageOperationStateError("Shadow operations cannot be released")
+             if operation.state == "released":
+                 return operation
+             if operation.state != "reserved":
+@@ -640,6 +792,29 @@
+                     operation = _operation_from_record(record)
+                 except Exception:
+                     continue
++                if operation.accounting_mode == "shadow":
++                    try:
++                        outcome: ShadowSettlementOutcome
++                        if operation.shadow_pending_outcome:
++                            _settle_shadow_operation_in_items(items, record, operation)
++                            reclaimed += 1
++                            continue
++                        if operation.dispatch_evidence_state == "not_dispatched":
++                            outcome = "failed_before_dispatch"
++                        elif operation.dispatch_evidence_state in ("dispatched", "completed"):
++                            outcome = "failed_after_dispatch"
++                        else:
++                            continue
++                        prepared = operation.with_shadow_pending(
++                            **_shadow_pending_values(operation, outcome, None)
++                        )
++                        record.clear()
++                        record.update(_operation_to_record(prepared))
++                        _settle_shadow_operation_in_items(items, record, prepared)
++                        reclaimed += 1
++                    except Exception:
++                        continue
++                    continue
+                 if operation.dispatch_evidence_state in ("dispatched", "completed"):
+                     try:
+                         _finalize_operation_in_items(
+@@ -865,6 +1040,8 @@
+         raise UsageOperationConflict("Dispatch evidence kind is invalid")
+     if operation.dispatch_kind and kind and operation.dispatch_kind != kind:
+         raise UsageOperationConflict("Dispatch evidence kind conflicts with the operation")
++    if operation.accounting_mode == "shadow" and operation.shadow_pending_outcome:
++        raise UsageOperationConflict("Prepared shadow settlement cannot accept later evidence")
+     if state == "dispatching":
+         if operation.dispatch_evidence_state != "not_dispatched":
+             raise UsageOperationStateError("Dispatch is already authorized or unavailable")
+@@ -948,7 +1125,79 @@
+         tokens=int(usage["total_tokens"]),
+         result_ref=f"usage-evidence:{operation.operation_id}",
+         evidence_completeness="measured",
++    )
++
++
++def _shadow_pending_values(
++    operation: UsageOperation,
++    outcome: ShadowSettlementOutcome,
++    result_ref: str | None,
++) -> dict[str, Any]:
++    if outcome not in ("success", "failed_before_dispatch", "failed_after_dispatch"):
++        raise UsageOperationConflict("Shadow settlement outcome is invalid")
++    if operation.accounting_mode != "shadow":
++        raise UsageOperationStateError("Operation is not shadow accounted")
++    if outcome == "failed_before_dispatch":
++        if operation.dispatch_evidence_state != "not_dispatched":
++            raise UsageOperationConflict("Dispatch evidence conflicts with shadow outcome")
++        return {
++            "outcome": outcome,
++            "usage": {
++                "actual_articles": 0,
++                "actual_cost_micro_usd": 0,
++                "input_tokens": 0,
++                "output_tokens": 0,
++                "total_tokens": 0,
++            },
++            "completeness": "unknown",
++            "result_ref": result_ref,
++        }
++    if outcome == "success" and operation.dispatch_evidence_state != "completed":
++        raise UsageOperationConflict("Successful shadow settlement requires completed evidence")
++    if outcome == "failed_after_dispatch" and operation.dispatch_evidence_state not in (
++        "dispatched",
++        "completed",
++    ):
++        raise UsageOperationConflict("Failed shadow settlement requires dispatch evidence")
++    request = _finalize_request_from_evidence(operation)
++    completeness: UsageCompleteness = request.evidence_completeness
++    if operation.pricing_available is not True:
++        request = _conservative_finalize_request(operation)
++        completeness = "conservative"
++    return {
++        "outcome": outcome,
++        "usage": {
++            "actual_articles": 1 if outcome == "success" else 0,
++            "actual_cost_micro_usd": request.actual_cost_micro_usd,
++            "input_tokens": request.input_tokens,
++            "output_tokens": request.output_tokens,
++            "total_tokens": request.tokens,
++        },
++        "completeness": completeness,
++        "result_ref": result_ref,
++    }
++
++
++def _settle_shadow_operation_in_items(
++    items: list[dict[str, Any]], record: dict[str, Any], operation: UsageOperation
++) -> UsageOperation:
++    if operation.accounting_mode != "shadow" or not operation.shadow_pending_outcome:
++        raise UsageOperationStateError("Shadow settlement is not prepared")
++    month = _get_or_add_month(items, operation.user_id, operation.month)
++    usage = operation.shadow_pending_usage or {}
++    _apply_amounts(
++        month,
++        {
++            "articles": int(usage.get("actual_articles") or 0),
++            "tokens": int(usage.get("total_tokens") or 0),
++            "shadow_cost_micro_usd": int(usage.get("actual_cost_micro_usd") or 0),
++        },
+     )
++    settled = operation.settled_shadow()
++    record.clear()
++    record.update(_operation_to_record(settled))
++    items.append(_event_record(settled, "shadow_settle"))
++    return settled
+ 
+ 
+ def _sweep_expired_results(items: list[dict[str, Any]], now: datetime) -> int:
+--- /private/tmp/untangle-remediation-20260914/rm11b-base/backend/repositories/dynamodb_billing_repositories.py	2026-09-14 22:41:37
++++ source/backend/repositories/dynamodb_billing_repositories.py	2026-09-14 22:58:23
+@@ -24,6 +24,7 @@
+     COUNTER_FIELDS,
+     USAGE_FIELDS,
+     ExecutionClaimStatus,
++    ShadowSettlementOutcome,
+     UsageFinalizeRequest,
+     UsageOperation,
+     UsageOperationConflict,
+@@ -43,6 +44,7 @@
+     _promote_dispatch_evidence,
+     _ratchet_limits,
+     _reconcile_compatibility_counters,
++    _shadow_pending_values,
+     _subtract_reserved,
+     _validate_add_amounts,
+     _validate_result_size,
+@@ -80,6 +82,8 @@
+         raise UsageRepositoryError("Usage compatibility add transaction conflicted")
+ 
+     def reserve(self, request: UsageReservationRequest) -> UsageOperation:
++        if request.accounting_mode != "enforced":
++            raise UsageOperationStateError("Shadow operations require start_shadow")
+         existing = self.get_operation(request.user_id, request.operation_id)
+         if existing is not None:
+             return self._idempotent_reserve(existing, request)
+@@ -113,11 +117,130 @@
+                 _check_admission(latest, request)
+         raise UsageRepositoryError("Usage reservation transaction conflicted")
+ 
++    def start_shadow(self, request: UsageReservationRequest) -> UsageOperation:
++        if request.accounting_mode != "shadow":
++            raise UsageOperationStateError("Shadow operation mode is required")
++        existing = self.get_operation(request.user_id, request.operation_id)
++        if existing is not None:
++            if (
++                existing.accounting_mode != "shadow"
++                or existing.payload_hash != request.payload_hash
++            ):
++                raise UsageOperationConflict("Shadow operation identity conflicts")
++            return existing
++        operation = UsageOperation.reserved(request)
++        try:
++            self._store.transact_write(
++                [
++                    self._operation_put(operation, create=True),
++                    self._event_put(operation, "shadow_start"),
++                ]
++            )
++            return operation
++        except ClientError as exc:
++            if not _is_transaction_failure(exc):
++                raise
++        existing = self.get_operation(request.user_id, request.operation_id)
++        if existing is not None:
++            if (
++                existing.accounting_mode != "shadow"
++                or existing.payload_hash != request.payload_hash
++            ):
++                raise UsageOperationConflict("Shadow operation identity conflicts")
++            return existing
++        raise UsageRepositoryError("Shadow operation transaction conflicted")
++
++    def prepare_shadow_settlement(
++        self,
++        user_id: str,
++        operation_id: str,
++        outcome: ShadowSettlementOutcome,
++        *,
++        result_ref: str | None = None,
++    ) -> UsageOperation:
++        if outcome not in ("success", "failed_before_dispatch", "failed_after_dispatch"):
++            raise UsageOperationConflict("Shadow settlement outcome is invalid")
++        for _attempt in range(4):
++            operation = self.get_operation(user_id, operation_id)
++            if operation is None:
++                raise UsageOperationNotFound(operation_id)
++            if operation.accounting_mode != "shadow":
++                raise UsageOperationStateError("Operation is not shadow accounted")
++            if operation.state == "finalized":
++                if operation.shadow_outcome != outcome or operation.result_ref != result_ref:
++                    raise UsageOperationConflict("Shadow settlement outcome conflicts")
++                return operation
++            prepared = operation.with_shadow_pending(
++                **_shadow_pending_values(operation, outcome, result_ref)
++            )
++            if prepared == operation:
++                return operation
++            try:
++                self._store.transact_write(
++                    [
++                        self._operation_put(
++                            prepared,
++                            expected_state="reserved",
++                            expected_dispatch_evidence_version=operation.dispatch_evidence_version,
++                        ),
++                        self._event_put(prepared, "shadow_prepare"),
++                    ]
++                )
++                return prepared
++            except ClientError as exc:
++                if not _is_transaction_failure(exc):
++                    raise
++        raise UsageRepositoryError("Shadow settlement preparation conflicted")
++
++    def settle_shadow(self, user_id: str, operation_id: str) -> UsageOperation:
++        for _attempt in range(4):
++            operation = self.get_operation(user_id, operation_id)
++            if operation is None:
++                raise UsageOperationNotFound(operation_id)
++            if operation.accounting_mode != "shadow":
++                raise UsageOperationStateError("Operation is not shadow accounted")
++            if operation.state == "finalized":
++                return operation
++            if not operation.shadow_pending_outcome:
++                raise UsageOperationStateError("Shadow settlement is not prepared")
++            month = self._load_month(operation.user_id, operation.month)
++            expected_version = int(month.get("version") or 0)
++            usage = operation.shadow_pending_usage or {}
++            _apply_amounts(
++                month,
++                {
++                    "articles": int(usage.get("actual_articles") or 0),
++                    "tokens": int(usage.get("total_tokens") or 0),
++                    "shadow_cost_micro_usd": int(usage.get("actual_cost_micro_usd") or 0),
++                },
++            )
++            month["version"] = expected_version + 1
++            settled = operation.settled_shadow()
++            try:
++                self._store.transact_write(
++                    [
++                        self._aggregate_put(month, expected_version),
++                        self._operation_put(
++                            settled,
++                            expected_state="reserved",
++                            expected_dispatch_evidence_version=operation.dispatch_evidence_version,
++                        ),
++                        self._event_put(settled, "shadow_settle"),
++                    ]
++                )
++                return settled
++            except ClientError as exc:
++                if not _is_transaction_failure(exc):
++                    raise
++        raise UsageRepositoryError("Shadow settlement transaction conflicted")
++
+     def finalize(self, request: UsageFinalizeRequest) -> UsageOperation:
+         for _attempt in range(4):
+             operation = self.get_operation(request.user_id, request.operation_id)
+             if operation is None:
+                 raise UsageOperationNotFound(request.operation_id)
++            if operation.accounting_mode != "enforced":
++                raise UsageOperationStateError("Shadow operations require settle_shadow")
+             if operation.state == "finalized":
+                 return operation
+             if operation.state != "reserved":
+@@ -187,6 +310,8 @@
+             operation = self.get_operation(user_id, operation_id)
+             if operation is None:
+                 raise UsageOperationNotFound(operation_id)
++            if operation.accounting_mode != "enforced":
++                raise UsageOperationStateError("Shadow operations cannot be released")
+             if operation.state == "released":
+                 return operation, False
+             if operation.state != "reserved":
+@@ -196,11 +321,14 @@
+             if expired_before is not None and operation.expires_at > expired_before:
+                 return operation, False
+             if expired_before is not None:
+-                execution = self._store.get_item(
+-                    user_pk(user_id),
+-                    usage_execution_sk(operation_id),
+-                    consistent_read=True,
+-                ) or {}
++                execution = (
++                    self._store.get_item(
++                        user_pk(user_id),
++                        usage_execution_sk(operation_id),
++                        consistent_read=True,
++                    )
++                    or {}
++                )
+                 execution_expiry = execution.get("expires_at")
+                 if execution_expiry and _parse_datetime(str(execution_expiry)) > expired_before:
+                     return operation, False
+@@ -514,6 +642,10 @@
+             if expired:
+                 operation = self.get_operation(user_id, str(record["operation_id"]))
+                 if operation is None or operation.state != "reserved":
++                    continue
++                if operation.accounting_mode == "shadow":
++                    if self._reclaim_shadow(user_id, operation.operation_id, now):
++                        reclaimed += 1
+                     continue
+                 if operation.dispatch_evidence_state != "not_dispatched":
+                     if self._reclaim_finalize(user_id, operation.operation_id, now):
+@@ -531,6 +663,88 @@
+                 except UsageOperationStateError:
+                     pass
+         return reclaimed
++
++    def _reclaim_shadow(self, user_id: str, operation_id: str, now: datetime) -> bool:
++        """Prepare then settle an expired shadow operation under lease fencing."""
++        for _attempt in range(4):
++            operation = self.get_operation(user_id, operation_id)
++            if (
++                operation is None
++                or operation.accounting_mode != "shadow"
++                or operation.state != "reserved"
++                or operation.expires_at > now
++            ):
++                return False
++            execution = (
++                self._store.get_item(
++                    user_pk(user_id), usage_execution_sk(operation_id), consistent_read=True
++                )
++                or {}
++            )
++            execution_expiry = execution.get("expires_at")
++            if execution_expiry and _parse_datetime(str(execution_expiry)) > now:
++                return False
++            if not operation.shadow_pending_outcome:
++                if operation.dispatch_evidence_state == "not_dispatched":
++                    outcome: ShadowSettlementOutcome = "failed_before_dispatch"
++                elif operation.dispatch_evidence_state in ("dispatched", "completed"):
++                    outcome = "failed_after_dispatch"
++                else:
++                    return False
++                prepared = operation.with_shadow_pending(
++                    **_shadow_pending_values(operation, outcome, None)
++                )
++                try:
++                    self._store.transact_write(
++                        [
++                            self._operation_put(
++                                prepared,
++                                expected_state="reserved",
++                                expected_expires_at=operation.expires_at,
++                                expected_dispatch_evidence_version=operation.dispatch_evidence_version,
++                            ),
++                            self._event_put(prepared, "shadow_prepare"),
++                            self._expired_execution_check(user_id, operation_id, now),
++                        ]
++                    )
++                    continue
++                except ClientError as exc:
++                    if not _is_transaction_failure(exc):
++                        raise
++                    continue
++
++            month = self._load_month(operation.user_id, operation.month)
++            expected_version = int(month.get("version") or 0)
++            usage = operation.shadow_pending_usage or {}
++            _apply_amounts(
++                month,
++                {
++                    "articles": int(usage.get("actual_articles") or 0),
++                    "tokens": int(usage.get("total_tokens") or 0),
++                    "shadow_cost_micro_usd": int(usage.get("actual_cost_micro_usd") or 0),
++                },
++            )
++            month["version"] = expected_version + 1
++            settled = operation.settled_shadow()
++            try:
++                self._store.transact_write(
++                    [
++                        self._aggregate_put(month, expected_version),
++                        self._operation_put(
++                            settled,
++                            expected_state="reserved",
++                            expected_expires_at=operation.expires_at,
++                            expected_dispatch_evidence_version=operation.dispatch_evidence_version,
++                        ),
++                        self._event_put(settled, "shadow_settle"),
++                        self._expired_execution_check(user_id, operation_id, now),
++                    ]
++                )
++                return True
++            except ClientError as exc:
++                if not _is_transaction_failure(exc):
++                    raise
++        return False
+ 
+     def _reclaim_finalize(self, user_id: str, operation_id: str, now: datetime) -> bool:
+         """Settle only an operation that remains expired and unowned at commit."""
+@@ -636,7 +850,10 @@
+     def _idempotent_reserve(
+         operation: UsageOperation, request: UsageReservationRequest
+     ) -> UsageOperation:
+-        if operation.payload_hash != request.payload_hash:
++        if (
++            operation.accounting_mode != request.accounting_mode
++            or operation.payload_hash != request.payload_hash
++        ):
+             raise UsageOperationConflict(
+                 f"Operation {request.operation_id} has a different payload"
+             )
+--- /private/tmp/untangle-remediation-20260914/rm11b-base/backend/services/usage_meter.py	2026-09-14 22:41:37
++++ source/backend/services/usage_meter.py	2026-09-14 22:50:45
+@@ -7,6 +7,7 @@
+ import os
+ import threading
+ from collections.abc import Callable
++from dataclasses import replace
+ from datetime import UTC, datetime, timedelta
+ from typing import Any, Literal
+ 
+@@ -15,6 +16,7 @@
+ from core.usage_costs import ModelRate, UnknownModelRateError, load_model_rate
+ from repositories.usage_repository import (
+     ExecutionClaimStatus,
++    ShadowSettlementOutcome,
+     UsageFinalizeRequest,
+     UsageOperation,
+     UsageOperationConflict,
+@@ -60,8 +62,11 @@
+         plan_loader: Callable[[str | None], PlanLimits] = get_plan_limits,
+         reservation_ttl_seconds: int = 900,
+         reservation_enabled: bool = True,
++        durable_shadow: bool = False,
+         provider_mode: str = "stripe",
+     ) -> None:
++        if durable_shadow and reservation_enabled:
++            raise ValueError("durable_shadow requires disabled reservation enforcement")
+         self.subscription_repository = subscription_repository
+         self.usage_repository = usage_repository
+         self.user_id = user_id
+@@ -91,6 +96,7 @@
+         self.plan_loader = plan_loader
+         self.reservation_ttl_seconds = reservation_ttl_seconds
+         self.reservation_enabled = reservation_enabled
++        self.durable_shadow = durable_shadow
+         self.provider_mode = provider_mode
+         self._disabled_operations: dict[str, UsageOperation] = {}
+ 
+@@ -128,6 +134,18 @@
+             input_micro_usd_per_million=self.rate.input_micro_usd_per_million,
+             output_micro_usd_per_million=self.rate.output_micro_usd_per_million,
+         )
++        if self.durable_shadow:
++            operation = self.usage_repository.start_shadow(
++                replace(
++                    request,
++                    accounting_mode="shadow",
++                    pricing_available=self.pricing_available,
++                )
++            )
++            _log_usage_event(
++                "usage_reserved", operation_id=operation_id, meter=meter, enforcement="shadow"
++            )
++            return operation
+         if not self.reservation_enabled:
+             operation = self._reserve_disabled(request)
+             _log_usage_event(
+@@ -196,6 +214,8 @@
+             result_ref=result_ref,
+             evidence_completeness=evidence_completeness,
+         )
++        if self.durable_shadow:
++            raise UsageOperationStateError("Durable shadow operations require settle_shadow")
+         if not self.reservation_enabled:
+             operation = self._disabled_operation(operation_id)
+             if operation.state == "finalized":
+@@ -264,6 +284,8 @@
+             raise
+ 
+     def release(self, operation_id: str, reason: str) -> UsageOperation:
++        if self.durable_shadow:
++            raise UsageOperationStateError("Durable shadow operations require settlement")
+         if not self.reservation_enabled:
+             operation = self._disabled_operation(operation_id)
+             if operation.state == "released":
+@@ -309,7 +331,9 @@
+         *,
+         outcome: str,
+     ) -> None:
+-        """Log non-enforcing calibration data without touching usage storage."""
++        """Log legacy non-enforcing calibration data without touching usage storage."""
++        if self.durable_shadow:
++            raise UsageOperationStateError("Durable shadow operations require settlement")
+         values = _usage_values(usage)
+         fields = {
+             "operation_id": operation_id,
+@@ -354,11 +378,15 @@
+         _log_usage_event("usage_shadow_observed", **fields)
+ 
+     def get_operation(self, operation_id: str) -> UsageOperation | None:
++        if self.durable_shadow:
++            return self.usage_repository.get_operation(self.user_id, operation_id)
+         if not self.reservation_enabled:
+             return self._disabled_operations.get(operation_id)
+         return self.usage_repository.get_operation(self.user_id, operation_id)
+ 
+     def save_result(self, operation_id: str, result: dict[str, Any]) -> dict[str, Any]:
++        if self.durable_shadow:
++            return self.usage_repository.save_result(self.user_id, operation_id, result)
+         if not self.reservation_enabled:
+             return result
+         return self.usage_repository.save_result(self.user_id, operation_id, result)
+@@ -379,11 +407,17 @@
+         return authorize
+ 
+     def get_result(self, operation_id: str) -> dict[str, Any] | None:
++        if self.durable_shadow:
++            return self.usage_repository.get_result(self.user_id, operation_id)
+         if not self.reservation_enabled:
+             return None
+         return self.usage_repository.get_result(self.user_id, operation_id)
+ 
+     def renew(self, operation_id: str, expires_at: datetime) -> UsageOperation:
++        if self.durable_shadow:
++            return self.usage_repository.renew(
++                self.user_id, operation_id, normalize_utc(expires_at)
++            )
+         if not self.reservation_enabled:
+             operation = self._disabled_operation(operation_id)
+             renewed = operation.renewed(expires_at)
+@@ -398,6 +432,10 @@
+         now: datetime,
+         expires_at: datetime,
+     ) -> ExecutionClaimStatus | None:
++        if self.durable_shadow:
++            return self.usage_repository.claim_execution(
++                self.user_id, operation_id, claim_id, normalize_utc(now), normalize_utc(expires_at)
++            )
+         if not self.reservation_enabled:
+             return "claimed"
+         return self.usage_repository.claim_execution(
+@@ -411,6 +449,10 @@
+     def release_execution(
+         self, operation_id: str, claim_id: str, now: datetime | None = None
+     ) -> bool:
++        if self.durable_shadow:
++            return self.usage_repository.release_execution(
++                self.user_id, operation_id, claim_id, normalize_utc(now or datetime.now(UTC))
++            )
+         if not self.reservation_enabled:
+             return True
+         return self.usage_repository.release_execution(
+@@ -421,6 +463,10 @@
+         )
+ 
+     def renew_execution(self, operation_id: str, claim_id: str, expires_at: datetime) -> bool:
++        if self.durable_shadow:
++            return self.usage_repository.renew_execution(
++                self.user_id, operation_id, claim_id, normalize_utc(expires_at)
++            )
+         if not self.reservation_enabled:
+             return True
+         return self.usage_repository.renew_execution(
+@@ -440,6 +486,24 @@
+         self._disabled_operations[request.operation_id] = operation
+         return operation
+ 
++    def prepare_shadow_settlement(
++        self,
++        operation_id: str,
++        *,
++        outcome: ShadowSettlementOutcome,
++        result_ref: str | None = None,
++    ) -> UsageOperation:
++        if not self.durable_shadow:
++            raise UsageOperationStateError("Durable shadow metering is disabled")
++        return self.usage_repository.prepare_shadow_settlement(
++            self.user_id, operation_id, outcome, result_ref=result_ref
++        )
++
++    def settle_shadow(self, operation_id: str) -> UsageOperation:
++        if not self.durable_shadow:
++            raise UsageOperationStateError("Durable shadow metering is disabled")
++        return self.usage_repository.settle_shadow(self.user_id, operation_id)
++
+     def _disabled_operation(self, operation_id: str) -> UsageOperation:
+         operation = self._disabled_operations.get(operation_id)
+         if operation is None:
+--- /private/tmp/untangle-remediation-20260914/rm11b-base/backend/services/preloading.py	2026-09-14 22:41:37
++++ source/backend/services/preloading.py	2026-09-14 22:58:23
+@@ -37,7 +37,11 @@
+     PreloadResultTooLarge,
+     normalize_page_url,
+ )
+-from repositories.usage_repository import UsageOperationStateError, UsageRepository
++from repositories.usage_repository import (
++    UsageOperationConflict,
++    UsageOperationStateError,
++    UsageRepository,
++)
+ from schemas import (
+     PagePreloadRequest,
+     PagePreloadStatusResponse,
+@@ -264,6 +268,7 @@
+     )
+     reservation_enabled = bool(usage_meter and usage_meter.reservation_enabled)
+     shadow_enabled = bool(usage_meter and not reservation_enabled)
++    durable_shadow = bool(shadow_enabled and usage_meter and usage_meter.durable_shadow)
+     payload_hash = canonical_payload_hash(request, exclude={"operation_id"})
+     requested_record = repository.get_by_id(user_id, request.operation_id)
+     if requested_record and (
+@@ -279,6 +284,7 @@
+         requested_record
+         and requested_record.get("status") == "failed_pending_release"
+         and not reservation_enabled
++        and not durable_shadow
+     ):
+         return _to_status_response(
+             _recover_failed_content_handoff(
+@@ -303,7 +309,12 @@
+             code="operation_payload_conflict",
+             status_code=409,
+         )
+-    if existing and _is_fresh_processing(existing) and not reservation_enabled:
++    if (
++        existing
++        and _is_fresh_processing(existing)
++        and not reservation_enabled
++        and not durable_shadow
++    ):
+         existing_fingerprint = existing.get(
+             "learner_profile_fingerprint"
+         ) or _learner_profile_fingerprint(
+@@ -376,7 +387,7 @@
+             )
+ 
+         estimated_cost = estimate() if reservation_enabled else _shadow_estimate(estimate)
+-    if reservation_enabled:
++    if reservation_enabled or durable_shadow:
+         try:
+             operation = usage_meter.reserve(
+                 request.operation_id,
+@@ -399,7 +410,11 @@
+             )
+             raise
+         operation_record = repository.get_by_id(user_id, operation.operation_id)
+-        if operation_record and operation_record.get("status") == "failed_pending_release":
++        if (
++            reservation_enabled
++            and operation_record
++            and operation_record.get("status") == "failed_pending_release"
++        ):
+             recovered = _recover_failed_content_handoff(
+                 repository,
+                 content_store,
+@@ -498,6 +513,7 @@
+         "enqueue_state": "pending",
+         "submitted": False,
+         "reservation_enabled": reservation_enabled,
++        "accounting_mode": "shadow" if durable_shadow else "enforced",
+         "error": None,
+         "requested_at": now,
+         "created_at": now,
+@@ -517,8 +533,23 @@
+                 "input_micro_usd_per_million": operation.input_micro_usd_per_million,
+                 "output_micro_usd_per_million": operation.output_micro_usd_per_million,
+                 "estimated_cost_micro_usd": operation.reserved_cost_micro_usd,
++                "accounting_mode": operation.accounting_mode,
++                "pricing_available": operation.pricing_available,
+             }
+         )
++    if durable_shadow:
++        record["shadow_version"] = 1
++        record["shadow_usage"] = {
++            "operation_id": request.operation_id,
++            "meter": "article",
++            "pricing_available": operation.pricing_available,
++            "model": operation.model,
++            "rate_card_version": operation.rate_card_version,
++            "tokenizer_encoding": operation.tokenizer_encoding,
++            "estimated_cost_micro_usd": operation.reserved_cost_micro_usd,
++            "input_micro_usd_per_million": operation.input_micro_usd_per_million,
++            "output_micro_usd_per_million": operation.output_micro_usd_per_million,
++        }
+     elif shadow_enabled:
+         record["shadow_usage"] = {
+             "operation_id": request.operation_id,
+@@ -599,6 +630,9 @@
+                 "input_micro_usd_per_million",
+                 "output_micro_usd_per_million",
+                 "estimated_cost_micro_usd",
++                "accounting_mode",
++                "shadow_version",
++                "pricing_available",
+             )
+             if key in record
+         }
+@@ -755,8 +789,524 @@
+         if self._thread.is_alive() or self._lost.is_set():
+             return False
+         return self._renew_once()
++
++
++def _durable_shadow_meter(
++    subscription_repository: SubscriptionRepository,
++    usage_repository: UsageRepository,
++    user_id: str,
++    record: dict[str, Any],
++    billing_provider_mode: str,
++) -> UsageMeter | None:
++    """Recreate the pinned durable-shadow meter from the submitted record."""
++    context = record.get("shadow_usage")
++    if not isinstance(context, dict) or record.get("shadow_version") != 1:
++        return None
++    return UsageMeter(
++        subscription_repository,
++        usage_repository,
++        user_id,
++        rate=ModelRate(
++            model=str(context.get("model") or ""),
++            input_micro_usd_per_million=int(context.get("input_micro_usd_per_million") or 0),
++            output_micro_usd_per_million=int(context.get("output_micro_usd_per_million") or 0),
++            version=str(context.get("rate_card_version") or ""),
++        ),
++        reservation_enabled=False,
++        durable_shadow=True,
++        provider_mode=billing_provider_mode,
++    )
++
++
++def _shadow_ready_payload(
++    record: dict[str, Any],
++    *,
++    content: str,
++    summary: str,
++    topics: list[Any],
++    sentences: list[Any],
++    study_items: list[Any],
++    vocabulary_coverage: dict[str, Any],
++) -> dict[str, Any]:
++    """Build the private, validated result needed to repair ready publication."""
++    return {
++        "summary": summary,
++        "topics": topics,
++        "sentences": sentences,
++        "study_items": study_items,
++        "vocabulary_coverage": vocabulary_coverage,
++        "sentences_detected": record.get("sentences_detected") or _estimate_sentence_count(content),
++        "created_at": datetime.now(UTC).isoformat(),
++    }
++
++
++def _valid_shadow_ready_payload(result: dict[str, Any] | None) -> dict[str, Any] | None:
++    """Return a complete private response, without treating TTL expiry as success."""
++    if not isinstance(result, dict) or result.get("kind") != "preload":
++        return None
++    if result.get("state") != "completed" or not isinstance(result.get("response"), dict):
++        return None
++    response = result["response"]
++    required = ("summary", "topics", "sentences", "study_items", "vocabulary_coverage")
++    if not all(field in response for field in required):
++        return None
++    if not isinstance(response["summary"], str):
++        return None
++    if not all(
++        isinstance(response[field], list) for field in ("topics", "sentences", "study_items")
++    ):
++        return None
++    if not isinstance(response["vocabulary_coverage"], dict):
++        return None
++    return dict(response)
++
++
++def _finish_durable_shadow_publication(
++    repository: PagePreloadRepository,
++    content_store: PreloadContentStore,
++    meter: UsageMeter,
++    user_id: str,
++    preload_id: str,
++    learner_profile_fingerprint: str,
++    record: dict[str, Any],
++    operation: Any,
++    *,
++    expected_status: str,
++    lease_id: str | None,
++    admin_activity_repository: AdminActivityRepository | None,
++    tally: UsageTally | None = None,
++) -> bool:
++    """Publish only a settled canonical shadow outcome owned by this record."""
++    if operation.state != "finalized" or not operation.shadow_outcome:
++        return False
++    private_result = meter.get_result(operation.operation_id)
++    response = _valid_shadow_ready_payload(private_result)
++    is_success = operation.shadow_outcome == "success" and response is not None
++    terminal = dict(record)
++    terminal.pop("content", None)
++    if is_success:
++        terminal.update(response)
++        terminal.update(
++            {
++                "status": "ready",
++                "error": None,
++                "content_retirement_pending": True,
++            }
++        )
++    else:
++        terminal.update(
++            {
++                "status": "failed",
++                "error": (
++                    "The saved analysis result is no longer available. "
++                    "Please submit the article again."
++                    if operation.shadow_outcome == "success"
++                    else "Article analysis failed. Please try again."
++                ),
++                "content_retirement_pending": True,
++            }
++        )
++    terminal["accounting_mode"] = "shadow"
++    terminal["shadow_version"] = 1
++    terminal["usage_state"] = "finalized"
++    terminal["shadow_outcome"] = operation.shadow_outcome
++    completed = repository.finish_processing(
++        user_id,
++        preload_id,
++        learner_profile_fingerprint,
++        terminal,
++        lease_id=lease_id,
++        expected_status=expected_status,
++    )
++    if not completed:
++        return False
++    terminal = _retire_terminal_content(
++        repository,
++        content_store,
++        user_id,
++        terminal,
++        learner_profile_fingerprint,
++    )
++    record_terminal_activity(
++        admin_activity_repository,
++        TerminalActivityOutcome.for_preload(
++            user_id=user_id,
++            preload_id=preload_id,
++            status="success" if is_success else "failed",
++            error=None if is_success else RuntimeError("preload_failed"),
++            record=terminal,
++            tally=tally,
++        ),
++    )
++    return True
++
++
++def _settle_durable_shadow(
++    meter: UsageMeter,
++    operation_id: str,
++    *,
++    outcome: str | None = None,
++    result_ref: str | None = None,
++) -> Any:
++    """Persist one outcome, or recover and settle the canonical winner."""
++    operation = meter.get_operation(operation_id)
++    if operation is None:
++        raise UsageOperationStateError("Durable shadow operation is missing")
++    if operation.state == "finalized":
++        return operation
++    if not operation.shadow_pending_outcome:
++        if outcome is None:
++            raise UsageOperationStateError("Durable shadow settlement is not prepared")
++        try:
++            operation = meter.prepare_shadow_settlement(
++                operation_id,
++                outcome=outcome,  # type: ignore[arg-type]
++                result_ref=result_ref,
++            )
++        except UsageOperationConflict:
++            operation = meter.get_operation(operation_id)
++            if operation is None:
++                raise
++    if operation.state != "finalized":
++        operation = meter.settle_shadow(operation_id)
++    return operation
++
++
++def _fail_unrecoverable_shadow_record(
++    repository: PagePreloadRepository,
++    content_store: PreloadContentStore,
++    user_id: str,
++    preload_id: str,
++    learner_profile_fingerprint: str,
++    record: dict[str, Any],
++) -> None:
++    """Fail old in-flight shadow records rather than inventing accounting evidence."""
++    status = str(record.get("status") or "")
++    lease_id: str | None = None
++    if status == "running":
++        now = datetime.now(UTC)
++        if not _has_expired_preload_lease(record, now):
++            return
++        lease_id = generate_uuid7()
++        record = (
++            repository.claim_processing(
++                user_id,
++                preload_id,
++                learner_profile_fingerprint,
++                lease_id=lease_id,
++                now=now,
++                lease_expires_at=now
++                + timedelta(seconds=max(1, int(os.getenv("PRELOAD_WORKER_LEASE_SECONDS", "900")))),
++            )
++            or record
++        )
++        if record.get("status") != "running" or record.get("lease_id") != lease_id:
++            return
++        status = "running"
++    if status != "processing" and status != "running":
++        return
++    failed = dict(record)
++    failed.update(
++        {
++            "status": "failed",
++            "error": "This legacy shadow preload cannot be recovered safely.",
++            "content_retirement_pending": True,
++        }
++    )
++    if repository.finish_processing(
++        user_id,
++        preload_id,
++        learner_profile_fingerprint,
++        failed,
++        lease_id=lease_id,
++        expected_status=status,
++    ):
++        _retire_terminal_content(
++            repository,
++            content_store,
++            user_id,
++            failed,
++            learner_profile_fingerprint,
++        )
++
++
++def _run_durable_shadow_preload_job(
++    repository: PagePreloadRepository,
++    subscription_repository: SubscriptionRepository,
++    usage_repository: UsageRepository,
++    content_store: PreloadContentStore,
++    user_id: str,
++    page_url: str,
++    preload_id: str,
++    learner_profile_fingerprint: str,
++    record: dict[str, Any],
++    *,
++    admin_activity_repository: AdminActivityRepository | None,
++    billing_provider_mode: str,
++) -> None:
++    """Run one durable shadow preload without the legacy additive shadow writes."""
++    meter = _durable_shadow_meter(
++        subscription_repository,
++        usage_repository,
++        user_id,
++        record,
++        billing_provider_mode,
++    )
++    operation_id = str(record.get("operation_id") or "")
++    operation = meter.get_operation(operation_id) if meter and operation_id else None
++    if meter is None or operation is None or operation.accounting_mode != "shadow":
++        _fail_unrecoverable_shadow_record(
++            repository,
++            content_store,
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            record,
++        )
++        return
+ 
++    status = str(record.get("status") or "")
++    if status in ("ready_pending_usage", "failed_pending_usage"):
++        try:
++            operation = _settle_durable_shadow(meter, operation_id)
++        except Exception:  # noqa: BLE001 - pending state remains retryable
++            logger.exception(
++                "durable shadow settlement recovery failed operation_id=%s", operation_id
++            )
++            return
++        _finish_durable_shadow_publication(
++            repository,
++            content_store,
++            meter,
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            record,
++            operation,
++            expected_status=status,
++            lease_id=None,
++            admin_activity_repository=admin_activity_repository,
++        )
++        return
+ 
++    lease_id = generate_uuid7()
++    lease_now = datetime.now(UTC)
++    lease_seconds = max(1, int(os.getenv("PRELOAD_WORKER_LEASE_SECONDS", "900")))
++    lease_expires_at = lease_now + timedelta(seconds=lease_seconds)
++    record = repository.claim_processing(
++        user_id,
++        preload_id,
++        learner_profile_fingerprint,
++        lease_id=lease_id,
++        now=lease_now,
++        lease_expires_at=lease_expires_at,
++    )
++    if not record:
++        return
++    operation = meter.get_operation(operation_id)
++    if operation is None:
++        _fail_unrecoverable_shadow_record(
++            repository,
++            content_store,
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            record,
++        )
++        return
++    execution_status = meter.claim_execution(operation_id, lease_id, lease_now, lease_expires_at)
++    if not execution_status:
++        repository.finish_processing(
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            {**record, "status": "processing"},
++            lease_id=lease_id,
++        )
++        return
++    try:
++        if operation.state == "finalized" or operation.shadow_pending_outcome:
++            operation = _settle_durable_shadow(meter, operation_id)
++            _finish_durable_shadow_publication(
++                repository,
++                content_store,
++                meter,
++                user_id,
++                preload_id,
++                learner_profile_fingerprint,
++                record,
++                operation,
++                expected_status="running",
++                lease_id=lease_id,
++                admin_activity_repository=admin_activity_repository,
++            )
++            return
++
++        content = content_store.get(user_id, preload_id) or record.get("content")
++        if not content:
++            operation = _settle_durable_shadow(
++                meter,
++                operation_id,
++                outcome="failed_before_dispatch",
++                result_ref=preload_id,
++            )
++            _finish_durable_shadow_publication(
++                repository,
++                content_store,
++                meter,
++                user_id,
++                preload_id,
++                learner_profile_fingerprint,
++                record,
++                operation,
++                expected_status="running",
++                lease_id=lease_id,
++                admin_activity_repository=admin_activity_repository,
++            )
++            return
++
++        tally = UsageTally(rate=meter.rate)
++        _configure_preload_dispatch_marker(meter, operation, tally)
++        heartbeat = _PreloadHeartbeat(
++            repository=repository,
++            meter=meter,
++            user_id=user_id,
++            preload_id=preload_id,
++            learner_profile_fingerprint=learner_profile_fingerprint,
++            lease_id=lease_id,
++            operation_id=operation_id,
++            lease_seconds=lease_seconds,
++        )
++        heartbeat.start()
++        provider_error: Exception | None = None
++        try:
++            sentences = _split_sentences(
++                content,
++                page_title=record.get("page_title"),
++                max_sentences=record.get("sentence_limit"),
++                tally=tally,
++            )
++            summary, topics, indexed_sentences = _analyze_sentences(
++                sentences,
++                page_title=record.get("page_title"),
++                vocabulary_coverage_percent=_resolve_vocabulary_coverage_percent(
++                    record.get("vocabulary_coverage_percent")
++                ),
++                target=_resolve_language_pair(
++                    record.get("target_language"), record.get("native_language")
++                )[0],
++                native=_resolve_language_pair(
++                    record.get("target_language"), record.get("native_language")
++                )[1],
++                learner_level=record.get("learner_level"),
++                tally=tally,
++            )
++            study_items, vocabulary_coverage = _extract_study_items(
++                indexed_sentences,
++                vocabulary_coverage_percent=_resolve_vocabulary_coverage_percent(
++                    record.get("vocabulary_coverage_percent")
++                ),
++            )
++            payload = _shadow_ready_payload(
++                record,
++                content=content,
++                summary=summary,
++                topics=topics,
++                sentences=indexed_sentences,
++                study_items=study_items,
++                vocabulary_coverage=vocabulary_coverage,
++            )
++            snapshot = tally.snapshot()
++            usage = _settlement_usage(tally, operation)
++            usage["usage_complete"] = bool(not snapshot.missing_usage and snapshot.total_tokens > 0)
++            meter.save_result(
++                operation_id,
++                {
++                    "kind": "preload",
++                    "state": "completed",
++                    "usage": usage,
++                    "response": payload,
++                },
++            )
++            desired_outcome = "success"
++        except Exception as exc:  # noqa: BLE001 - settle all durable outcomes
++            provider_error = exc
++            desired_outcome = (
++                "failed_after_dispatch"
++                if _dispatch_was_attempted(tally, exc)
++                else "failed_before_dispatch"
++            )
++        finally:
++            owns_publication = heartbeat.stop_and_verify()
++
++        if provider_error is not None and _dispatch_was_attempted(tally, provider_error):
++            try:
++                partial_usage = _settlement_usage(tally, operation)
++                partial_usage["usage_complete"] = False
++                meter.save_result(
++                    operation_id,
++                    {
++                        "kind": "preload",
++                        "state": "completed",
++                        "usage": partial_usage,
++                    },
++                )
++            except Exception:  # noqa: BLE001 - retain the already-persisted dispatch marker
++                logger.warning(
++                    "durable shadow partial evidence could not be saved operation_id=%s",
++                    operation_id,
++                )
++
++        try:
++            operation = _settle_durable_shadow(
++                meter,
++                operation_id,
++                outcome=desired_outcome,
++                result_ref=preload_id,
++            )
++        except Exception:  # noqa: BLE001 - retain a retryable pending record
++            pending = dict(record)
++            pending["status"] = (
++                "ready_pending_usage" if desired_outcome == "success" else "failed_pending_usage"
++            )
++            pending["content_retirement_pending"] = True
++            repository.finish_processing(
++                user_id,
++                preload_id,
++                learner_profile_fingerprint,
++                pending,
++                lease_id=lease_id,
++            )
++            logger.exception("durable shadow settlement failed operation_id=%s", operation_id)
++            return
++
++        if not owns_publication:
++            return
++        _finish_durable_shadow_publication(
++            repository,
++            content_store,
++            meter,
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            record,
++            operation,
++            expected_status="running",
++            lease_id=lease_id,
++            admin_activity_repository=admin_activity_repository,
++            tally=tally,
++        )
++        if provider_error:
++            logger.warning(
++                "durable shadow preload failed user=%s url=%s: %s",
++                user_id,
++                normalize_page_url(page_url),
++                type(provider_error).__name__,
++            )
++    finally:
++        meter.release_execution(operation_id, lease_id)
++
++
+ def run_preload_job(
+     repository: PagePreloadRepository,
+     subscription_repository: SubscriptionRepository,
+@@ -806,6 +1356,32 @@
+         )
+         return
+ 
++    if record.get("accounting_mode") == "shadow" and record.get("shadow_version") == 1:
++        _run_durable_shadow_preload_job(
++            repository,
++            subscription_repository,
++            usage_repository,
++            content_store,
++            user_id,
++            page_url,
++            preload_id,
++            learner_profile_fingerprint,
++            record,
++            admin_activity_repository=admin_activity_repository,
++            billing_provider_mode=billing_provider_mode,
++        )
++        return
++    if isinstance(record.get("shadow_usage"), dict):
++        _fail_unrecoverable_shadow_record(
++            repository,
++            content_store,
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            record,
++        )
++        return
++
+     operation_id = str(record.get("operation_id") or "")
+     meter = None
+     operation = None
+--- /dev/null	2026-09-14 22:58:58
++++ source/backend/test_preload_shadow_accounting.py	2026-09-14 22:57:43
+@@ -0,0 +1,417 @@
++"""Integration regressions for durable shadow preload accounting."""
++
++from __future__ import annotations
++
++import json
++import os
++import tempfile
++import types
++import unittest
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from unittest import mock
++
++import core.pipeline as pipeline
++from accounts.storage import JsonSubscriptionRepository
++from core.usage_costs import ModelRate
++from repositories.page_preload_repository import JsonPagePreloadRepository
++from repositories.usage_repository import JsonUsageRepository
++from schemas import PagePreloadRequest
++from services import preloading
++from services.usage_meter import UsageMeter
++from storage.json_list_store import write_json_list
++from storage.preload_content_store import FilesystemPreloadContentStore
++
++_HTML = (
++    "<article><p>This long article paragraph gives the deferred shadow workflow enough "
++    "content to establish a durable operation before any provider work begins.</p>"
++    "<p>A second realistic paragraph makes the content extraction and retry boundaries "
++    "independent of a private model response.</p></article>"
++)
++_PAGE_URL = "https://example.com/durable-shadow"
++_USER_ID = "shadow-user"
++_OPERATION_ID = "019b63f8-f600-7000-8000-000000000401"
++
++
++class _RecordingRunner:
++    def __init__(self) -> None:
++        self.calls: list[tuple] = []
++
++    def enqueue(
++        self,
++        user_id: str,
++        page_url: str,
++        preload_id: str,
++        learner_profile_fingerprint: str,
++        usage_context: dict | None = None,
++    ) -> None:
++        self.calls.append(
++            (user_id, page_url, preload_id, learner_profile_fingerprint, usage_context)
++        )
++
++
++class _SettlementBeforeReadyRepository(JsonPagePreloadRepository):
++    def __init__(self, path: Path, usage: JsonUsageRepository) -> None:
++        super().__init__(path)
++        self._usage = usage
++        self.checked_ready_publication = False
++
++    def finish_processing(self, user_id, preload_id, fingerprint, record, **kwargs):
++        if record.get("status") == "ready":
++            operation = self._usage.get_operation(user_id, str(record["operation_id"]))
++            if operation is None:
++                raise AssertionError("shadow settlement must complete before ready publication")
++            month = self._usage.get_month(user_id, operation.month)
++            if (
++                operation.state != "finalized"
++                or operation.accounting_mode != "shadow"
++                or operation.shadow_outcome != "success"
++                or month["articles"] != 1
++            ):
++                raise AssertionError("shadow settlement must complete before ready publication")
++            self.checked_ready_publication = True
++        return super().finish_processing(user_id, preload_id, fingerprint, record, **kwargs)
++
++
++class _LostPublicationRepository(JsonPagePreloadRepository):
++    def __init__(self, path: Path) -> None:
++        super().__init__(path)
++        self.blocked_publications = 0
++
++    def finish_processing(self, user_id, preload_id, fingerprint, record, **kwargs):
++        if record.get("status") in {"ready", "failed"}:
++            self.blocked_publications += 1
++            return False
++        return super().finish_processing(user_id, preload_id, fingerprint, record, **kwargs)
++
++
++class ShadowPreloadAccountingTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++        directory = Path(self._temporary_directory.name)
++        self.preloads = JsonPagePreloadRepository(directory / "preloads.json")
++        self.usage = JsonUsageRepository(directory / "usage.json")
++        self.subscriptions = JsonSubscriptionRepository(directory / "subscriptions.json")
++        self.content = FilesystemPreloadContentStore(directory / "content")
++        self.runner = _RecordingRunner()
++        self._rate_environment = mock.patch.dict(
++            os.environ,
++            {
++                "OPENAI_MODEL": pipeline.OPENAI_MODEL,
++                "OPENAI_RATE_CARD_VERSION": "shadow-test",
++                "OPENAI_MODEL_INPUT_MICRO_USD_PER_MILLION": "1",
++                "OPENAI_MODEL_OUTPUT_MICRO_USD_PER_MILLION": "1",
++            },
++        )
++        self._rate_environment.start()
++
++    def tearDown(self) -> None:
++        self._rate_environment.stop()
++        self._temporary_directory.cleanup()
++
++    def _request(self, *, operation_id: str = _OPERATION_ID) -> PagePreloadRequest:
++        return PagePreloadRequest(
++            page_url=_PAGE_URL,
++            page_title="Durable shadow article",
++            html=_HTML,
++            operation_id=operation_id,
++        )
++
++    def _meter(self, user_id: str = _USER_ID, *, now: datetime | None = None) -> UsageMeter:
++        return UsageMeter(
++            self.subscriptions,
++            self.usage,
++            user_id,
++            rate=ModelRate(pipeline.OPENAI_MODEL, 1, 1, "shadow-test"),
++            now=now,
++            reservation_enabled=False,
++            durable_shadow=True,
++        )
++
++    def _submit(self, *, user_id: str = _USER_ID, meter: UsageMeter | None = None):
++        return preloading.submit_preload(
++            self.preloads,
++            self.runner,
++            self.content,
++            user_id,
++            self._request(),
++            usage_meter=meter or self._meter(user_id),
++        )
++
++    def _run_success(self, *, provider_calls: list[str] | None = None) -> None:
++        def split(*_args, **kwargs):
++            tally = kwargs["tally"]
++            tally.mark_dispatch_attempt()
++            tally.add_response(
++                types.SimpleNamespace(
++                    model=pipeline.OPENAI_MODEL,
++                    usage=types.SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
++                )
++            )
++            if provider_calls is not None:
++                provider_calls.append("split")
++            return ["A durable shadow sentence."]
++
++        with (
++            mock.patch.object(preloading, "_split_sentences", side_effect=split),
++            mock.patch.object(
++                preloading,
++                "_analyze_sentences",
++                return_value=("summary", [], []),
++            ),
++            mock.patch.object(preloading, "_extract_study_items", return_value=([], {})),
++        ):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *self.runner.calls[0][:4],
++            )
++
++    def test_shadow_marker_failure_prevents_provider_dispatch(self) -> None:
++        self._submit()
++        provider_called = mock.Mock()
++
++        def split(*_args, **kwargs):
++            kwargs["tally"].mark_dispatch_attempt()
++            provider_called()
++            return ["This provider call must be fenced by durable evidence."]
++
++        with (
++            mock.patch.object(UsageMeter, "save_result", side_effect=OSError("marker unavailable")),
++            mock.patch.object(preloading, "_split_sentences", side_effect=split),
++        ):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *self.runner.calls[0][:4],
++            )
++
++        provider_called.assert_not_called()
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertNotEqual(record["status"], "ready")
++        self.assertEqual(operation.dispatch_evidence_state, "not_dispatched")
++
++    def test_shadow_success_settles_before_ready_and_replay_does_not_redispatch(self) -> None:
++        self.preloads = _SettlementBeforeReadyRepository(
++            Path(self._temporary_directory.name) / "preloads.json",
++            self.usage,
++        )
++        self._submit()
++        provider_calls: list[str] = []
++        self._run_success(provider_calls=provider_calls)
++
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(record["status"], "ready")
++        self.assertEqual(record["accounting_mode"], "shadow")
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.accounting_mode, "shadow")
++        self.assertEqual(operation.shadow_outcome, "success")
++        self.assertEqual(month["articles"], 1)
++        self.assertEqual(month["tokens"], 5)
++        self.assertGreater(month["shadow_cost_micro_usd"], 0)
++        self.assertTrue(self.preloads.checked_ready_publication)
++
++        self._run_success(provider_calls=provider_calls)
++        after_replay = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(provider_calls, ["split"])
++        self.assertEqual(after_replay["articles"], 1)
++        self.assertEqual(after_replay["tokens"], 5)
++
++    def test_shadow_crash_after_settlement_recovers_after_ttl_without_provider(self) -> None:
++        self._submit()
++        original_settle = UsageMeter.settle_shadow
++
++        def settle_then_crash(meter, operation_id):
++            original_settle(meter, operation_id)
++            raise KeyboardInterrupt("simulated crash after shadow settlement")
++
++        with (
++            mock.patch.object(UsageMeter, "settle_shadow", new=settle_then_crash),
++            self.assertRaisesRegex(KeyboardInterrupt, "after shadow settlement"),
++        ):
++            self._run_success()
++
++        settled = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        self.assertEqual(settled.state, "finalized")
++        self.assertEqual(settled.shadow_outcome, "success")
++        pending = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        pending["status"] = "processing"
++        pending.pop("lease_id", None)
++        pending.pop("lease_expires_at", None)
++        self.preloads.save(_USER_ID, pending, make_latest=False)
++        records = json.loads((Path(self._temporary_directory.name) / "usage.json").read_text())
++        expired_result_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
++        for stored in records:
++            if stored.get("record_type") == "usage_result":
++                stored["expires_at"] = expired_result_at
++        write_json_list(
++            Path(self._temporary_directory.name) / "usage.json",
++            records,
++        )
++        self.assertIsNone(self.usage.get_result(_USER_ID, _OPERATION_ID))
++        provider = mock.Mock(side_effect=AssertionError("TTL replay must not redispatch"))
++
++        with mock.patch.object(preloading, "_split_sentences", provider):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *self.runner.calls[0][:4],
++            )
++
++        provider.assert_not_called()
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.shadow_outcome, "success")
++        self.assertEqual(record["status"], "failed")
++        self.assertIn("no longer available", record["error"])
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(month["articles"], 1)
++        self.assertEqual(month["tokens"], 5)
++
++    def test_shadow_provider_failure_settles_cost_without_an_article(self) -> None:
++        self._submit()
++
++        def split(*_args, **kwargs):
++            tally = kwargs["tally"]
++            tally.mark_dispatch_attempt()
++            tally.add_response(
++                types.SimpleNamespace(
++                    model=pipeline.OPENAI_MODEL,
++                    usage=types.SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
++                )
++            )
++            raise RuntimeError("provider private detail")
++
++        with mock.patch.object(preloading, "_split_sentences", side_effect=split):
++            preloading.run_preload_job(
++                self.preloads,
++                self.subscriptions,
++                self.usage,
++                self.content,
++                *self.runner.calls[0][:4],
++            )
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.shadow_outcome, "failed_after_dispatch")
++        self.assertEqual(record["status"], "failed")
++        self.assertNotIn("provider private detail", record["error"])
++        self.assertEqual(month["articles"], 0)
++        self.assertEqual(month["tokens"], 5)
++        self.assertGreater(month["shadow_cost_micro_usd"], 0)
++
++    def test_shadow_oversized_private_result_settles_failure_without_an_article(self) -> None:
++        self._submit()
++        original_save_result = UsageMeter.save_result
++
++        def reject_completed_result(meter, operation_id, result):
++            if result.get("state") == "completed":
++                raise ValueError("private result exceeded its retention limit")
++            return original_save_result(meter, operation_id, result)
++
++        with mock.patch.object(UsageMeter, "save_result", new=reject_completed_result):
++            self._run_success()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.shadow_outcome, "failed_after_dispatch")
++        self.assertEqual(record["status"], "failed")
++        self.assertEqual(month["articles"], 0)
++        self.assertGreater(month["shadow_cost_micro_usd"], 0)
++
++    def test_shadow_lost_publication_keeps_settlement_and_content_for_recovery(self) -> None:
++        self.preloads = _LostPublicationRepository(
++            Path(self._temporary_directory.name) / "preloads.json"
++        )
++        self._submit()
++        self._run_success()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.shadow_outcome, "success")
++        self.assertEqual(record["status"], "running")
++        self.assertGreater(self.preloads.blocked_publications, 0)
++        self.assertIsNotNone(self.content.get(_USER_ID, _OPERATION_ID))
++        self.assertEqual(month["articles"], 1)
++        self.assertEqual(month["tokens"], 5)
++
++    def test_shadow_recovers_an_expired_worker_lease_without_duplicate_accounting(self) -> None:
++        self._submit()
++        expired = datetime.now(UTC) - timedelta(minutes=1)
++        first_lease = "expired-worker-lease"
++        claimed = self.preloads.claim_processing(
++            _USER_ID,
++            _OPERATION_ID,
++            self.runner.calls[0][3],
++            lease_id=first_lease,
++            now=expired - timedelta(minutes=1),
++            lease_expires_at=expired,
++        )
++        self.assertIsNotNone(claimed)
++        self.assertEqual(
++            self._meter().claim_execution(
++                _OPERATION_ID,
++                first_lease,
++                expired - timedelta(minutes=1),
++                expired,
++            ),
++            "claimed",
++        )
++
++        self._run_success()
++
++        operation = self.usage.get_operation(_USER_ID, _OPERATION_ID)
++        record = self.preloads.get_by_id(_USER_ID, _OPERATION_ID)
++        month = self.usage.get_month(_USER_ID, operation.month)
++        self.assertEqual(record["status"], "ready")
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(month["articles"], 1)
++        self.assertEqual(month["tokens"], 5)
++
++    def test_shadow_operations_are_scoped_by_account_and_pinned_month(self) -> None:
++        july = datetime(2026, 7, 31, 23, 59, tzinfo=UTC)
++        august = datetime(2026, 8, 1, 0, 1, tzinfo=UTC)
++        self._submit(user_id="shadow-july", meter=self._meter("shadow-july", now=july))
++        self._submit(user_id="shadow-august", meter=self._meter("shadow-august", now=august))
++
++        july_operation = self.usage.get_operation("shadow-july", _OPERATION_ID)
++        august_operation = self.usage.get_operation("shadow-august", _OPERATION_ID)
++        self.assertEqual(july_operation.month, "2026-07")
++        self.assertEqual(august_operation.month, "2026-08")
++        self.assertEqual(july_operation.accounting_mode, "shadow")
++        self.assertEqual(august_operation.accounting_mode, "shadow")
++
++        self.preloads = JsonPagePreloadRepository(
++            Path(self._temporary_directory.name) / "rollover-preloads.json"
++        )
++        self.runner = _RecordingRunner()
++        self._submit(meter=self._meter(now=july))
++        self._run_success()
++        retry = self._submit(meter=self._meter(now=august))
++        original_month = self.usage.get_month(_USER_ID, "2026-07")
++        rollover_month = self.usage.get_month(_USER_ID, "2026-08")
++        self.assertTrue(retry.ready)
++        self.assertEqual(original_month["articles"], 1)
++        self.assertEqual(original_month["tokens"], 5)
++        self.assertEqual(rollover_month["articles"], 0)
++        self.assertEqual(rollover_month["tokens"], 0)
++
++
++if __name__ == "__main__":
++    unittest.main()

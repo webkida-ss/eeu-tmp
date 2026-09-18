@@ -1,0 +1,1742 @@
+--- before/backend/repositories/usage_repository.py
++++ after/backend/repositories/usage_repository.py
+@@ -26,6 +26,8 @@
+ )
+ OperationState = Literal["reserved", "finalized", "released"]
+ ExecutionClaimStatus = Literal["claimed", "owned", "recovered"]
++DispatchEvidenceState = Literal["unknown", "not_dispatched", "dispatched", "completed", "settled"]
++UsageCompleteness = Literal["unknown", "measured", "conservative"]
+ 
+ 
+ class UsageRepositoryError(RuntimeError):
+@@ -109,10 +111,13 @@
+     output_tokens: int = 0
+     tokens: int = 0
+     result_ref: str | None = None
++    evidence_completeness: UsageCompleteness = "measured"
+ 
+     def __post_init__(self) -> None:
+         for field in ("actual_cost_micro_usd", "input_tokens", "output_tokens", "tokens"):
+             _nonnegative(field, getattr(self, field))
++        if self.evidence_completeness not in ("measured", "conservative"):
++            raise ValueError("evidence_completeness is invalid")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -146,6 +151,11 @@
+     output_tokens: int = 0
+     tokens: int = 0
+     release_reason: str | None = None
++    dispatch_evidence_state: DispatchEvidenceState = "unknown"
++    dispatch_evidence_version: int = 0
++    dispatch_kind: str | None = None
++    dispatch_usage_completeness: UsageCompleteness = "unknown"
++    dispatch_usage: dict[str, int] | None = None
+ 
+     @classmethod
+     def reserved(cls, request: UsageReservationRequest) -> UsageOperation:
+@@ -171,6 +181,8 @@
+             reserved_cost_micro_usd=request.cost_micro_usd,
+             state="reserved",
+             expires_at=request.expires_at,
++            dispatch_evidence_state="not_dispatched",
++            dispatch_evidence_version=1,
+         )
+ 
+     def finalized(
+@@ -189,6 +201,14 @@
+             input_tokens=request.input_tokens,
+             output_tokens=request.output_tokens,
+             tokens=actual_tokens,
++            dispatch_evidence_state="settled",
++            dispatch_evidence_version=self.dispatch_evidence_version + 1,
++            dispatch_usage_completeness=request.evidence_completeness,
++            dispatch_usage=(
++                _usage_record_from_finalize(request, actual_tokens)
++                if request.evidence_completeness == "measured"
++                else _preserve_conservative_usage(self.dispatch_usage, request, actual_tokens)
++            ),
+         )
+ 
+     def released(self, reason: str) -> UsageOperation:
+@@ -196,10 +216,38 @@
+             self,
+             state="released",
+             release_reason=reason,
++            dispatch_evidence_version=self.dispatch_evidence_version + 1,
+         )
+ 
+     def renewed(self, expires_at: datetime) -> UsageOperation:
+-        return replace(self, expires_at=expires_at)
++        return replace(
++            self,
++            expires_at=expires_at,
++            dispatch_evidence_version=self.dispatch_evidence_version + 1,
++        )
++
++    def with_dispatch_evidence(
++        self,
++        *,
++        state: DispatchEvidenceState,
++        kind: str | None,
++        completeness: UsageCompleteness,
++        usage: dict[str, int] | None,
++    ) -> UsageOperation:
++        if self.state != "reserved":
++            raise UsageOperationStateError(
++                f"Cannot record dispatch evidence for {self.state} operation"
++            )
++        if self.dispatch_evidence_state == "settled":
++            raise UsageOperationStateError("Cannot replace settled dispatch evidence")
++        return replace(
++            self,
++            dispatch_evidence_state=state,
++            dispatch_evidence_version=self.dispatch_evidence_version + 1,
++            dispatch_kind=kind or self.dispatch_kind,
++            dispatch_usage_completeness=completeness,
++            dispatch_usage=usage if usage is not None else self.dispatch_usage,
++        )
+ 
+     @property
+     def articles(self) -> int:
+@@ -382,6 +430,9 @@
+             if operation.state != "reserved":
+                 raise UsageOperationStateError(f"Cannot finalize {operation.state} operation")
+ 
++            if operation.dispatch_evidence_state == "completed":
++                request = _finalize_request_from_evidence(operation)
++
+             finalized = _finalize_operation_in_items(items, record, operation, request)
+             write_json_list(self._path, items)
+             return finalized
+@@ -397,6 +448,8 @@
+                 return operation
+             if operation.state != "reserved":
+                 raise UsageOperationStateError(f"Cannot release {operation.state} operation")
++            if operation.dispatch_evidence_state != "not_dispatched":
++                raise UsageOperationStateError("Cannot release an operation with dispatch evidence")
+ 
+             month = _find_month(items, operation.user_id, operation.month)
+             if month is None:
+@@ -428,9 +481,20 @@
+             "expires_at": expires_at.isoformat(),
+             **result,
+         }
+-        _validate_result_size(stored)
+         with self._lock, json_list_lock(self._path):
+             items = self._load_items_with_cleanup()
++            operation_record = _find_operation(items, user_id, operation_id)
++            if operation_record is not None:
++                operation = _operation_from_record(operation_record)
++                promoted = _promote_dispatch_evidence(operation, result)
++                if promoted != operation:
++                    operation_record.clear()
++                    operation_record.update(_operation_to_record(promoted))
++                    # Keep accounting evidence even when a TTL-private response
++                    # later proves too large or cannot be written.
++                    write_json_list(self._path, items)
++
++            _validate_result_size(stored)
+             existing = _find_result(items, user_id, operation_id)
+             if existing is not None:
+                 comparable = {
+@@ -572,31 +636,39 @@
+                 execution = _find_execution(items, user_id, str(record["operation_id"]))
+                 if execution and _parse_datetime(execution["expires_at"]) > now:
+                     continue
+-                result = _find_result(items, user_id, str(record["operation_id"]))
+-                if result:
++                try:
++                    operation = _operation_from_record(record)
++                except Exception:
++                    continue
++                if operation.dispatch_evidence_state in ("dispatched", "completed"):
+                     try:
+-                        operation = _operation_from_record(record)
++                        _finalize_operation_in_items(
++                            items,
++                            record,
++                            operation,
++                            _finalize_request_from_evidence(operation),
++                        )
++                    except Exception:
++                        continue
++                    reclaimed += 1
++                    continue
++                result = _find_result(items, user_id, operation.operation_id)
++                if operation.dispatch_evidence_state == "unknown":
++                    # Old operations have no durable marker. A surviving private
++                    # result is positive historical evidence; its absence is not.
++                    if result is None:
++                        continue
++                    try:
+                         request = _finalize_request_from_result(operation, result)
+                     except Exception:
+-                        try:
+-                            operation = _operation_from_record(record)
+-                        except Exception:
+-                            continue
+-                        request = UsageFinalizeRequest(
+-                            user_id=operation.user_id,
+-                            operation_id=operation.operation_id,
+-                            actual_cost_micro_usd=(operation.reserved_cost_micro_usd),
+-                            result_ref=operation.operation_id,
+-                        )
++                        request = _conservative_finalize_request(operation)
+                     try:
+                         _finalize_operation_in_items(items, record, operation, request)
+                     except Exception:
+                         continue
+                     reclaimed += 1
+                     continue
+-                try:
+-                    operation = _operation_from_record(record)
+-                except Exception:
++                if operation.dispatch_evidence_state != "not_dispatched":
+                     continue
+                 month = _find_month(items, operation.user_id, operation.month)
+                 if month is None:
+@@ -714,6 +786,136 @@
+         )
+ 
+ 
++def _usage_record_from_finalize(
++    request: UsageFinalizeRequest, actual_tokens: int
++) -> dict[str, int]:
++    return {
++        "actual_cost_micro_usd": request.actual_cost_micro_usd,
++        "input_tokens": request.input_tokens,
++        "output_tokens": request.output_tokens,
++        "total_tokens": actual_tokens,
++    }
++
++
++def _preserve_conservative_usage(
++    existing: dict[str, int] | None,
++    request: UsageFinalizeRequest,
++    actual_tokens: int,
++) -> dict[str, int] | None:
++    if existing is None:
++        return None
++    return {
++        "actual_cost_micro_usd": max(
++            int(existing.get("actual_cost_micro_usd") or 0),
++            request.actual_cost_micro_usd,
++        ),
++        "input_tokens": max(int(existing.get("input_tokens") or 0), request.input_tokens),
++        "output_tokens": max(int(existing.get("output_tokens") or 0), request.output_tokens),
++        "total_tokens": max(int(existing.get("total_tokens") or 0), actual_tokens),
++    }
++
++
++def _normalized_result_usage(
++    result: dict[str, Any],
++) -> tuple[UsageCompleteness, dict[str, int] | None]:
++    usage = result.get("usage")
++    if not isinstance(usage, dict):
++        return "unknown", None
++    values: dict[str, int] = {}
++    present = False
++    aliases = {
++        "actual_cost_micro_usd": ("actual_cost_micro_usd", "cost_micro_usd"),
++        "input_tokens": ("input_tokens",),
++        "output_tokens": ("output_tokens",),
++        "total_tokens": ("total_tokens",),
++    }
++    for target, names in aliases.items():
++        matching = next((name for name in names if name in usage), None)
++        if matching is None:
++            values[target] = 0
++            continue
++        present = True
++        raw = usage[matching]
++        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
++            return "unknown", None
++        values[target] = raw
++    if not present:
++        return "unknown", None
++    if values["total_tokens"] == 0 and ("input_tokens" in usage or "output_tokens" in usage):
++        values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
++    # A response object alone is not usage evidence. New callers supply this
++    # flag from UsageTally; numeric-only historical results remain compatible.
++    complete = usage.get("usage_complete")
++    if complete is None:
++        complete = not bool(usage.get("missing_usage", False))
++    if complete is not True:
++        return "unknown", values
++    return "measured", values
++
++
++def _promote_dispatch_evidence(operation: UsageOperation, result: dict[str, Any]) -> UsageOperation:
++    state = str(result.get("state") or "completed")
++    kind = result.get("kind")
++    if kind is not None and kind not in {"analyze", "chat", "preload"}:
++        raise UsageOperationConflict("Dispatch evidence kind is invalid")
++    if operation.dispatch_kind and kind and operation.dispatch_kind != kind:
++        raise UsageOperationConflict("Dispatch evidence kind conflicts with the operation")
++    if state == "dispatching":
++        if operation.dispatch_evidence_state != "not_dispatched":
++            raise UsageOperationStateError("Dispatch is already authorized or unavailable")
++        return operation.with_dispatch_evidence(
++            state="dispatched",
++            kind=kind,
++            completeness="unknown",
++            usage=None,
++        )
++    if state != "completed":
++        raise UsageOperationConflict("Dispatch evidence state is invalid")
++    completeness, usage = _normalized_result_usage(result)
++    if operation.dispatch_evidence_state == "settled":
++        raise UsageOperationStateError("Cannot replace settled dispatch evidence")
++    if operation.dispatch_evidence_state == "completed":
++        if operation.dispatch_usage_completeness == "measured":
++            if completeness != "measured" or operation.dispatch_usage != usage:
++                raise UsageOperationConflict("Completed dispatch evidence conflicts")
++            return operation
++        if completeness != "measured":
++            return operation
++    return operation.with_dispatch_evidence(
++        state="completed",
++        kind=kind,
++        completeness=completeness,
++        usage=usage,
++    )
++
++
++def _conservative_finalize_request(operation: UsageOperation) -> UsageFinalizeRequest:
++    known_cost = int((operation.dispatch_usage or {}).get("actual_cost_micro_usd") or 0)
++    return UsageFinalizeRequest(
++        user_id=operation.user_id,
++        operation_id=operation.operation_id,
++        actual_cost_micro_usd=max(operation.reserved_cost_micro_usd, known_cost),
++        result_ref=f"usage-evidence:{operation.operation_id}",
++        evidence_completeness="conservative",
++    )
++
++
++def _finalize_request_from_evidence(operation: UsageOperation) -> UsageFinalizeRequest:
++    if operation.dispatch_usage_completeness != "measured":
++        return _conservative_finalize_request(operation)
++    usage = operation.dispatch_usage or {}
++    return UsageFinalizeRequest(
++        user_id=operation.user_id,
++        operation_id=operation.operation_id,
++        actual_cost_micro_usd=int(usage["actual_cost_micro_usd"]),
++        input_tokens=int(usage["input_tokens"]),
++        output_tokens=int(usage["output_tokens"]),
++        tokens=int(usage["total_tokens"]),
++        result_ref=f"usage-evidence:{operation.operation_id}",
++        evidence_completeness="measured",
++    )
++
++
+ def _sweep_expired_results(items: list[dict[str, Any]], now: datetime) -> int:
+     limit = min(
+         1000,
+@@ -871,6 +1073,11 @@
+         "sentences_per_article": 0,
+         "source_tokens_per_article": 0,
+         "tokenizer_encoding": "",
++        "dispatch_evidence_state": "unknown",
++        "dispatch_evidence_version": 0,
++        "dispatch_kind": None,
++        "dispatch_usage_completeness": "unknown",
++        "dispatch_usage": None,
+     }
+     values = {
+         field.name: record.get(field.name, compatibility_defaults.get(field.name, field.default))
+--- before/backend/repositories/dynamodb_billing_repositories.py
++++ after/backend/repositories/dynamodb_billing_repositories.py
+@@ -33,11 +33,14 @@
+     UsageReservationRequest,
+     _apply_amounts,
+     _check_admission,
++    _conservative_finalize_request,
+     _event_record,
++    _finalize_request_from_evidence,
+     _finalize_request_from_result,
+     _operation_from_record,
+     _operation_to_record,
+     _parse_datetime,
++    _promote_dispatch_evidence,
+     _ratchet_limits,
+     _reconcile_compatibility_counters,
+     _subtract_reserved,
+@@ -119,6 +122,14 @@
+                 return operation
+             if operation.state != "reserved":
+                 raise UsageOperationStateError(f"Cannot finalize {operation.state} operation")
++            if (
++                request.result_ref == f"usage-evidence:{operation.operation_id}"
++                or operation.dispatch_evidence_state == "completed"
++            ):
++                # Recompute after every CAS retry. A completed marker can win
++                # between an expired-reclaim read and this transaction; its
++                # measured evidence must never be replaced by the old floor.
++                request = _finalize_request_from_evidence(operation)
+ 
+             month = self._load_month(operation.user_id, operation.month)
+             expected_version = int(month.get("version") or 0)
+@@ -140,6 +151,13 @@
+                         self._operation_put(
+                             finalized,
+                             expected_state="reserved",
++                            expected_dispatch_evidence_version=(
++                                operation.dispatch_evidence_version
++                            ),
++                            expected_missing_dispatch_evidence=(
++                                operation.dispatch_evidence_state == "unknown"
++                                and operation.dispatch_evidence_version == 0
++                            ),
+                         ),
+                         self._event_put(finalized, "finalize"),
+                     ]
+@@ -173,6 +191,8 @@
+                 return operation, False
+             if operation.state != "reserved":
+                 raise UsageOperationStateError(f"Cannot release {operation.state} operation")
++            if operation.dispatch_evidence_state != "not_dispatched":
++                raise UsageOperationStateError("Cannot release an operation with dispatch evidence")
+             if expired_before is not None and operation.expires_at > expired_before:
+                 return operation, False
+ 
+@@ -191,6 +211,13 @@
+                             expected_expires_at=(
+                                 operation.expires_at if expired_before is not None else None
+                             ),
++                            expected_dispatch_evidence_version=(
++                                operation.dispatch_evidence_version
++                            ),
++                            expected_missing_dispatch_evidence=(
++                                operation.dispatch_evidence_state == "unknown"
++                                and operation.dispatch_evidence_version == 0
++                            ),
+                         ),
+                         self._event_put(released, "release", reason=reason),
+                     ]
+@@ -218,6 +245,7 @@
+     def save_result(
+         self, user_id: str, operation_id: str, result: dict[str, Any]
+     ) -> dict[str, Any]:
++        self._persist_dispatch_evidence(user_id, operation_id, result)
+         pk = user_pk(user_id)
+         sk = usage_result_sk(operation_id)
+         expires_at = datetime.now(UTC) + timedelta(
+@@ -264,6 +292,49 @@
+             raise UsageOperationConflict(f"Operation {operation_id} has a different stored result")
+         return result
+ 
++    def _persist_dispatch_evidence(
++        self, user_id: str, operation_id: str, result: dict[str, Any]
++    ) -> None:
++        """Persist safe dispatch evidence before writing a TTL-private result."""
++        for _attempt in range(4):
++            operation = self.get_operation(user_id, operation_id)
++            if operation is None:
++                # Compatibility callers may use result storage without a quota
++                # operation. Those records have no durable reservation to fence.
++                return
++            promoted = _promote_dispatch_evidence(operation, result)
++            if promoted == operation:
++                return
++            try:
++                self._store.transact_write(
++                    [
++                        self._operation_put(
++                            promoted,
++                            expected_state=operation.state,
++                            expected_dispatch_evidence_version=(
++                                operation.dispatch_evidence_version
++                            ),
++                            expected_missing_dispatch_evidence=(
++                                operation.dispatch_evidence_state == "unknown"
++                                and operation.dispatch_evidence_version == 0
++                            ),
++                        )
++                    ]
++                )
++                return
++            except ClientError as exc:
++                if not _is_transaction_failure(exc):
++                    raise
++        # Re-read once more to make a stale writer apply the same monotonic
++        # validation instead of rebasing a whole stale operation snapshot.
++        operation = self.get_operation(user_id, operation_id)
++        if operation is None:
++            return
++        promoted = _promote_dispatch_evidence(operation, result)
++        if promoted == operation:
++            return
++        raise UsageRepositoryError("Dispatch evidence transaction conflicted")
++
+     def get_result(self, user_id: str, operation_id: str) -> dict[str, Any] | None:
+         item = self._store.get_item(
+             user_pk(user_id),
+@@ -296,6 +367,13 @@
+                             renewed,
+                             expected_state="reserved",
+                             expected_expires_at=operation.expires_at,
++                            expected_dispatch_evidence_version=(
++                                operation.dispatch_evidence_version
++                            ),
++                            expected_missing_dispatch_evidence=(
++                                operation.dispatch_evidence_state == "unknown"
++                                and operation.dispatch_evidence_version == 0
++                            ),
+                         )
+                     ]
+                 )
+@@ -431,25 +509,34 @@
+                 execution_expiry = execution_item.get("expires_at")
+                 if execution_expiry and _parse_datetime(str(execution_expiry)) > now:
+                     continue
+-                result = self.get_result(user_id, str(record["operation_id"]))
+-                if result:
+-                    operation = self.get_operation(user_id, str(record["operation_id"]))
+-                    if operation and operation.state == "reserved":
+-                        try:
+-                            request = _finalize_request_from_result(operation, result)
+-                        except Exception:
+-                            request = UsageFinalizeRequest(
+-                                user_id=operation.user_id,
+-                                operation_id=operation.operation_id,
+-                                actual_cost_micro_usd=(operation.reserved_cost_micro_usd),
+-                                result_ref=operation.operation_id,
+-                            )
+-                        try:
+-                            self.finalize(request)
+-                            reclaimed += 1
+-                        except Exception:
+-                            continue
++                operation = self.get_operation(user_id, str(record["operation_id"]))
++                if operation is None or operation.state != "reserved":
++                    continue
++                if operation.dispatch_evidence_state in ("dispatched", "completed"):
++                    try:
++                        self.finalize(_finalize_request_from_evidence(operation))
++                        reclaimed += 1
++                    except Exception:
++                        continue
++                    continue
++                if operation.dispatch_evidence_state == "unknown":
++                    # A legacy result is positive evidence. A missing result is
++                    # deliberately unresolved rather than silently released.
++                    result = self.get_result(user_id, operation.operation_id)
++                    if result is None:
++                        continue
++                    try:
++                        request = _finalize_request_from_result(operation, result)
++                    except Exception:
++                        request = _conservative_finalize_request(operation)
++                    try:
++                        self.finalize(request)
++                        reclaimed += 1
++                    except Exception:
++                        continue
+                     continue
++                if operation.dispatch_evidence_state != "not_dispatched":
++                    continue
+                 try:
+                     _operation, transitioned = self._release_transition(
+                         user_id,
+@@ -521,6 +608,8 @@
+         create: bool = False,
+         expected_state: str | None = None,
+         expected_expires_at: datetime | None = None,
++        expected_dispatch_evidence_version: int | None = None,
++        expected_missing_dispatch_evidence: bool = False,
+     ) -> dict[str, Any]:
+         record = _operation_to_record(operation)
+         item = {
+@@ -530,6 +619,8 @@
+             "state": operation.state,
+             "payload_hash": operation.payload_hash,
+             "expires_at": operation.expires_at.isoformat(),
++            "dispatch_evidence_state": operation.dispatch_evidence_state,
++            "dispatch_evidence_version": operation.dispatch_evidence_version,
+         }
+         put: dict[str, Any] = {
+             "TableName": self._store.table_name,
+@@ -541,6 +632,12 @@
+             conditions = ["#state = :expected_state"]
+             names = {"#state": "state"}
+             values: dict[str, Any] = {":expected_state": expected_state}
++            names["#evidence_version"] = "dispatch_evidence_version"
++            if expected_missing_dispatch_evidence:
++                conditions.append("attribute_not_exists(#evidence_version)")
++            elif expected_dispatch_evidence_version is not None:
++                conditions.append("#evidence_version = :expected_evidence_version")
++                values[":expected_evidence_version"] = expected_dispatch_evidence_version
+             if expected_expires_at is not None:
+                 conditions.append(
+                     "(attribute_not_exists(#expires_at) OR #expires_at = :expected_expires_at)"
+--- before/backend/services/usage_meter.py
++++ after/backend/services/usage_meter.py
+@@ -5,6 +5,7 @@
+ import json
+ import logging
+ import os
++import threading
+ from collections.abc import Callable
+ from datetime import UTC, datetime, timedelta
+ from typing import Any, Literal
+@@ -181,6 +182,8 @@
+         operation_id: str,
+         usage: Any,
+         result_ref: str | None = None,
++        *,
++        evidence_completeness: Literal["measured", "conservative"] = "measured",
+     ) -> UsageOperation:
+         values = _usage_values(usage)
+         request = UsageFinalizeRequest(
+@@ -191,6 +194,7 @@
+             tokens=values["total_tokens"],
+             actual_cost_micro_usd=values["actual_cost_micro_usd"],
+             result_ref=result_ref,
++            evidence_completeness=evidence_completeness,
+         )
+         if not self.reservation_enabled:
+             operation = self._disabled_operation(operation_id)
+@@ -359,6 +363,21 @@
+             return result
+         return self.usage_repository.save_result(self.user_id, operation_id, result)
+ 
++    def dispatch_authorizer(self, operation_id: str, marker: dict[str, Any]) -> Callable[[], None]:
++        """Authorize one execution's first provider call after durable persistence."""
++        lock = threading.Lock()
++        authorized = False
++
++        def authorize() -> None:
++            nonlocal authorized
++            with lock:
++                if authorized:
++                    return
++                self.save_result(operation_id, marker)
++                authorized = True
++
++        return authorize
++
+     def get_result(self, operation_id: str) -> dict[str, Any] | None:
+         if not self.reservation_enabled:
+             return None
+--- before/backend/services/synchronous_execution.py
++++ after/backend/services/synchronous_execution.py
+@@ -53,8 +53,14 @@
+     if operation.state == "reserved":
+         meter.finalize(
+             operation.operation_id,
+-            stored["usage"],
++            operation.dispatch_usage or stored["usage"],
+             result_ref=f"usage-result:{operation.operation_id}",
++            evidence_completeness=(
++                "measured"
++                if operation.dispatch_evidence_state == "unknown"
++                or operation.dispatch_usage_completeness == "measured"
++                else "conservative"
++            ),
+         )
+         _log_recovery_event(
+             "pending_result_repaired",
+@@ -64,6 +70,24 @@
+     return response
+ 
+ 
++def _settle_durable_dispatch_evidence(meter: UsageMeter, operation: Any) -> None:
++    if operation.dispatch_evidence_state not in ("dispatched", "completed"):
++        return
++    usage = operation.dispatch_usage or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd}
++    meter.finalize(
++        operation.operation_id,
++        usage,
++        result_ref=f"usage-evidence:{operation.operation_id}",
++        evidence_completeness=(
++            "measured" if operation.dispatch_usage_completeness == "measured" else "conservative"
++        ),
++    )
++    raise PipelineError(
++        "The previous provider dispatch had an uncertain result.",
++        status_code=502,
++    )
++
++
+ def _claim_or_await_synchronous_execution(
+     meter: UsageMeter,
+     operation: Any,
+@@ -107,11 +131,19 @@
+                     kind=kind,
+                 )
+             pending = meter.get_result(operation.operation_id)
++            latest = meter.get_operation(operation.operation_id)
++            if latest is not None:
++                try:
++                    _settle_durable_dispatch_evidence(meter, latest)
++                except PipelineError:
++                    meter.release_execution(operation.operation_id, claim_id, now)
++                    raise
+             if pending and pending.get("state") == "dispatching":
+                 meter.finalize(
+                     operation.operation_id,
+                     pending["usage"],
+                     result_ref=f"usage-result:{operation.operation_id}",
++                    evidence_completeness="conservative",
+                 )
+                 _log_recovery_event(
+                     "pending_result_repaired",
+@@ -200,6 +232,20 @@
+     dispatch_attempted: bool,
+ ) -> None:
+     if dispatch_attempted:
++        latest = meter.get_operation(operation.operation_id)
++        if latest and latest.dispatch_evidence_state in ("dispatched", "completed"):
++            meter.finalize(
++                operation.operation_id,
++                latest.dispatch_usage
++                or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
++                result_ref=f"usage-evidence:{operation.operation_id}",
++                evidence_completeness=(
++                    "measured"
++                    if latest.dispatch_usage_completeness == "measured"
++                    else "conservative"
++                ),
++            )
++            return
+         pending = meter.get_result(operation.operation_id)
+         if pending and pending.get("state") == "completed":
+             return
+@@ -208,11 +254,13 @@
+                 operation.operation_id,
+                 pending["usage"],
+                 result_ref=f"usage-result:{operation.operation_id}",
++                evidence_completeness="conservative",
+             )
+             return
+         meter.finalize(
+             operation.operation_id,
+             {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
++            evidence_completeness="conservative",
+         )
+     else:
+         meter.release(operation.operation_id, "failed_before_dispatch")
+@@ -231,7 +279,7 @@
+         "state": "dispatching",
+         "usage": {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
+     }
+-    tally.set_dispatch_callback(lambda: meter.save_result(operation.operation_id, marker))
++    tally.set_dispatch_callback(meter.dispatch_authorizer(operation.operation_id, marker))
+ 
+ 
+ class SynchronousExecution[ResponseT: BaseModel]:
+@@ -343,6 +391,10 @@
+         try:
+             response = build_response(provider_result)
+             self.usage = _settlement_usage(tally, self.operation)
++            snapshot = tally.snapshot()
++            self.usage["usage_complete"] = bool(
++                not snapshot.missing_usage and snapshot.total_tokens > 0
++            )
+             self.meter.save_result(
+                 self.operation.operation_id,
+                 {
+@@ -352,10 +404,16 @@
+                     "usage": self.usage,
+                 },
+             )
++            latest = self.meter.get_operation(self.operation.operation_id) or self.operation
+             self.meter.finalize(
+                 self.operation.operation_id,
+-                self.usage,
++                latest.dispatch_usage or self.usage,
+                 result_ref=f"usage-result:{self.operation.operation_id}",
++                evidence_completeness=(
++                    "measured"
++                    if latest.dispatch_usage_completeness == "measured"
++                    else "conservative"
++                ),
+             )
+         except Exception as error:
+             if on_failure:
+--- before/backend/services/preloading.py
++++ after/backend/services/preloading.py
+@@ -94,7 +94,27 @@
+         "state": "dispatching",
+         "usage": {"actual_cost_micro_usd": (operation.reserved_cost_micro_usd)},
+     }
+-    tally.set_dispatch_callback(lambda: meter.save_result(operation.operation_id, marker))
++    tally.set_dispatch_callback(meter.dispatch_authorizer(operation.operation_id, marker))
++
++
++def _finalize_dispatch_evidence(
++    meter: UsageMeter,
++    operation: Any,
++    *,
++    result_ref: str,
++) -> str:
++    """Settle durable provider evidence without relying on private results."""
++    usage = operation.dispatch_usage or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd}
++    completeness = (
++        "measured" if operation.dispatch_usage_completeness == "measured" else "conservative"
++    )
++    meter.finalize(
++        operation.operation_id,
++        usage,
++        result_ref=result_ref,
++        evidence_completeness=completeness,
++    )
++    return "finalized" if completeness == "measured" else "finalized_conservative"
+ 
+ 
+ def _require_published_transition(
+@@ -888,42 +908,44 @@
+             return
+         if operation and operation.state == "finalized":
+             if record.get("status") in ("processing", "running"):
+-                crash_result = meter.get_result(operation_id)
+-                if crash_result and crash_result.get("kind") == "preload":
+-                    interrupted = dict(record)
+-                    interrupted["status"] = "failed"
+-                    interrupted["content_retirement_pending"] = True
+-                    interrupted["usage_state"] = "finalized_conservative"
+-                    interrupted["error"] = (
+-                        "Article analysis was interrupted after provider "
+-                        "dispatch. Please submit it again."
+-                    )
+-                    completed = repository.finish_processing(
+-                        user_id,
+-                        preload_id,
+-                        learner_profile_fingerprint,
+-                        interrupted,
+-                        lease_id=(
+-                            str(record.get("lease_id"))
+-                            if record.get("status") == "running" and record.get("lease_id")
+-                            else None
+-                        ),
+-                        expected_status=str(record.get("status")),
+-                    )
+-                    _require_published_transition(repository, user_id, preload_id, completed)
+-                    _log_recovery_event(
+-                        "pending_result_repaired",
+-                        operation_id=operation_id,
+-                        kind="preload",
+-                        outcome="interrupted",
+-                    )
+-                    _retire_terminal_content(
+-                        repository,
+-                        content_store,
+-                        user_id,
+-                        interrupted,
+-                        learner_profile_fingerprint,
+-                    )
++                interrupted = dict(record)
++                interrupted["status"] = "failed"
++                interrupted["content_retirement_pending"] = True
++                interrupted["usage_state"] = (
++                    "finalized"
++                    if operation.dispatch_usage_completeness == "measured"
++                    else "finalized_conservative"
++                )
++                interrupted["error"] = (
++                    "Article analysis was interrupted after provider "
++                    "dispatch. Please submit it again."
++                )
++                completed = repository.finish_processing(
++                    user_id,
++                    preload_id,
++                    learner_profile_fingerprint,
++                    interrupted,
++                    lease_id=(
++                        str(record.get("lease_id"))
++                        if record.get("status") == "running" and record.get("lease_id")
++                        else None
++                    ),
++                    expected_status=str(record.get("status")),
++                )
++                _require_published_transition(repository, user_id, preload_id, completed)
++                _log_recovery_event(
++                    "pending_result_repaired",
++                    operation_id=operation_id,
++                    kind="preload",
++                    outcome="interrupted",
++                )
++                _retire_terminal_content(
++                    repository,
++                    content_store,
++                    user_id,
++                    interrupted,
++                    learner_profile_fingerprint,
++                )
+                 return
+             if record.get("status") == "ready_pending_usage":
+                 repaired = dict(record)
+@@ -1011,11 +1033,14 @@
+             and record.get("status") in ("ready_pending_usage", "ready")
+             and record.get("usage_tally")
+         ):
+-            meter.finalize(
+-                operation_id,
+-                record["usage_tally"],
+-                result_ref=preload_id,
+-            )
++            if operation.dispatch_evidence_state in ("dispatched", "completed"):
++                _finalize_dispatch_evidence(meter, operation, result_ref=preload_id)
++            else:
++                meter.finalize(
++                    operation_id,
++                    record["usage_tally"],
++                    result_ref=preload_id,
++                )
+             repaired = dict(record)
+             repaired["status"] = "ready"
+             repaired["usage_state"] = "finalized"
+@@ -1043,12 +1068,19 @@
+             )
+             return
+         if operation.state == "reserved" and record.get("status") == "failed_pending_usage":
+-            if record.get("failure_settlement") == "finalize_conservative":
++            if record.get("failure_settlement") == "finalize_evidence":
++                usage_state = _finalize_dispatch_evidence(
++                    meter,
++                    operation,
++                    result_ref=preload_id,
++                )
++            elif record.get("failure_settlement") == "finalize_conservative":
+                 meter.finalize(
+                     operation_id,
+                     record.get("failure_usage")
+                     or {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
+                     result_ref=preload_id,
++                    evidence_completeness="conservative",
+                 )
+                 usage_state = "finalized_conservative"
+             else:
+@@ -1172,7 +1204,42 @@
+                 lease_id=lease_id,
+             )
+             return
++        latest_operation = meter.get_operation(operation_id) or operation
+         durable_result = meter.get_result(operation_id)
++        if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
++            try:
++                usage_state = _finalize_dispatch_evidence(
++                    meter,
++                    latest_operation,
++                    result_ref=preload_id,
++                )
++                interrupted = dict(record)
++                interrupted["status"] = "failed"
++                interrupted["content_retirement_pending"] = True
++                interrupted["usage_state"] = usage_state
++                interrupted["error"] = (
++                    "Article analysis was interrupted after provider "
++                    "dispatch. Please submit it again."
++                )
++                completed = repository.finish_processing(
++                    user_id,
++                    preload_id,
++                    learner_profile_fingerprint,
++                    interrupted,
++                    lease_id=lease_id,
++                )
++                _require_published_transition(repository, user_id, preload_id, completed)
++            finally:
++                meter.release_execution(operation_id, lease_id)
++            if completed:
++                _retire_terminal_content(
++                    repository,
++                    content_store,
++                    user_id,
++                    interrupted,
++                    learner_profile_fingerprint,
++                )
++            return
+         if (
+             durable_result
+             and durable_result.get("kind") == "preload"
+@@ -1384,6 +1451,11 @@
+                     if provider_error is None
+                     else {"actual_cost_micro_usd": (operation.reserved_cost_micro_usd)}
+                 )
++                if provider_error is None:
++                    snapshot = tally.snapshot()
++                    durable_usage["usage_complete"] = bool(
++                        not snapshot.missing_usage and snapshot.total_tokens > 0
++                    )
+                 meter.save_result(
+                     operation_id,
+                     {
+@@ -1392,6 +1464,12 @@
+                         "usage": durable_usage,
+                     },
+                 )
++        except Exception as evidence_error:
++            # The durable promotion may already have succeeded before the
++            # TTL-private result write failed. Route through settlement so
++            # exact safe evidence is not replaced by a reservation floor.
++            if provider_error is None:
++                provider_error = evidence_error
+         finally:
+             owns_publication = heartbeat.stop_and_verify()
+             if meter:
+@@ -1412,10 +1490,14 @@
+         failed["error"] = str(exc) or "Article analysis failed. Please try again."
+         if meter:
+             if _dispatch_was_attempted(tally, exc):
+-                failed["failure_settlement"] = "finalize_conservative"
+-                failed["failure_usage"] = {
+-                    "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-                }
++                latest_operation = meter.get_operation(operation_id) or operation
++                if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
++                    failed["failure_settlement"] = "finalize_evidence"
++                else:
++                    failed["failure_settlement"] = "finalize_conservative"
++                    failed["failure_usage"] = {
++                        "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
++                    }
+             else:
+                 failed["failure_settlement"] = "release"
+                 failed["failure_reason"] = "analysis_failed_before_dispatch"
+@@ -1428,11 +1510,18 @@
+             lease_id=lease_id,
+         )
+         if completed and meter:
+-            if failed["failure_settlement"] == "finalize_conservative":
++            if failed["failure_settlement"] == "finalize_evidence":
++                failed["usage_state"] = _finalize_dispatch_evidence(
++                    meter,
++                    meter.get_operation(operation_id) or operation,
++                    result_ref=preload_id,
++                )
++            elif failed["failure_settlement"] == "finalize_conservative":
+                 meter.finalize(
+                     operation_id,
+                     failed["failure_usage"],
+                     result_ref=preload_id,
++                    evidence_completeness="conservative",
+                 )
+                 failed["usage_state"] = "finalized_conservative"
+             else:
+@@ -1527,10 +1616,14 @@
+         failed["error"] = str(exc)
+         failed["content_retirement_pending"] = True
+         if meter:
+-            failed["failure_settlement"] = "finalize_conservative"
+-            failed["failure_usage"] = {
+-                "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
+-            }
++            latest_operation = meter.get_operation(operation_id) or operation
++            if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
++                failed["failure_settlement"] = "finalize_evidence"
++            else:
++                failed["failure_settlement"] = "finalize_conservative"
++                failed["failure_usage"] = {
++                    "actual_cost_micro_usd": operation.reserved_cost_micro_usd,
++                }
+             failed["usage_state"] = "reserved"
+         published = repository.finish_processing(
+             user_id,
+@@ -1540,11 +1633,19 @@
+             lease_id=lease_id,
+         )
+         if published and meter:
+-            meter.finalize(
+-                operation_id,
+-                failed["failure_usage"],
+-                result_ref=preload_id,
+-            )
++            if failed["failure_settlement"] == "finalize_evidence":
++                _finalize_dispatch_evidence(
++                    meter,
++                    meter.get_operation(operation_id) or operation,
++                    result_ref=preload_id,
++                )
++            else:
++                meter.finalize(
++                    operation_id,
++                    failed["failure_usage"],
++                    result_ref=preload_id,
++                    evidence_completeness="conservative",
++                )
+             failed["status"] = "failed"
+             failed["usage_state"] = "finalized_conservative"
+             settled = repository.finish_processing(
+@@ -1584,7 +1685,15 @@
+         )
+         return
+     if meter:
+-        meter.finalize(operation_id, ready["usage_tally"], result_ref=preload_id)
++        latest_operation = meter.get_operation(operation_id) or operation
++        if latest_operation.dispatch_evidence_state in ("dispatched", "completed"):
++            _finalize_dispatch_evidence(
++                meter,
++                latest_operation,
++                result_ref=preload_id,
++            )
++        else:
++            meter.finalize(operation_id, ready["usage_tally"], result_ref=preload_id)
+         ready["status"] = "ready"
+         ready["usage_state"] = "finalized"
+         settled = repository.finish_processing(
+--- before/backend/test_usage_repository.py
++++ after/backend/test_usage_repository.py
+@@ -1035,21 +1035,25 @@
+         }
+         if condition == "#version = :expected_version":
+             return existing is not None and existing.get("version") == values[":expected_version"]
+-        if condition == "#state = :expected_state":
+-            return existing is not None and existing.get("state") == values[":expected_state"]
+-        if condition == (
+-            "#state = :expected_state AND "
+-            "(attribute_not_exists(#expires_at) OR "
+-            "#expires_at = :expected_expires_at)"
+-        ):
+-            return (
+-                existing is not None
+-                and existing.get("state") == values[":expected_state"]
+-                and (
+-                    "expires_at" not in existing
+-                    or existing.get("expires_at") == values[":expected_expires_at"]
+-                )
+-            )
++        if condition.startswith("#state = :expected_state"):
++            if existing is None or existing.get("state") != values[":expected_state"]:
++                return False
++            if (
++                ":expected_evidence_version" in values
++                and existing.get("dispatch_evidence_version")
++                != values[":expected_evidence_version"]
++            ):
++                return False
++            if "attribute_not_exists(#evidence_version)" in condition and (
++                "dispatch_evidence_version" in existing
++            ):
++                return False
++            if ":expected_expires_at" in values and (
++                "expires_at" in existing
++                and existing.get("expires_at") != values[":expected_expires_at"]
++            ):
++                return False
++            return True
+         raise AssertionError(f"Unexpected condition: {condition}")
+ 
+ 
+--- before/backend/test_usage_evidence_recovery.py
++++ after/backend/test_usage_evidence_recovery.py
+@@ -0,0 +1,618 @@
++"""Adversarial regressions for durable dispatch evidence and recovery."""
++
++from __future__ import annotations
++
++import json
++import tempfile
++import threading
++import unittest
++from concurrent.futures import ThreadPoolExecutor
++from datetime import UTC, datetime
++from pathlib import Path
++from unittest import mock
++
++from accounts.storage import JsonSubscriptionRepository
++from core.pipeline import PipelineError, UsageTally
++from core.plans import PlanLimits
++from core.usage_costs import ModelRate
++from repositories.dynamodb_billing_repositories import DynamoUsageRepository
++from repositories.usage_repository import (
++    JsonUsageRepository,
++    UsageOperationConflict,
++    UsageOperationStateError,
++    UsageResultTooLarge,
++)
++from schemas import ChatResponse
++from services.preloading import _configure_preload_dispatch_marker
++from services.synchronous_execution import (
++    SynchronousExecution,
++    _configure_synchronous_dispatch_marker,
++)
++from services.usage_meter import UsageMeter
++from storage.dynamodb_keys import usage_operation_sk, usage_result_sk, user_pk
++from storage.dynamodb_store import DOCUMENT_ATTRIBUTE
++from storage.json_list_store import write_json_list
++from test_usage_repository import NOW, _MemoryDynamoStore, reservation
++
++_USER_ID = "0190f4c0-0000-7000-8000-000000000001"
++_RATE = ModelRate("test-model", 10, 20, "rates-v1")
++_PLAN = PlanLimits("basic", 10, 10, 50, 12_000, 1_000, 200_000)
++_PRIVATE_RESPONSE = "Private provider response that must remain TTL-bound."
++
++
++def _operation_record(records: list[dict], operation_id: str) -> dict:
++    return next(
++        record
++        for record in records
++        if record.get("record_type") == "usage_operation"
++        and record.get("operation_id") == operation_id
++    )
++
++
++class _FailingMarkerJsonUsageRepository(JsonUsageRepository):
++    def save_result(self, user_id: str, operation_id: str, result: dict) -> dict:
++        if result.get("state") == "dispatching":
++            raise OSError("durable dispatch marker unavailable")
++        return super().save_result(user_id, operation_id, result)
++
++
++class JsonUsageEvidenceRecoveryTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++        directory = Path(self._temporary_directory.name)
++        self.path = directory / "usage.json"
++        self.repository = JsonUsageRepository(self.path)
++
++    def tearDown(self) -> None:
++        self._temporary_directory.cleanup()
++
++    def test_private_completed_result_expiry_preserves_measured_settlement_once(self) -> None:
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000301",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(request)
++        self.repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "chat",
++                "state": "dispatching",
++                "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++            },
++        )
++        self.repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "chat",
++                "state": "completed",
++                "response": {"reply": _PRIVATE_RESPONSE},
++                "usage": {
++                    "input_tokens": 3,
++                    "output_tokens": 2,
++                    "total_tokens": 5,
++                    "actual_cost_micro_usd": 17,
++                },
++            },
++        )
++        records = json.loads(self.path.read_text())
++        write_json_list(
++            self.path,
++            [record for record in records if record.get("record_type") != "usage_result"],
++        )
++        first_adapter = JsonUsageRepository(self.path)
++        second_adapter = JsonUsageRepository(self.path)
++        barrier = threading.Barrier(3)
++
++        def reclaim(adapter: JsonUsageRepository) -> int:
++            barrier.wait()
++            return adapter.reclaim_expired(request.user_id, NOW)
++
++        with ThreadPoolExecutor(max_workers=2) as executor:
++            futures = [
++                executor.submit(reclaim, adapter) for adapter in (first_adapter, second_adapter)
++            ]
++            barrier.wait()
++            reclaimed = [future.result(timeout=2) for future in futures]
++
++        operation = self.repository.get_operation(request.user_id, request.operation_id)
++        month = self.repository.get_month(request.user_id, request.month)
++        evidence = _operation_record(json.loads(self.path.read_text()), request.operation_id)
++        self.assertEqual(sum(reclaimed), 1)
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.actual_cost_micro_usd, 17)
++        self.assertEqual(month["committed_cost_micro_usd"], 17)
++        self.assertEqual(month["tokens"], 5)
++        self.assertEqual(evidence["dispatch_evidence_state"], "settled")
++        self.assertEqual(evidence["dispatch_usage"]["actual_cost_micro_usd"], 17)
++        self.assertNotIn("response", evidence)
++        self.assertNotIn(_PRIVATE_RESPONSE, json.dumps(evidence, sort_keys=True))
++
++    def test_new_no_dispatch_releases_but_unknown_legacy_operation_remains_reserved(self) -> None:
++        new_request = reservation(
++            "019b63f8-f600-7000-8000-000000000302",
++            chats=1,
++            expires_at=NOW,
++        )
++        legacy_request = reservation(
++            "019b63f8-f600-7000-8000-000000000303",
++            chats=1,
++            expires_at=NOW,
++        )
++        self.repository.reserve(new_request)
++        self.repository.reserve(legacy_request)
++        records = json.loads(self.path.read_text())
++        legacy_record = _operation_record(records, legacy_request.operation_id)
++        legacy_record.pop("dispatch_evidence_state", None)
++        legacy_record.pop("evidence_version", None)
++        legacy_record.pop("dispatch_evidence_version", None)
++        legacy_record.pop("kind", None)
++        legacy_record.pop("dispatch_kind", None)
++        legacy_record.pop("dispatch_usage", None)
++        write_json_list(self.path, records)
++
++        reclaimed = self.repository.reclaim_expired(_USER_ID, NOW)
++
++        self.assertEqual(reclaimed, 1)
++        self.assertEqual(
++            self.repository.get_operation(_USER_ID, new_request.operation_id).state,
++            "released",
++        )
++        self.assertEqual(
++            self.repository.get_operation(_USER_ID, legacy_request.operation_id).state,
++            "reserved",
++        )
++
++    def test_stale_dispatch_marker_cannot_downgrade_completed_evidence(self) -> None:
++        request = reservation("019b63f8-f600-7000-8000-000000000308", cost_micro_usd=13)
++        self.repository.reserve(request)
++        self.repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "chat",
++                "state": "dispatching",
++                "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++            },
++        )
++        self.repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "chat",
++                "state": "completed",
++                "response": {"reply": _PRIVATE_RESPONSE},
++                "usage": {"actual_cost_micro_usd": 17},
++            },
++        )
++
++        with self.assertRaises(UsageOperationStateError):
++            self.repository.save_result(
++                request.user_id,
++                request.operation_id,
++                {
++                    "kind": "chat",
++                    "state": "dispatching",
++                    "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++                },
++            )
++
++        operation = self.repository.get_operation(request.user_id, request.operation_id)
++        self.assertEqual(operation.dispatch_evidence_state, "completed")
++        self.assertEqual(operation.dispatch_usage["actual_cost_micro_usd"], 17)
++
++    def test_completion_and_reclaim_settle_once_under_concurrent_adapters(self) -> None:
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000309",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(request)
++        self.repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "chat",
++                "state": "dispatching",
++                "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++            },
++        )
++        completing_adapter = JsonUsageRepository(self.path)
++        reclaiming_adapter = JsonUsageRepository(self.path)
++        barrier = threading.Barrier(3)
++
++        def complete() -> Exception | None:
++            barrier.wait()
++            try:
++                completing_adapter.save_result(
++                    request.user_id,
++                    request.operation_id,
++                    {
++                        "kind": "chat",
++                        "state": "completed",
++                        "response": {"reply": _PRIVATE_RESPONSE},
++                        "usage": {"actual_cost_micro_usd": 17},
++                    },
++                )
++            except Exception as exc:  # The reclaim winner may fence the late completion.
++                return exc
++            return None
++
++        def reclaim() -> int:
++            barrier.wait()
++            return reclaiming_adapter.reclaim_expired(request.user_id, NOW)
++
++        with ThreadPoolExecutor(max_workers=2) as executor:
++            completion = executor.submit(complete)
++            reclamation = executor.submit(reclaim)
++            barrier.wait()
++            completion_error = completion.result(timeout=2)
++            reclamation_count = reclamation.result(timeout=2)
++
++        operation = self.repository.get_operation(request.user_id, request.operation_id)
++        month = self.repository.get_month(request.user_id, request.month)
++        self.assertTrue(
++            completion_error is None or isinstance(completion_error, UsageOperationStateError)
++        )
++        self.assertIn(reclamation_count, (0, 1))
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.dispatch_evidence_state, "settled")
++        self.assertIn(operation.actual_cost_micro_usd, (request.cost_micro_usd, 17))
++        self.assertEqual(month["committed_cost_micro_usd"], operation.actual_cost_micro_usd)
++        self.assertEqual(month["reserved_cost_micro_usd"], 0)
++
++    def test_private_result_write_failure_keeps_durable_measured_evidence(self) -> None:
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000310",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(request)
++        private_response = "x" * 2_000
++
++        with (
++            mock.patch.dict("os.environ", {"SYNC_RESULT_MAX_BYTES": "100"}),
++            self.assertRaises(UsageResultTooLarge),
++        ):
++            self.repository.save_result(
++                request.user_id,
++                request.operation_id,
++                {
++                    "kind": "chat",
++                    "state": "completed",
++                    "response": {"reply": private_response},
++                    "usage": {"actual_cost_micro_usd": 17},
++                },
++            )
++
++        operation = self.repository.get_operation(request.user_id, request.operation_id)
++        self.assertEqual(operation.dispatch_evidence_state, "completed")
++        self.assertEqual(operation.dispatch_usage["actual_cost_micro_usd"], 17)
++        self.assertIsNone(self.repository.get_result(request.user_id, request.operation_id))
++        self.assertEqual(self.repository.reclaim_expired(request.user_id, NOW), 1)
++        settled = self.repository.get_operation(request.user_id, request.operation_id)
++        self.assertEqual(settled.state, "finalized")
++        self.assertEqual(settled.actual_cost_micro_usd, 17)
++
++    def test_incomplete_usage_does_not_become_measured_zero_after_reclaim(self) -> None:
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000312",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(request)
++        self.repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "chat",
++                "state": "completed",
++                "response": {"reply": _PRIVATE_RESPONSE},
++                "usage": {},
++            },
++        )
++
++        self.assertEqual(self.repository.reclaim_expired(request.user_id, NOW), 1)
++
++        settled = self.repository.get_operation(request.user_id, request.operation_id)
++        self.assertEqual(settled.state, "finalized")
++        self.assertEqual(settled.dispatch_usage_completeness, "conservative")
++        self.assertEqual(settled.actual_cost_micro_usd, request.cost_micro_usd)
++        self.assertEqual(settled.tokens, 0)
++
++    def test_partial_usage_is_retained_when_conservative_reclaim_settles(self) -> None:
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000313",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(request)
++        self.repository.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "preload",
++                "state": "completed",
++                "usage": {
++                    "actual_cost_micro_usd": 17,
++                    "input_tokens": 3,
++                    "usage_complete": False,
++                },
++            },
++        )
++
++        self.assertEqual(self.repository.reclaim_expired(request.user_id, NOW), 1)
++
++        settled = self.repository.get_operation(request.user_id, request.operation_id)
++        self.assertEqual(settled.state, "finalized")
++        self.assertEqual(settled.dispatch_usage_completeness, "conservative")
++        self.assertEqual(settled.actual_cost_micro_usd, 17)
++        self.assertEqual(settled.dispatch_usage["input_tokens"], 3)
++        self.assertEqual(settled.dispatch_usage["total_tokens"], 3)
++
++    def test_arbitrary_result_kind_cannot_be_persisted_as_dispatch_evidence(self) -> None:
++        request = reservation("019b63f8-f600-7000-8000-000000000314", cost_micro_usd=13)
++        self.repository.reserve(request)
++
++        with self.assertRaises(UsageOperationConflict):
++            self.repository.save_result(
++                request.user_id,
++                request.operation_id,
++                {
++                    "kind": _PRIVATE_RESPONSE,
++                    "state": "dispatching",
++                    "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++                },
++            )
++
++        operation = self.repository.get_operation(request.user_id, request.operation_id)
++        self.assertEqual(operation.dispatch_evidence_state, "not_dispatched")
++        self.assertIsNone(operation.dispatch_kind)
++
++    def test_reclaim_and_dispatch_promotion_leave_one_terminal_outcome(self) -> None:
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000311",
++            cost_micro_usd=13,
++            expires_at=NOW,
++        )
++        self.repository.reserve(request)
++        promoting_adapter = JsonUsageRepository(self.path)
++        reclaiming_adapter = JsonUsageRepository(self.path)
++        barrier = threading.Barrier(3)
++
++        def promote() -> Exception | None:
++            barrier.wait()
++            try:
++                promoting_adapter.save_result(
++                    request.user_id,
++                    request.operation_id,
++                    {
++                        "kind": "chat",
++                        "state": "dispatching",
++                        "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++                    },
++                )
++            except Exception as exc:
++                return exc
++            return None
++
++        def reclaim() -> int:
++            barrier.wait()
++            return reclaiming_adapter.reclaim_expired(request.user_id, NOW)
++
++        with ThreadPoolExecutor(max_workers=2) as executor:
++            promotion = executor.submit(promote)
++            reclamation = executor.submit(reclaim)
++            barrier.wait()
++            promotion_error = promotion.result(timeout=2)
++            reclamation_count = reclamation.result(timeout=2)
++
++        operation = self.repository.get_operation(request.user_id, request.operation_id)
++        month = self.repository.get_month(request.user_id, request.month)
++        self.assertTrue(
++            promotion_error is None or isinstance(promotion_error, UsageOperationStateError)
++        )
++        self.assertIn(reclamation_count, (0, 1))
++        self.assertIn(operation.state, ("finalized", "released"))
++        self.assertEqual(month["reserved_cost_micro_usd"], 0)
++        if operation.state == "finalized":
++            self.assertEqual(operation.actual_cost_micro_usd, request.cost_micro_usd)
++            self.assertEqual(operation.dispatch_evidence_state, "settled")
++        else:
++            self.assertEqual(operation.dispatch_evidence_state, "not_dispatched")
++
++
++class DynamoUsageEvidenceRecoveryTests(unittest.TestCase):
++    def test_native_private_result_deletion_preserves_conservative_settlement_once(self) -> None:
++        store = _MemoryDynamoStore()
++        request = reservation(
++            "019b63f8-f600-7000-8000-000000000304",
++            cost_micro_usd=19,
++            expires_at=NOW,
++        )
++        first_adapter = DynamoUsageRepository(store)
++        second_adapter = DynamoUsageRepository(store)
++        first_adapter.reserve(request)
++        first_adapter.save_result(
++            request.user_id,
++            request.operation_id,
++            {
++                "kind": "preload",
++                "state": "dispatching",
++                "usage": {"actual_cost_micro_usd": request.cost_micro_usd},
++            },
++        )
++        store.items.pop((user_pk(request.user_id), usage_result_sk(request.operation_id)))
++        barrier = threading.Barrier(3)
++
++        def reclaim(adapter: DynamoUsageRepository) -> int:
++            barrier.wait()
++            return adapter.reclaim_expired(request.user_id, NOW)
++
++        with ThreadPoolExecutor(max_workers=2) as executor:
++            futures = [
++                executor.submit(reclaim, adapter) for adapter in (first_adapter, second_adapter)
++            ]
++            barrier.wait()
++            reclaimed = [future.result(timeout=2) for future in futures]
++
++        operation = first_adapter.get_operation(request.user_id, request.operation_id)
++        month = first_adapter.get_month(request.user_id, request.month)
++        evidence = json.loads(
++            store.items[(user_pk(request.user_id), usage_operation_sk(request.operation_id))][
++                DOCUMENT_ATTRIBUTE
++            ]
++        )
++        self.assertEqual(sum(reclaimed), 1)
++        self.assertEqual(operation.state, "finalized")
++        self.assertEqual(operation.actual_cost_micro_usd, request.cost_micro_usd)
++        self.assertEqual(month["committed_cost_micro_usd"], request.cost_micro_usd)
++        self.assertEqual(month["reserved_cost_micro_usd"], 0)
++        self.assertEqual(evidence["dispatch_evidence_state"], "settled")
++        self.assertNotIn("response", evidence)
++
++
++class SynchronousDispatchEvidenceTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary_directory = tempfile.TemporaryDirectory()
++        directory = Path(self._temporary_directory.name)
++        subscriptions = JsonSubscriptionRepository(directory / "subscriptions.json")
++        usage = _FailingMarkerJsonUsageRepository(directory / "usage.json")
++        self.meter = UsageMeter(
++            subscriptions,
++            usage,
++            _USER_ID,
++            rate=_RATE,
++            now=datetime.now(UTC),
++            plan_loader=lambda _plan_id: _PLAN,
++            reservation_enabled=True,
++        )
++        self.operation = self.meter.reserve(
++            "019b63f8-f600-7000-8000-000000000305",
++            "dispatch-marker-failure",
++            "chat",
++            11,
++        )
++
++    def tearDown(self) -> None:
++        self._temporary_directory.cleanup()
++
++    def test_marker_write_failure_prevents_synchronous_provider_dispatch(self) -> None:
++        execution = SynchronousExecution(
++            self.meter,
++            self.operation,
++            kind="chat",
++            response_model=ChatResponse,
++        )
++        provider = mock.Mock()
++        tally = UsageTally(rate=_RATE)
++
++        def dispatch() -> None:
++            tally.mark_dispatch_attempt()
++            provider()
++
++        with execution:
++            with self.assertRaisesRegex(OSError, "dispatch marker"):
++                execution.run(tally, dispatch, lambda value: ChatResponse(reply=value))
++
++        provider.assert_not_called()
++
++    def test_marker_write_failure_prevents_preload_provider_dispatch(self) -> None:
++        provider = mock.Mock()
++        tally = UsageTally(rate=_RATE)
++        _configure_preload_dispatch_marker(self.meter, self.operation, tally)
++
++        def dispatch() -> None:
++            tally.mark_dispatch_attempt()
++            provider()
++
++        with self.assertRaisesRegex(OSError, "dispatch marker"):
++            dispatch()
++
++        provider.assert_not_called()
++
++    def test_private_result_expiry_blocks_synchronous_redispatch_before_reclaim(self) -> None:
++        directory = Path(self._temporary_directory.name)
++        usage = JsonUsageRepository(directory / "retry-usage.json")
++        meter = UsageMeter(
++            JsonSubscriptionRepository(directory / "retry-subscriptions.json"),
++            usage,
++            _USER_ID,
++            rate=_RATE,
++            now=datetime.now(UTC),
++            plan_loader=lambda _plan_id: _PLAN,
++            reservation_enabled=True,
++        )
++        operation = meter.reserve(
++            "019b63f8-f600-7000-8000-000000000306",
++            "private-result-expiry",
++            "chat",
++            11,
++        )
++        meter.save_result(
++            operation.operation_id,
++            {
++                "kind": "chat",
++                "state": "dispatching",
++                "usage": {"actual_cost_micro_usd": operation.reserved_cost_micro_usd},
++            },
++        )
++        records = json.loads((directory / "retry-usage.json").read_text())
++        write_json_list(
++            directory / "retry-usage.json",
++            [record for record in records if record.get("record_type") != "usage_result"],
++        )
++        execution = SynchronousExecution(
++            meter,
++            meter.get_operation(operation.operation_id),
++            kind="chat",
++            response_model=ChatResponse,
++        )
++        provider = mock.Mock(return_value="must not dispatch")
++
++        with self.assertRaises(PipelineError):
++            with execution:
++                execution.run(
++                    UsageTally(rate=_RATE),
++                    provider,
++                    lambda reply: ChatResponse(reply=reply),
++                )
++
++        provider.assert_not_called()
++
++    def test_configured_marker_authorizes_only_the_current_execution(self) -> None:
++        directory = Path(self._temporary_directory.name)
++        meter = UsageMeter(
++            JsonSubscriptionRepository(directory / "marker-subscriptions.json"),
++            JsonUsageRepository(directory / "marker-usage.json"),
++            _USER_ID,
++            rate=_RATE,
++            now=datetime.now(UTC),
++            plan_loader=lambda _plan_id: _PLAN,
++            reservation_enabled=True,
++        )
++        operation = meter.reserve(
++            "019b63f8-f600-7000-8000-000000000307",
++            "same-execution-marker",
++            "chat",
++            11,
++        )
++        current_execution = UsageTally(rate=_RATE)
++        _configure_synchronous_dispatch_marker(current_execution, meter, operation, "chat")
++
++        current_execution.mark_dispatch_attempt()
++        current_execution.mark_dispatch_attempt()
++
++        new_execution = UsageTally(rate=_RATE)
++        _configure_synchronous_dispatch_marker(new_execution, meter, operation, "chat")
++        with self.assertRaises(UsageOperationStateError):
++            new_execution.mark_dispatch_attempt()
++
++        self.assertTrue(current_execution.any_dispatch_attempted)
++        self.assertFalse(new_execution.any_dispatch_attempted)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,18 @@
+properties:
+  id:
+    type: string
+    title: Id
+    description: Opaque compatibility identifier; examples use UUID v7.
+    x-id-compatibility: legacy-string-or-uuid
+  email:
+    type: string
+    title: Email
+  display_name:
+    type: string
+    title: Display Name
+type: object
+required:
+- id
+- email
+- display_name
+title: User

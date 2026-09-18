@@ -1,0 +1,129 @@
+diff --git a/docs/tasks/review-remediation/evidence/RM-09/C-runtime-02/source/backend/accounts/services/billing_flow.py b/docs/tasks/review-remediation/evidence/RM-09/C-runtime-03/source/backend/accounts/services/billing_flow.py
+index 542c4c1..10ff191 100644
+--- a/docs/tasks/review-remediation/evidence/RM-09/C-runtime-02/source/backend/accounts/services/billing_flow.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-runtime-03/source/backend/accounts/services/billing_flow.py
+@@ -560,16 +560,47 @@ def start_checkout(
+         stored_session = _session_from_pending(current_pending)
+         if stored_session is not None:
+             return stored_session
+-        attempted_pending = {
+-            **current_pending,
+-            "state": "attempted",
+-            "creation_attempted_at": current_pending.get("creation_attempted_at") or _now_epoch(),
+-        }
+-        if provider_mode == "mock":
+-            attempted_pending["activation_fence_revision"] = _record_revision(current) + 1
+-        persisted = _persist_pending(subscription_repository, user.id, current, attempted_pending)
+-        if persisted is None:
+-            continue
++        existing_activation_fence = current_pending.get("activation_fence_revision")
++        if (
++            provider_mode == "mock"
++            and current_pending.get("state") == "attempted"
++            and isinstance(existing_activation_fence, int)
++            and not isinstance(existing_activation_fence, bool)
++        ):
++            if (
++                _record_revision(current) != existing_activation_fence
++                and current.get("status") in _TERMINAL_SUBSCRIPTION_STATUSES
++            ):
++                operation_id = current_pending.get("operation_id")
++                if not isinstance(operation_id, str) or not operation_id:
++                    raise _safe_checkout_conflict(
++                        "Canceled mock checkout lacks an operation identity."
++                    )
++                _terminalize_pending_checkout(
++                    subscription_repository,
++                    user.id,
++                    current,
++                    current_pending,
++                    expected_operation_id=operation_id,
++                )
++                raise _safe_checkout_conflict(
++                    "Checkout was canceled before mock activation completed."
++                )
++            attempted_pending = current_pending
++        else:
++            attempted_pending = {
++                **current_pending,
++                "state": "attempted",
++                "creation_attempted_at": current_pending.get("creation_attempted_at")
++                or _now_epoch(),
++            }
++            if provider_mode == "mock":
++                attempted_pending["activation_fence_revision"] = _record_revision(current) + 1
++            persisted = _persist_pending(
++                subscription_repository, user.id, current, attempted_pending
++            )
++            if persisted is None:
++                continue
+ 
+         # Provider I/O is deliberately outside repository locks. Every retry
+         # carries the durable operation identity and identical parameters.
+diff --git a/docs/tasks/review-remediation/evidence/RM-09/C-runtime-02/source/backend/test_accounts.py b/docs/tasks/review-remediation/evidence/RM-09/C-runtime-03/source/backend/test_accounts.py
+index d734fdd..cb290f3 100644
+--- a/docs/tasks/review-remediation/evidence/RM-09/C-runtime-02/source/backend/test_accounts.py
++++ b/docs/tasks/review-remediation/evidence/RM-09/C-runtime-03/source/backend/test_accounts.py
+@@ -385,6 +385,62 @@ class CheckoutTests(unittest.TestCase):
+         self.assertNotEqual(replacement["pending_checkout"]["operation_id"], stale_operation)
+         self.assertEqual(replacement["pending_checkout"]["state"], "activated")
+ 
++    def test_cancellation_before_mock_result_persistence_never_replays_the_old_operation(self):
++        class _CancelBeforeCompletionRepository(InMemorySubscriptionRepository):
++            def __init__(self):
++                super().__init__()
++                self.canceled = False
++
++            def compare_and_swap(self, user_id, record, *, expected_revision):
++                pending = record.get("pending_checkout")
++                if (
++                    not self.canceled
++                    and isinstance(pending, dict)
++                    and pending.get("state") == "created"
++                ):
++                    self.canceled = True
++                    current = self.get(user_id) or {}
++                    super().compare_and_swap(
++                        user_id,
++                        {**current, "status": "canceled"},
++                        expected_revision=current["revision"],
++                    )
++                    return None
++                return super().compare_and_swap(
++                    user_id,
++                    record,
++                    expected_revision=expected_revision,
++                )
++
++        class _CountingMockProvider(MockBillingProvider):
++            def __init__(self):
++                super().__init__(PLANS)
++                self.calls = 0
++
++            def create_checkout_session(self, user, plan_id, **kwargs):
++                self.calls += 1
++                return super().create_checkout_session(user, plan_id, **kwargs)
++
++        repository = _CancelBeforeCompletionRepository()
++        provider = _CountingMockProvider()
++        accounts = build_test_accounts(
++            plans=PLANS,
++            auth_service=InMemoryAuthService(),
++            subscription_repository=repository,
++            billing_provider=provider,
++        )
++        user = accounts.login("mock:before-completion-cancel@example.com").user
++
++        with self.assertRaises(BillingError) as caught:
++            accounts.start_checkout(user, "pro")
++
++        record = repository.get(user.id)
++        self.assertEqual(caught.exception.status_code, 409)
++        self.assertTrue(repository.canceled)
++        self.assertEqual(provider.calls, 1)
++        self.assertEqual(record["pending_checkout"]["state"], "terminal")
++        self.assertNotIn("entitlement_provider", record)
++
+     def test_mock_checkout_evidence_cannot_be_reused_after_a_stripe_mode_switch(self):
+         self.accounts.start_checkout(self.user, "pro")
+         stripe_accounts = build_test_accounts(

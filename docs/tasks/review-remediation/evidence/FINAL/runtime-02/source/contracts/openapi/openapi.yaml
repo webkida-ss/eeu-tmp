@@ -1,0 +1,55 @@
+openapi: 3.1.0
+info:
+  title: Untangle API
+  version: 1.0.0
+  description: Canonical HTTP contract for the Untangle browser extension backend.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+- url: http://127.0.0.1:18765
+  description: Local development
+paths:
+  /admin/v1/session:
+    $ref: ./paths/admin-session.yaml
+  /analyze:
+    $ref: ./paths/01-analyze.yaml
+  /auth/config:
+    $ref: ./paths/02-auth-config.yaml
+  /auth/login:
+    $ref: ./paths/03-auth-login.yaml
+  /auth/logout:
+    $ref: ./paths/04-auth-logout.yaml
+  /auth/me:
+    $ref: ./paths/05-auth-me.yaml
+  /billing/checkout:
+    $ref: ./paths/06-billing-checkout.yaml
+  /billing/done:
+    $ref: ./paths/07-billing-done.yaml
+  /billing/me:
+    $ref: ./paths/08-billing-me.yaml
+  /billing/portal:
+    $ref: ./paths/09-billing-portal.yaml
+  /billing/webhook:
+    $ref: ./paths/10-billing-webhook.yaml
+  /chat:
+    $ref: ./paths/11-chat.yaml
+  /health:
+    $ref: ./paths/12-health.yaml
+  /pages/preload:
+    $ref: ./paths/13-pages-preload.yaml
+  /phrases:
+    $ref: ./paths/14-phrases.yaml
+  /vocabulary:
+    $ref: ./paths/15-vocabulary.yaml
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-session
+    stripeSignature:
+      type: apiKey
+      in: header
+      name: Stripe-Signature
+      description: Stripe-compatible signature over the exact raw request bytes.

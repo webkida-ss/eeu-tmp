@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Untangle</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="panel-ui.css" />
+    <link rel="stylesheet" href="reading-panel.css" />
+  </head>
+  <body>
+    <main class="panel-ui view-settings">
+      <header>
+        <div class="panel-header-row">
+          <h1>Untangle</h1>
+          <button
+            id="darkModeToggle"
+            class="theme-toggle-button"
+            type="button"
+            aria-pressed="false"
+          ></button>
+          <nav class="side-panel-view-switch" role="tablist" aria-label="Side panel view">
+            <button
+              id="settingsViewButton"
+              class="side-panel-view-button side-panel-view-active"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              data-view="settings"
+              data-i18n="tabSettings"
+            >
+              設定
+            </button>
+            <button
+              id="readingViewButton"
+              class="side-panel-view-button"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-view="reading"
+              disabled
+              data-i18n="tabReadingView"
+            >
+              解説
+            </button>
+            <button
+              id="vocabBookViewButton"
+              class="side-panel-view-button"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-view="vocab"
+              disabled
+              data-i18n="tabVocabBook"
+            >
+              単語帳
+            </button>
+          </nav>
+        </div>
+      </header>
+
+      <div id="settingsView">
+        <section class="auth-panel">
+          <div class="auth-copy">
+            <strong data-i18n="authSectionTitle">ログイン</strong>
+            <small data-i18n="authSectionDesc"
+              >学習レベル・事前読み込み・解説など、すべての機能にログインが必要です。</small
+            >
+          </div>
+          <div id="authLoggedOut">
+            <!-- Filled by the sign-in method the server names; see
+               signin-methods.js. Nothing provider-specific lives here. -->
+            <div id="signInRoot"></div>
+          </div>
+          <div id="authLoggedIn" hidden>
+            <p id="authUserSummary" class="auth-summary" aria-live="polite"></p>
+            <button
+              id="logoutButton"
+              class="preload-button preload-button-secondary"
+              type="button"
+              data-i18n="authLogoutBtn"
+            >
+              ログアウト
+            </button>
+          </div>
+          <p id="authStatus" class="auth-status" aria-live="polite"></p>
+        </section>
+
+        <div id="authenticatedFeatures" class="authenticated-features features-locked">
+          <p id="loginRequiredBanner" class="login-required-banner" data-i18n="loginRequiredBanner">
+            ログイン後に利用できます。
+          </p>
+
+          <section class="learner-panel">
+            <label class="toggle-row">
+              <span>
+                <strong data-i18n="selectionAnalysisTitle">テキスト選択で解析</strong>
+                <small data-i18n="selectionAnalysisDesc"
+                  >ONにすると、ページ上でテキストを選択（ダブルクリックの単語選択も含む）するたびに自動でAI解析ポップアップが表示されます。OFFでも、事前読み込み済みの文をクリックすれば解説は開けます。</small
+                >
+              </span>
+              <input id="selectionAnalysisToggle" type="checkbox" />
+            </label>
+            <p id="selectionAnalysisStatus" class="learner-summary" aria-live="polite"></p>
+          </section>
+
+          <section class="learner-panel">
+            <div class="learner-copy">
+              <strong data-i18n="langSectionTitle">言語設定</strong>
+              <small data-i18n="langSectionDesc"
+                >学習する言語と、解説に使う言語を選びます。変更は次回の事前読み込みから反映されます。</small
+              >
+            </div>
+            <label class="field learner-field">
+              <span data-i18n="langTargetLabel">学習する言語</span>
+              <select id="targetLanguageSelect" class="era-select" disabled></select>
+            </label>
+            <label class="field learner-field">
+              <span data-i18n="langNativeLabel">解説の言語</span>
+              <select id="nativeLanguageSelect" class="era-select" disabled></select>
+            </label>
+            <p id="languageSummary" class="learner-summary" aria-live="polite"></p>
+          </section>
+
+          <section class="learner-panel">
+            <div class="learner-copy">
+              <strong data-i18n="learnerSectionTitle">学習レベル</strong>
+              <small data-i18n="learnerSectionDesc"
+                >このレベルより易しい語彙は抽出しません。変更後は再読み込みが必要です。</small
+              >
+            </div>
+            <label class="field learner-field">
+              <span data-i18n="learnerPresetLabel">目安レベル</span>
+              <select id="learnerLevelPreset" class="era-select" disabled></select>
+            </label>
+            <label class="field learner-field">
+              <span data-i18n="learnerNotesLabel">補足（任意）</span>
+              <textarea
+                id="learnerLevelNotes"
+                rows="3"
+                disabled
+                data-i18n-placeholder="learnerNotesPlaceholder"
+                placeholder="例: 仕事の文書はまだ不安。ニュース記事向け。"
+              ></textarea>
+            </label>
+            <p id="learnerLevelSummary" class="learner-summary" aria-live="polite"></p>
+          </section>
+
+          <section class="learner-panel">
+            <div class="learner-copy">
+              <strong data-i18n="customPromptsTitle">追加質問のカスタムボタン</strong>
+              <small data-i18n="customPromptsDesc"
+                >よく使う質問をボタンとして登録できます。文・単語・選択の追加質問に表示されます。</small
+              >
+            </div>
+            <ul id="customPromptsList" class="custom-prompts-list"></ul>
+            <label class="field learner-field">
+              <span data-i18n="customPromptNameLabel">ボタン名</span>
+              <input
+                id="customPromptName"
+                type="text"
+                maxlength="40"
+                data-i18n-placeholder="customPromptNamePlaceholder"
+                placeholder="例: 語源を教えて"
+              />
+            </label>
+            <label class="field learner-field">
+              <span data-i18n="customPromptBodyLabel">プロンプト本文</span>
+              <textarea
+                id="customPromptBody"
+                rows="3"
+                data-i18n-placeholder="customPromptBodyPlaceholder"
+                placeholder="例: この語の語源と成り立ちを日本語で説明してください。"
+              ></textarea>
+            </label>
+            <div class="custom-prompts-form-actions">
+              <button
+                id="customPromptAddButton"
+                type="button"
+                class="preload-button"
+                data-i18n="customPromptAdd"
+              >
+                追加
+              </button>
+              <button
+                id="customPromptCancelButton"
+                type="button"
+                class="preload-button preload-button-secondary"
+                hidden
+                data-i18n="customPromptCancel"
+              >
+                キャンセル
+              </button>
+            </div>
+            <p id="customPromptStatus" class="learner-summary" aria-live="polite"></p>
+          </section>
+
+          <section class="preload-panel">
+            <div class="preload-copy">
+              <strong data-i18n="preloadSectionTitle">ページ事前読み込み</strong>
+              <small data-i18n="preloadSectionDesc"
+                >ページHTMLをサーバに送り、本文抽出・文分割・解析を行います。完了後、このサイドパネルに解説が表示され、ページ本文と連動します。</small
+              >
+            </div>
+            <button
+              id="preloadButton"
+              class="preload-button"
+              type="button"
+              disabled
+              data-i18n="preloadBtnStart"
+            >
+              事前読み込みを開始
+            </button>
+            <div id="preloadConfirm" class="preload-confirm" hidden>
+              <p id="preloadConfirmMessage"></p>
+              <div class="preload-confirm-actions">
+                <button
+                  id="preloadConfirmButton"
+                  class="preload-button"
+                  type="button"
+                  data-i18n="confirmOverwriteBtn"
+                >
+                  上書きして再解析
+                </button>
+                <button
+                  id="preloadCancelButton"
+                  class="preload-button preload-button-secondary"
+                  type="button"
+                  data-i18n="confirmCancelBtn"
+                >
+                  キャンセル
+                </button>
+              </div>
+            </div>
+            <p
+              id="preloadStatus"
+              class="preload-status"
+              aria-live="polite"
+              data-i18n="statusPreloadLoginRequired"
+            >
+              ログインすると事前読み込みできます。
+            </p>
+          </section>
+
+          <section class="billing-panel">
+            <div class="learner-copy">
+              <strong data-i18n="billingSectionTitle">プラン</strong>
+              <small data-i18n="billingSectionDesc"
+                >解析とチャットの月間利用量はプランで決まります。</small
+              >
+            </div>
+            <p
+              id="billingSummary"
+              class="billing-summary"
+              aria-live="polite"
+              aria-atomic="true"
+            ></p>
+            <p
+              id="billingWarning"
+              class="billing-warning"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              hidden
+            ></p>
+            <div class="billing-actions">
+              <button
+                id="billingUpgradeProButton"
+                class="preload-button"
+                type="button"
+                hidden
+                data-i18n="billingUpgradePro"
+              >
+                proにアップグレード
+              </button>
+              <button
+                id="billingUpgradeMaxButton"
+                class="preload-button"
+                type="button"
+                hidden
+                data-i18n="billingUpgradeMax"
+              >
+                maxにアップグレード
+              </button>
+              <button
+                id="billingPortalButton"
+                class="preload-button preload-button-secondary"
+                type="button"
+                hidden
+                data-i18n="billingManage"
+              >
+                契約を管理
+              </button>
+            </div>
+            <p id="billingStatus" class="preload-status" aria-live="polite"></p>
+          </section>
+        </div>
+      </div>
+
+      <div id="readingView">
+        <div id="readingEmptyState" class="reading-empty">
+          <p id="readingEmptyMessage" data-i18n="readingEmptyLogin">
+            ログインして事前読み込みを完了すると、文の解説をここで読めます。
+          </p>
+          <button
+            id="goToPreloadButton"
+            class="preload-button preload-button-secondary"
+            type="button"
+            data-i18n="btnGoToSettings"
+          >
+            設定で読み込む
+          </button>
+        </div>
+        <section
+          id="readingPanelRoot"
+          class="reading-panel-section"
+          hidden
+          aria-label="Reading explanation panel"
+        ></section>
+      </div>
+
+      <div id="vocabBookView">
+        <p id="vocabBookStatus" class="vocab-book-status" aria-live="polite"></p>
+        <div id="vocabBookList" class="vocab-book-list"></div>
+      </div>
+
+      <p id="status" class="status" aria-live="polite"></p>
+      <script src="settings.js"></script>
+      <script src="i18n.js"></script>
+      <script src="shared.js"></script>
+      <script src="signin-methods.js"></script>
+      <script src="reading-panel.js"></script>
+      <script src="panel-ui.js"></script>
+      <script src="select-ui.js"></script>
+    </main>
+  </body>
+</html>

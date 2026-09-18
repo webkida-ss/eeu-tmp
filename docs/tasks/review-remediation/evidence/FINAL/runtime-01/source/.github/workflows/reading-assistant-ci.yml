@@ -1,0 +1,273 @@
+name: Reading Assistant CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      trusted_base_sha:
+        description: Maintainer-approved non-zero prior commit SHA
+        required: true
+        type: string
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reading-assistant-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Filter paths
+        id: filter
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+        with:
+          filters: |
+            infra:
+              - "infra/**"
+              - "Taskfile.yaml"
+              - "mise.toml"
+              - "scripts/bootstrap.sh"
+              - "scripts/check_terraform_locks.sh"
+              - ".github/workflows/reading-assistant-ci.yml"
+
+  agent-config:
+    name: Agent configuration drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bootstrap managed tools
+        run: ./scripts/bootstrap.sh
+
+      - name: Install agent dependencies
+        run: ./scripts/bootstrap.sh --exec task setup:agents
+
+      - name: Audit locked agent dependencies
+        run: ./scripts/bootstrap.sh --exec task deps:agents:audit
+
+      - name: Verify generated agent configuration
+        run: |
+          ./scripts/bootstrap.sh --exec task agents:check
+          ./scripts/bootstrap.sh --exec task test:agents
+
+  backend-test:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local@sha256:d89f8fcc6b1a39cb35976c248ed42a28c66ae00dc043099210f5571e42648ab4
+        ports:
+          - 8000:8000
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Bootstrap managed tools
+        working-directory: .
+        run: ./scripts/bootstrap.sh
+
+      - name: Install backend dependencies
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task setup:backend
+
+      - name: Install schema tooling
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task setup:extension
+
+      - name: Verify backend dependency locks
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task deps:backend:check
+
+      - name: Check backend formatting and lint
+        working-directory: .
+        run: |
+          ./scripts/bootstrap.sh --exec task format:backend:check
+          ./scripts/bootstrap.sh --exec task lint:backend
+
+      - name: Select compatibility baseline
+        working-directory: .
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MANUAL_BASE_SHA: ${{ inputs.trusted_base_sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            baseline="${MANUAL_BASE_SHA}"
+            echo "Using maintainer-approved manual compatibility baseline."
+          elif [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            baseline="${PR_BASE_SHA}"
+          else
+            baseline="${BEFORE_SHA}"
+          fi
+          if [[ ! "${baseline}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid compatibility baseline for ${EVENT_NAME}: ${baseline}" >&2
+            exit 1
+          fi
+          if [[ "${baseline}" == "0000000000000000000000000000000000000000" ]]; then
+            echo "Initial push has no prior compatibility baseline."
+          fi
+          echo "SCHEMA_BASE_SHA=${baseline}" >> "${GITHUB_ENV}"
+          echo "SCHEMA_BASE_REF=${baseline}" >> "${GITHUB_ENV}"
+
+      - name: Verify canonical API schema
+        id: schema
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task api:check
+
+      - name: Upload schema reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: schema-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/schema/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Build and validate Lambda package
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task build:lambda
+
+      - name: Upload Lambda package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reading-assistant-lambda-${{ github.run_id }}-${{ github.run_attempt }}
+          path: backend/dist/reading-assistant-lambda.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Run DynamoDB integration tests
+        working-directory: .
+        env:
+          DYNAMODB_INTEGRATION_ENDPOINT: http://localhost:8000
+        run: ./scripts/bootstrap.sh --exec task test:backend:integration
+
+      - name: Run pytest with coverage
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task test:backend:coverage
+
+      - name: Test admin-enabled contracts and learner compatibility
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task test:backend:admin
+
+      - name: Test release package dependency closure
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task test:extension:package
+
+      - name: Upload backend coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: backend-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/coverage/backend/
+          if-no-files-found: warn
+          retention-days: 14
+
+  extension-test:
+    name: Extension tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bootstrap managed tools
+        working-directory: .
+        run: ./scripts/bootstrap.sh
+
+      - name: Install extension dependencies
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task setup:extension
+
+      - name: Audit extension dependencies
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task deps:extension:audit
+
+      - name: Check extension formatting and lint
+        working-directory: .
+        run: |
+          ./scripts/bootstrap.sh --exec task format:extension:check
+          ./scripts/bootstrap.sh --exec task lint:extension
+
+      - name: Run unit tests with coverage
+        # The Playwright smoke test (test/smoke.mjs) is intentionally not run
+        # in CI: it needs a Chrome for Testing build to load the unpacked
+        # extension. Candidate for a future nightly workflow.
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task test:extension:coverage
+
+      - name: Verify static automation contracts
+        working-directory: .
+        run: ./scripts/bootstrap.sh --exec task test:extension:automation:static
+
+      - name: Upload extension coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extension-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/coverage/extension/
+          if-no-files-found: warn
+          retention-days: 14
+
+  secrets-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bootstrap managed tools
+        run: ./scripts/bootstrap.sh
+
+      - name: Scan tracked files for secrets
+        run: ./scripts/bootstrap.sh --exec task secrets:check
+
+  terraform-validate:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bootstrap managed tools
+        run: ./scripts/bootstrap.sh
+
+      - name: Verify Terraform provider locks
+        run: ./scripts/bootstrap.sh --exec task infra:lock:check
+
+      - name: Validate Terraform
+        run: ./scripts/bootstrap.sh --exec task infra:validate

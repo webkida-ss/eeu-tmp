@@ -1,0 +1,14 @@
+---
+paths:
+  - '**/*'
+---
+# Data Model Type Definitions
+
+## Entity IDs
+
+Use UUID v7 as the default identifier format for domain entities and persisted data models.
+
+- Name primary identifier fields consistently as `id`.
+- Treat IDs as opaque values. Do not encode business meaning into ID strings.
+- Do not use incremental numeric IDs for domain entities unless an external system requires them.
+- Keep ID types consistent across API schemas, backend models, frontend models, mock data, fixtures, and tests.

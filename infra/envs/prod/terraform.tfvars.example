@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars and fill in real values. Do not commit terraform.tfvars.
+#
+# Prod is pinned to auth_provider = "google" and billing_provider = "stripe"
+# in main.tf; the mock providers cannot be enabled here.
+
+google_oauth_client_id = "replace-with-google-oauth-client-id.apps.googleusercontent.com"
+alert_email            = "you@example.com"
+
+stripe_price_id_pro = "price_replace_pro"
+stripe_price_id_max = "price_replace_max"
+
+# Non-secret app tuning. API_BASE_URL is only known after the first apply
+# (it is the api_endpoint output); set it and re-apply so Stripe redirect
+# URLs point at the deployed API.
+app_extra_environment = {
+  # API_BASE_URL  = "https://xxxxxxxxxx.execute-api.ap-northeast-1.amazonaws.com"
+  # OPENAI_MODEL  = "gpt-5.4-mini"
+  # MAX_SENTENCES = "200"
+}
+
+# lambda_zip_path defaults to
+# ../../../backend/dist/reading-assistant-lambda.zip

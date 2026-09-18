@@ -1,0 +1,53 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /extension
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 2
+    groups:
+      extension-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Dependabot cannot run the repository's hash-checked pip-compile workflow.
+  # Maintainers must regenerate and verify all Python locks with the canonical
+  # Taskfile commands documented in CONTRIBUTING.md.
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:20"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 2
+    groups:
+      backend-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:40"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 2
+    groups:
+      workflow-actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

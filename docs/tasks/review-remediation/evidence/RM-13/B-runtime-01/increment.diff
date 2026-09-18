@@ -1,0 +1,379 @@
+diff --git a/private/tmp/untangle-remediation-20260914/rm13-base/backend/accounts/storage/json_auth.py b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/accounts/storage/json_auth.py
+index 4f7c5a6..4d8957f 100644
+--- a/private/tmp/untangle-remediation-20260914/rm13-base/backend/accounts/storage/json_auth.py
++++ b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/accounts/storage/json_auth.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import secrets
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+@@ -11,7 +12,7 @@ from core.ids import generate_uuid7
+ 
+ from accounts.models import User
+ from accounts.settings import DEFAULT_SESSION_TTL_DAYS
+-from accounts.storage.json_store import read_json_list, write_json_list
++from accounts.storage.json_store import json_list_lock, read_json_list, write_json_list
+ 
+ 
+ def _normalize_email(email: str) -> str:
+@@ -26,7 +27,7 @@ class JsonEmailAuthService:
+         session_ttl_days: int = DEFAULT_SESSION_TTL_DAYS,
+     ) -> None:
+         self._users_path = users_path
+-        self._sessions_path = sessions_path
++        self._sessions_path = sessions_path.resolve()
+         self._session_ttl = timedelta(days=session_ttl_days)
+ 
+     def login(self, *, email: str, display_name: str | None = None) -> tuple[str, User]:
+@@ -89,38 +90,38 @@ class JsonEmailAuthService:
+         if not token:
+             return
+ 
+-        sessions = read_json_list(self._sessions_path)
+-        sessions = [item for item in sessions if item.get("token") != token]
+-        write_json_list(self._sessions_path, sessions)
++        with json_list_lock(self._sessions_path):
++            sessions = self._read_sessions_unlocked()
++            retained = [item for item in sessions if item.get("token") != token]
++            if len(retained) != len(sessions):
++                write_json_list(self._sessions_path, retained)
+ 
+     def _create_session(self, user_id: str) -> str:
+         token = secrets.token_urlsafe(32)
+         now = datetime.now(UTC)
+-        sessions = self._read_active_sessions()
+-        sessions.append(
+-            {
+-                "token": token,
+-                "user_id": user_id,
+-                "created_at": now.isoformat(),
+-                "expires_at": (now + self._session_ttl).isoformat(),
+-            }
+-        )
+-        write_json_list(self._sessions_path, sessions)
++        with json_list_lock(self._sessions_path):
++            sessions = self._read_active_sessions_unlocked(now)
++            sessions.append(
++                {
++                    "token": token,
++                    "user_id": user_id,
++                    "created_at": now.isoformat(),
++                    "expires_at": (now + self._session_ttl).isoformat(),
++                }
++            )
++            write_json_list(self._sessions_path, sessions)
+         return token
+ 
+     def _read_active_sessions(self) -> list[dict[str, Any]]:
+-        now = datetime.now(UTC)
+-        sessions = read_json_list(self._sessions_path)
++        with json_list_lock(self._sessions_path):
++            return self._read_active_sessions_unlocked(datetime.now(UTC))
++
++    def _read_active_sessions_unlocked(self, now: datetime) -> list[dict[str, Any]]:
++        sessions = self._read_sessions_unlocked()
+         active_sessions: list[dict[str, Any]] = []
+ 
+         for session in sessions:
+-            expires_at_raw = session.get("expires_at")
+-            if not isinstance(expires_at_raw, str):
+-                continue
+-            try:
+-                expires_at = datetime.fromisoformat(expires_at_raw)
+-            except ValueError:
+-                continue
++            expires_at = _session_expiry(session)
+             if expires_at.tzinfo is None:
+                 expires_at = expires_at.replace(tzinfo=UTC)
+             if expires_at >= now:
+@@ -130,3 +131,33 @@ class JsonEmailAuthService:
+             write_json_list(self._sessions_path, active_sessions)
+ 
+         return active_sessions
++
++    def _read_sessions_unlocked(self) -> list[dict[str, Any]]:
++        if not self._sessions_path.exists():
++            return []
++        try:
++            with self._sessions_path.open(encoding="utf-8") as handle:
++                raw = json.load(handle)
++        except (OSError, json.JSONDecodeError) as exc:
++            raise ValueError("Session document is corrupt") from exc
++        if not isinstance(raw, list) or not all(isinstance(session, dict) for session in raw):
++            raise ValueError("Session document must be a list of objects")
++        for session in raw:
++            _session_expiry(session)
++        return raw
++
++
++def _session_expiry(session: dict[str, Any]) -> datetime:
++    token = session.get("token")
++    user_id = session.get("user_id")
++    expires_at_raw = session.get("expires_at")
++    if not isinstance(token, str) or not token:
++        raise ValueError("Session document has an invalid token")
++    if not isinstance(user_id, str) or not user_id:
++        raise ValueError("Session document has an invalid user ID")
++    if not isinstance(expires_at_raw, str):
++        raise ValueError("Session document has an invalid expiry")
++    try:
++        return datetime.fromisoformat(expires_at_raw)
++    except ValueError as exc:
++        raise ValueError("Session document has an invalid expiry") from exc
+diff --git a/private/tmp/untangle-remediation-20260914/rm13-base/backend/repositories/json_session_repository.py b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/repositories/json_session_repository.py
+index d893914..b60c31d 100644
+--- a/private/tmp/untangle-remediation-20260914/rm13-base/backend/repositories/json_session_repository.py
++++ b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/repositories/json_session_repository.py
+@@ -1,7 +1,6 @@
+ from __future__ import annotations
+ 
+ import json
+-import threading
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -9,13 +8,8 @@ from storage.json_list_store import json_list_lock, write_json_list
+ 
+ 
+ class JsonSessionRepository:
+-    _locks_guard = threading.Lock()
+-    _locks: dict[str, threading.RLock] = {}
+-
+     def __init__(self, path: Path) -> None:
+-        self._path = path
+-        with self._locks_guard:
+-            self._lock = self._locks.setdefault(str(path.resolve()), threading.RLock())
++        self._path = path.resolve()
+ 
+     def _read_sessions(self) -> list[dict[str, Any]]:
+         if not self._path.exists():
+@@ -31,11 +25,11 @@ class JsonSessionRepository:
+ 
+     @property
+     def sessions(self) -> list[dict[str, Any]]:
+-        with self._lock, json_list_lock(self._path):
++        with json_list_lock(self._path):
+             return self._read_sessions()
+ 
+     def revoke_all(self, user_id: str) -> int:
+-        with self._lock, json_list_lock(self._path):
++        with json_list_lock(self._path):
+             sessions = self._read_sessions()
+             retained = [session for session in sessions if session.get("user_id") != user_id]
+             removed = len(sessions) - len(retained)
+diff --git a/private/tmp/untangle-remediation-20260914/rm13-base/backend/test_session_repository.py b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/test_session_repository.py
+index 5e4acf1..4fd2c3d 100644
+--- a/private/tmp/untangle-remediation-20260914/rm13-base/backend/test_session_repository.py
++++ b/docs/tasks/review-remediation/evidence/RM-13/B-runtime-01/source/backend/test_session_repository.py
+@@ -2,11 +2,46 @@ from __future__ import annotations
+ 
+ import json
+ import tempfile
++import threading
+ import unittest
++from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+ 
++from accounts.storage import JsonEmailAuthService
++from repositories.json_admin_account_control import JsonAdminAccountControlRepository
+ from repositories.json_session_repository import JsonSessionRepository
+ from repositories.memory_session_repository import MemorySessionRepository
++from services.admin_accounts import AdminAccounts
++
++
++class PausingJsonEmailAuthService(JsonEmailAuthService):
++    def __init__(
++        self,
++        *args,
++        sessions_read: threading.Event,
++        continue_sessions_read: threading.Event,
++        **kwargs,
++    ) -> None:
++        super().__init__(*args, **kwargs)
++        self._sessions_read = sessions_read
++        self._continue_sessions_read = continue_sessions_read
++
++    def _read_sessions_unlocked(self):
++        sessions = super()._read_sessions_unlocked()
++        self._sessions_read.set()
++        if not self._continue_sessions_read.wait(timeout=2):
++            raise TimeoutError("Test did not release the session reader")
++        return sessions
++
++
++class RecordingJsonSessionRepository(JsonSessionRepository):
++    def __init__(self, *args, revocation_started: threading.Event, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        self._revocation_started = revocation_started
++
++    def revoke_all(self, user_id: str) -> int:
++        self._revocation_started.set()
++        return super().revoke_all(user_id)
+ 
+ 
+ class SessionRepositoryContract:
+@@ -36,6 +71,7 @@ class JsonSessionRepositoryTests(SessionRepositoryContract, unittest.TestCase):
+     def setUp(self) -> None:
+         self._tempdir = tempfile.TemporaryDirectory()
+         self.path = Path(self._tempdir.name) / "auth_sessions.json"
++        self.users_path = Path(self._tempdir.name) / "users.json"
+ 
+     def tearDown(self) -> None:
+         self._tempdir.cleanup()
+@@ -55,6 +91,153 @@ class JsonSessionRepositoryTests(SessionRepositoryContract, unittest.TestCase):
+             JsonSessionRepository(self.path).revoke_all("user-1")
+         self.assertEqual(self.path.read_text(encoding="utf-8"), '{"not":"a-list"}')
+ 
++    def test_auth_does_not_replace_a_corrupt_session_document(self) -> None:
++        for original in ('{"not":"a-list"}', '[{"token":"missing-session-fields"}]'):
++            with self.subTest(document=original):
++                self.path.write_text(original, encoding="utf-8")
++                auth = JsonEmailAuthService(self.users_path, self.path)
++
++                with self.assertRaises(ValueError):
++                    auth.login(email="reader@example.test")
++
++                self.assertEqual(self.path.read_text(encoding="utf-8"), original)
++
++    def test_login_and_logout_share_one_canonical_session_lock_across_a_symlink(self) -> None:
++        seed_auth = JsonEmailAuthService(self.users_path, self.path)
++        old_token, user = seed_auth.login(email="reader@example.test")
++        alias = Path(self._tempdir.name) / "auth_sessions_alias.json"
++        alias.symlink_to(self.path)
++        sessions_read = threading.Event()
++        continue_sessions_read = threading.Event()
++        login_auth = PausingJsonEmailAuthService(
++            self.users_path,
++            alias,
++            sessions_read=sessions_read,
++            continue_sessions_read=continue_sessions_read,
++        )
++        logout_auth = JsonEmailAuthService(self.users_path, self.path)
++        login_result: list[tuple[str, object]] = []
++        logout_finished = threading.Event()
++
++        login_thread = threading.Thread(
++            target=lambda: login_result.append(login_auth.login(email="reader@example.test")),
++        )
++        logout_thread = threading.Thread(
++            target=lambda: (logout_auth.logout(old_token), logout_finished.set()),
++        )
++        login_thread.start()
++        self.assertTrue(sessions_read.wait(timeout=2))
++        logout_thread.start()
++        self.assertFalse(logout_finished.wait(timeout=0.1))
++        continue_sessions_read.set()
++        login_thread.join(timeout=2)
++        logout_thread.join(timeout=2)
++
++        self.assertFalse(login_thread.is_alive())
++        self.assertFalse(logout_thread.is_alive())
++        self.assertEqual(login_auth._sessions_path, self.path.resolve())
++        self.assertIsNone(seed_auth.resolve_user(old_token))
++        new_token, new_user = login_result[0]
++        self.assertEqual(new_user.id, user.id)
++        self.assertEqual(logout_auth.resolve_user(new_token).id, user.id)
++
++    def test_expiry_cleanup_cannot_restore_sessions_after_admin_revocation_and_reactivation(
++        self,
++    ) -> None:
++        now = datetime.now(UTC)
++        self.path.write_text(
++            json.dumps(
++                [
++                    {
++                        "token": "expired-target",
++                        "user_id": "target-1",
++                        "expires_at": (now - timedelta(minutes=1)).isoformat(),
++                    },
++                    {
++                        "token": "active-target",
++                        "user_id": "target-1",
++                        "expires_at": (now + timedelta(minutes=1)).isoformat(),
++                    },
++                    {
++                        "token": "active-other",
++                        "user_id": "other-1",
++                        "expires_at": (now + timedelta(minutes=1)).isoformat(),
++                    },
++                ]
++            ),
++            encoding="utf-8",
++        )
++        sessions_read = threading.Event()
++        continue_sessions_read = threading.Event()
++        revocation_started = threading.Event()
++        cleanup_auth = PausingJsonEmailAuthService(
++            self.users_path,
++            self.path,
++            sessions_read=sessions_read,
++            continue_sessions_read=continue_sessions_read,
++        )
++        sessions = RecordingJsonSessionRepository(
++            self.path,
++            revocation_started=revocation_started,
++        )
++        controls = JsonAdminAccountControlRepository(
++            Path(self._tempdir.name) / "account_controls.json"
++        )
++        admin = AdminAccounts(
++            controls,
++            sessions,
++            user_exists=lambda user_id: user_id == "target-1",
++        )
++        admin_finished = threading.Event()
++
++        cleanup_thread = threading.Thread(
++            target=lambda: cleanup_auth.resolve_user("expired-target")
++        )
++
++        def suspend_and_reactivate() -> None:
++            admin.suspend(
++                target_user_id="target-1",
++                actor_user_id="admin-1",
++                actor_email="admin@example.test",
++                reason="Policy violation",
++                correlation_id="session-race-1",
++                occurred_at=now,
++            )
++            admin.reactivate(
++                target_user_id="target-1",
++                actor_user_id="admin-1",
++                actor_email="admin@example.test",
++                reason="Appeal approved",
++                correlation_id="session-race-2",
++                occurred_at=now + timedelta(minutes=1),
++            )
++            admin_finished.set()
++
++        admin_thread = threading.Thread(target=suspend_and_reactivate)
++        cleanup_thread.start()
++        self.assertTrue(sessions_read.wait(timeout=2))
++        admin_thread.start()
++        self.assertTrue(revocation_started.wait(timeout=2))
++        self.assertFalse(admin_finished.wait(timeout=0.1))
++        continue_sessions_read.set()
++        cleanup_thread.join(timeout=2)
++        admin_thread.join(timeout=2)
++
++        self.assertFalse(cleanup_thread.is_alive())
++        self.assertFalse(admin_thread.is_alive())
++        self.assertTrue(admin_finished.is_set())
++        self.assertEqual(controls.get_control("target-1").status, "active")
++        self.assertEqual(
++            sessions.sessions,
++            [
++                {
++                    "token": "active-other",
++                    "user_id": "other-1",
++                    "expires_at": (now + timedelta(minutes=1)).isoformat(),
++                }
++            ],
++        )
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

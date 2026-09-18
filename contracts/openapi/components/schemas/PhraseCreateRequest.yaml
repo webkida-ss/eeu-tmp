@@ -1,0 +1,23 @@
+properties:
+  original_text:
+    type: string
+    maxLength: 3000
+    minLength: 1
+    title: Original Text
+  analysis:
+    $ref: ./AnalyzeResponse.yaml
+  page_url:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Url
+  page_title:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Page Title
+type: object
+required:
+- original_text
+- analysis
+title: PhraseCreateRequest

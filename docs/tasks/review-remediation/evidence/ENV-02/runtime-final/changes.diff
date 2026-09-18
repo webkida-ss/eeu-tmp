@@ -1,0 +1,130 @@
+diff --git a/backend/conftest.py b/backend/conftest.py
+index a702b18..632dd10 100644
+--- a/backend/conftest.py
++++ b/backend/conftest.py
+@@ -1,15 +1,23 @@
+ from __future__ import annotations
+ 
+ import os
++import sys
+ import time
+ import uuid
+ from collections.abc import Iterator
++from pathlib import Path
+ 
+ import boto3
+ import pytest
+ from botocore.config import Config
+ from storage.dynamodb_store import DynamoDbStore
+ 
++PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
++if PROJECT_ROOT not in sys.path:
++    # `test:backend:unit` runs pytest from backend/, while policy tests import
++    # root-level scripts as a namespace package.
++    sys.path.insert(0, PROJECT_ROOT)
++
+ 
+ @pytest.fixture(scope="module")
+ def dynamodb_store() -> Iterator[DynamoDbStore]:
+diff --git a/backend/scripts/build_lambda.sh b/backend/scripts/build_lambda.sh
+index 08d3d11..4b93aae 100755
+--- a/backend/scripts/build_lambda.sh
++++ b/backend/scripts/build_lambda.sh
+@@ -26,6 +26,7 @@ APP_FILES=(
+   config.py
+   deps.py
+   schemas.py
++  secret_resolver.py
+   lambda_handler.py
+   worker_handler.py
+ )
+diff --git a/backend/test_handler_independence.py b/backend/test_handler_independence.py
+index 792445a..1931c7a 100644
+--- a/backend/test_handler_independence.py
++++ b/backend/test_handler_independence.py
+@@ -2,11 +2,15 @@
+ work without FastAPI, so the handler layer (FastAPI today, e.g. an AWS
+ Lambda handler tomorrow) can be swapped without touching them."""
+ 
++import importlib
+ import subprocess
+ import sys
+ import tempfile
+ import unittest
++from collections.abc import Iterator
++from contextlib import contextmanager
+ from pathlib import Path
++from types import ModuleType
+ 
+ from accounts.storage import JsonEmailAuthService
+ from accounts.testing import build_test_accounts
+@@ -15,9 +19,57 @@ from deps import get_accounts, get_page_preload_repository
+ from fastapi.testclient import TestClient
+ from main import app
+ from repositories.page_preload_repository import JsonPagePreloadRepository
++from storage import dynamodb_store
++
++_dynamodb_resource_factory = dynamodb_store.create_dynamodb_resource
++_dynamodb_client_factory = dynamodb_store.create_dynamodb_client
++
++
++class FakeMangum:
++    """Test adapter that records the application composed by the entrypoint."""
++
++    def __init__(self, application: object) -> None:
++        self.application = application
++
++
++_MISSING_MODULE = object()
++
++
++@contextmanager
++def import_lambda_handler_with_fake_mangum() -> Iterator[ModuleType]:
++    """Import the real entrypoint with a scoped adapter dependency.
++
++    The service-free unit suite intentionally does not install the Lambda
++    runtime dependencies. `test_lambda_package.py` separately validates the
++    real package and its Mangum dependency.
++    """
++
++    previous_mangum = sys.modules.get("mangum", _MISSING_MODULE)
++    previous_lambda_handler = sys.modules.get("lambda_handler", _MISSING_MODULE)
++    fake_mangum = ModuleType("mangum")
++    fake_mangum.Mangum = FakeMangum
++    sys.modules["mangum"] = fake_mangum
++    sys.modules.pop("lambda_handler", None)
++
++    try:
++        yield importlib.import_module("lambda_handler")
++    finally:
++        sys.modules.pop("mangum", None)
++        sys.modules.pop("lambda_handler", None)
++        if previous_mangum is not _MISSING_MODULE:
++            sys.modules["mangum"] = previous_mangum
++        if previous_lambda_handler is not _MISSING_MODULE:
++            sys.modules["lambda_handler"] = previous_lambda_handler
+ 
+ 
+ class FrameworkIndependenceTests(unittest.TestCase):
++    def test_api_lambda_entrypoint_keeps_both_dynamodb_factories(self):
++        with import_lambda_handler_with_fake_mangum() as lambda_handler:
++            self.assertIs(dynamodb_store.create_dynamodb_resource, _dynamodb_resource_factory)
++            self.assertIs(dynamodb_store.create_dynamodb_client, _dynamodb_client_factory)
++            self.assertIsInstance(lambda_handler.handler, FakeMangum)
++            self.assertIs(lambda_handler.handler.application, app)
++
+     def test_core_and_services_import_without_fastapi(self):
+         # A fresh interpreter proves the import graph is clean; in-process
+         # checks would be polluted by other tests importing main.
+diff --git a/backend/test_offline_build_inputs.py b/backend/test_offline_build_inputs.py
+index a27d72d..09c5f50 100644
+--- a/backend/test_offline_build_inputs.py
++++ b/backend/test_offline_build_inputs.py
+@@ -36,6 +36,7 @@ def _make_lambda_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+         "config.py",
+         "deps.py",
+         "schemas.py",
++        "secret_resolver.py",
+         "lambda_handler.py",
+         "worker_handler.py",
+     ):

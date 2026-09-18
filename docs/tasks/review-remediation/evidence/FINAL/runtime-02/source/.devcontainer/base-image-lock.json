@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "repository": "mcr.microsoft.com/devcontainers/base",
+  "sourceTag": "ubuntu-24.04",
+  "sourceTagInformationalOnly": true,
+  "verifiedAt": "2026-07-19",
+  "verificationCommand": "python3 scripts/verify-base-image-lock.py",
+  "indexDigest": "sha256:d94c97dd9cacf183d0a6fd12a8e87b526e9e928307674ae9c94139139c0c6eae",
+  "immutableReference": "mcr.microsoft.com/devcontainers/base@sha256:d94c97dd9cacf183d0a6fd12a8e87b526e9e928307674ae9c94139139c0c6eae",
+  "platforms": {
+    "linux/amd64": "sha256:3612b800eaae8513e7dca54f21d2e4eda48eda57426f3746a78677f342ac7ee9",
+    "linux/arm64": "sha256:309df9dde7aeb9e734a8f7ead76ab4d18ee4eb17b6047d2a2d008fa52fdea67b"
+  }
+}

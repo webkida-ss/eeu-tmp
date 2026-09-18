@@ -1,0 +1,58 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+  ".git",
+  ".terraform",
+  ".tools",
+  ".venv",
+  "backend/generated",
+  "build",
+  "dist",
+  "docs/tasks/review-remediation/evidence",
+  "extension/generated",
+  "node_modules",
+  "output",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"backend/accounts/api/*.py" = ["B008"]
+"backend/admin/*.py" = ["B008"]
+"backend/deps.py" = ["B008"]
+"backend/main.py" = ["B008", "E402"]
+"backend/test_ci_workflow_security.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.coverage.run]
+branch = true
+data_file = "output/coverage/backend/.coverage"
+source = ["backend"]
+omit = [
+  "backend/.venv/*",
+  "backend/conftest.py",
+  "backend/generated/*",
+  "backend/test_*.py",
+  "backend/scripts/*",
+  "build/*",
+  "dist/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.coverage.xml]
+output = "output/coverage/backend/coverage.xml"
+
+[tool.coverage.json]
+output = "output/coverage/backend/coverage.json"
+
+[tool.coverage.html]
+directory = "output/coverage/backend/html"

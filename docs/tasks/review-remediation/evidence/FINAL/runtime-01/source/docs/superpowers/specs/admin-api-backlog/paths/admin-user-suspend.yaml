@@ -1,0 +1,43 @@
+# Historical design proposal; not a supported runtime contract.
+post:
+  operationId: suspendAdminUser
+  summary: Suspend a user account
+  description: The transition is idempotent. An actual transition revokes current learner sessions and appends one audit event.
+  security:
+    - bearerAuth: []
+  parameters:
+    - name: id
+      in: path
+      required: true
+      description: Opaque user identifier.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+      example: user-17
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../admin-openapi.yaml#/components/schemas/AccountTransitionRequest
+  responses:
+    "200":
+      description: Current account state and transition outcome.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/AccountTransitionResponse
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "403":
+      $ref: ../admin-openapi.yaml#/components/responses/AdminForbidden
+    "404":
+      $ref: ../admin-openapi.yaml#/components/responses/UserNotFound
+    "422":
+      $ref: ../admin-openapi.yaml#/components/responses/ValidationError
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

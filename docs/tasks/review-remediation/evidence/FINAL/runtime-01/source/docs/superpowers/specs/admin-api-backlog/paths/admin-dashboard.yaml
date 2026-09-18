@@ -1,0 +1,40 @@
+# Historical design proposal; not a supported runtime contract.
+get:
+  operationId: getAdminDashboard
+  summary: Get administration metrics and alert summaries
+  description: Defaults to the rolling 30-day UTC period. Custom ranges are inclusive of start, exclusive of end, and limited to 90 days.
+  security:
+    - bearerAuth: []
+  parameters:
+    - name: start
+      in: query
+      description: Inclusive UTC reporting boundary. Supply with end.
+      schema:
+        type: string
+        format: date-time
+      example: "2026-06-20T00:00:00Z"
+    - name: end
+      in: query
+      description: Exclusive UTC reporting boundary. Supply with start.
+      schema:
+        type: string
+        format: date-time
+      example: "2026-07-20T00:00:00Z"
+  responses:
+    "200":
+      description: Dashboard whose independent sections may contain ok or error envelopes.
+      headers:
+        X-Correlation-ID:
+          $ref: ../admin-openapi.yaml#/components/headers/CorrelationId
+      content:
+        application/json:
+          schema:
+            $ref: ../admin-openapi.yaml#/components/schemas/DashboardResponse
+    "401":
+      $ref: ../admin-openapi.yaml#/components/responses/Unauthenticated
+    "403":
+      $ref: ../admin-openapi.yaml#/components/responses/AdminForbidden
+    "422":
+      $ref: ../admin-openapi.yaml#/components/responses/ValidationError
+    "500":
+      $ref: ../admin-openapi.yaml#/components/responses/InternalError

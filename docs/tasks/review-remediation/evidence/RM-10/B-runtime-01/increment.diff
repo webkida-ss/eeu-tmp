@@ -1,0 +1,1258 @@
+--- before/backend/services/preloading.py
++++ after/backend/services/preloading.py
+@@ -139,6 +139,80 @@
+         return False
+     moment = now or datetime.now(UTC)
+     return (moment - requested).total_seconds() < STALE_PROCESSING_AFTER_SECONDS
++
++
++def _recover_failed_content_handoff(
++    repository: PagePreloadRepository,
++    content_store: PreloadContentStore,
++    user_id: str,
++    record: dict[str, Any],
++    usage_meter: UsageMeter | None,
++) -> dict[str, Any]:
++    """Complete a persisted handoff failure without granting a stale owner control."""
++    if record.get("status") != "failed_pending_release":
++        return record
++    operation_id = str(record.get("operation_id") or "")
++    has_reserved_operation = bool(record.get("reservation_enabled"))
++    if (
++        usage_meter
++        and operation_id
++        and "reservation_enabled" not in record
++        and usage_meter.get_operation(operation_id) is not None
++    ):
++        has_reserved_operation = True
++    if usage_meter and operation_id and has_reserved_operation:
++        usage_meter.release(operation_id, str(record.get("failure_reason") or "handoff_failed"))
++    content_store.retire(user_id, str(record["id"]))
++    recovered = {
++        **record,
++        "status": "failed",
++        "usage_state": (
++            "released"
++            if usage_meter and operation_id and has_reserved_operation
++            else record.get("usage_state")
++        ),
++        "content_retirement_pending": False,
++    }
++    repository.finish_processing(
++        user_id,
++        str(record["id"]),
++        str(record.get("learner_profile_fingerprint") or ""),
++        recovered,
++        expected_status="failed_pending_release",
++    )
++    return repository.get_by_id(user_id, str(record["id"])) or recovered
++
++
++def _retire_terminal_content(
++    repository: PagePreloadRepository,
++    content_store: PreloadContentStore,
++    user_id: str,
++    record: dict[str, Any],
++    learner_profile_fingerprint: str,
++) -> dict[str, Any]:
++    """Retire a terminal worker payload and retain a retry marker on failure."""
++    if not record.get("content_retirement_pending"):
++        return record
++    if record.get("learner_profile_fingerprint") != learner_profile_fingerprint:
++        return record
++    try:
++        content_store.retire(user_id, str(record["id"]))
++    except Exception:  # noqa: BLE001 - retry is driven by an authenticated worker replay
++        logger.warning(
++            "preload content retirement pending user=%s preload_id=%s",
++            user_id,
++            record["id"],
++        )
++        return record
++    retired = {**record, "content_retirement_pending": False}
++    repository.finish_processing(
++        user_id,
++        str(record["id"]),
++        learner_profile_fingerprint,
++        retired,
++        expected_status=str(record.get("status") or ""),
++    )
++    return repository.get_by_id(user_id, str(record["id"])) or retired
+ 
+ 
+ def submit_preload(
+@@ -270,16 +344,13 @@
+             raise
+         operation_record = repository.get_by_id(user_id, operation.operation_id)
+         if operation_record and operation_record.get("status") == "failed_pending_release":
+-            usage_meter.release(
+-                operation.operation_id,
+-                str(operation_record.get("failure_reason") or "enqueue_failed"),
++            recovered = _recover_failed_content_handoff(
++                repository,
++                content_store,
++                user_id,
++                operation_record,
++                usage_meter,
+             )
+-            recovered = dict(operation_record)
+-            recovered["status"] = "failed"
+-            recovered["usage_state"] = "released"
+-            recovered["error"] = "The preload job could not be queued. Please try again."
+-            repository.save(user_id, recovered, make_latest=False)
+-            content_store.delete(user_id, operation.operation_id)
+             return _to_status_response(recovered)
+         if (
+             existing
+@@ -351,7 +422,9 @@
+ 
+     now = datetime.now(UTC).isoformat()
+     record = {
+-        "id": request.operation_id if reservation_enabled else generate_uuid7(),
++        "id": request.operation_id,
++        "operation_id": request.operation_id,
++        "payload_hash": payload_hash,
+         "page_url": normalize_page_url(request.page_url),
+         "page_title": request.page_title,
+         "learner_level": learner_level,
+@@ -364,9 +437,10 @@
+         "source_tokens_detected": prepared.source_tokens_detected,
+         "source_tokens_analyzed": prepared.source_tokens_analyzed,
+         "source_token_limit": prepared.source_token_limit,
+-        "status": "processing",
++        "status": "content_pending",
+         "enqueue_state": "pending",
+         "submitted": False,
++        "reservation_enabled": reservation_enabled,
+         "error": None,
+         "requested_at": now,
+         "created_at": now,
+@@ -374,8 +448,6 @@
+     if operation:
+         record.update(
+             {
+-                "operation_id": operation.operation_id,
+-                "payload_hash": operation.payload_hash,
+                 "usage_month": operation.month,
+                 "usage_state": operation.state,
+                 "quota_plan": operation.plan_id,
+@@ -408,18 +480,47 @@
+                 usage_meter.rate.output_micro_usd_per_million
+             )
+ 
+-    # The raw extracted text is a one-time submit -> worker handoff payload, so
+-    # it lives in the transient content store rather than in the record (which
+-    # would carry it forever and risk the DynamoDB 400 KB item limit). Write it
+-    # before enqueue so the worker always finds it.
+-    submitted = False
++    creation = repository.create_if_absent(user_id, record)
++    record = creation.record
++    owns_handoff = creation.created
++    if not owns_handoff and record.get("status") == "content_pending":
++        takeover = repository.claim_content_handoff(user_id, record)
++        record = takeover.record
++        owns_handoff = takeover.created
++    if not owns_handoff:
++        return _to_status_response(record)
++
++    handoff_token = str(record["content_handoff_token"])
++    enqueue_attempted = False
+     try:
+-        content_store.put(user_id, record["id"], prepared.content)
+-        # Saving before enqueue guarantees the worker finds the record. This
+-        # replaces any prior record for the URL (a failed or stale-processing one).
+-        repository.save(user_id, record)
++        stored_content = content_store.get(user_id, record["id"])
++        if stored_content is None:
++            content_written = content_store.put_if_absent(user_id, record["id"], prepared.content)
++            if not content_written:
++                stored_content = content_store.get(user_id, record["id"])
++                if stored_content != prepared.content:
++                    raise RuntimeError(
++                        "Preload handoff content conflicts with the operation payload."
++                    )
++        elif stored_content != prepared.content:
++            raise RuntimeError("Preload handoff content conflicts with the operation payload.")
++        if not repository.mark_content_available(user_id, record["id"], handoff_token):
++            return _to_status_response(repository.get_by_id(user_id, record["id"]) or record)
++        record = repository.get_by_id(user_id, record["id"]) or record
+         if not repository.mark_enqueue_submitting(user_id, record["id"]):
+-            raise RuntimeError("Preload enqueue ownership changed before submission.")
++            if repository.fail_content_handoff(
++                user_id,
++                record["id"],
++                handoff_token,
++                "The preload job could not be queued. Release is pending.",
++            ):
++                failed = repository.get_by_id(user_id, record["id"]) or record
++                return _to_status_response(
++                    _recover_failed_content_handoff(
++                        repository, content_store, user_id, failed, usage_meter
++                    )
++                )
++            return _to_status_response(repository.get_by_id(user_id, record["id"]) or record)
+         record["enqueue_state"] = "queued_unconfirmed"
+         record["submitted"] = True
+         usage_context = {
+@@ -445,6 +546,7 @@
+             if key in record
+         }
+         if operation:
++            enqueue_attempted = True
+             job_runner.enqueue(
+                 user_id,
+                 record["page_url"],
+@@ -453,13 +555,13 @@
+                 usage_context,
+             )
+         else:
++            enqueue_attempted = True
+             job_runner.enqueue(
+                 user_id,
+                 record["page_url"],
+                 record["id"],
+                 record["learner_profile_fingerprint"],
+             )
+-        submitted = True
+         try:
+             confirmed = repository.confirm_enqueued(user_id, record["id"])
+         except Exception:
+@@ -484,38 +586,31 @@
+             "submitted": True,
+         }
+     except Exception:
+-        if submitted:
++        if enqueue_attempted:
+             logger.exception(
+-                "preload post-send persistence failed; reservation retained user=%s preload_id=%s",
++                "preload enqueue outcome is ambiguous; reservation retained user=%s preload_id=%s",
+                 user_id,
+                 record["id"],
+             )
+             current = repository.get_by_id(user_id, record["id"])
+             return _to_status_response(current or record)
+-        if operation and operation.state == "reserved":
+-            record["status"] = "failed_pending_release"
+-            record["usage_state"] = "pending_release"
+-            record["failure_reason"] = "enqueue_failed"
+-            record["error"] = "The preload job could not be queued. Release is pending."
+-            try:
+-                repository.save(user_id, record, make_latest=False)
+-            except Exception:
+-                logger.exception(
+-                    "could not persist pending preload release user=%s operation_id=%s",
+-                    user_id,
+-                    operation.operation_id,
+-                )
+-            try:
+-                usage_meter.release(operation.operation_id, "enqueue_failed")
+-            except Exception:
+-                raise
+-            record["status"] = "failed"
+-            record["usage_state"] = "released"
+-            record["error"] = "The preload job could not be queued. Please try again."
+-            try:
+-                repository.save(user_id, record, make_latest=False)
+-            finally:
+-                content_store.delete(user_id, record["id"])
++        if repository.fail_content_handoff(
++            user_id,
++            record["id"],
++            handoff_token,
++            "The preload handoff failed. Release is pending.",
++        ):
++            failed = repository.get_by_id(user_id, record["id"]) or record
++            _recover_failed_content_handoff(repository, content_store, user_id, failed, usage_meter)
++        else:
++            logger.info(
++                "preload handoff ownership changed before cleanup user=%s preload_id=%s",
++                user_id,
++                record["id"],
++            )
++            current = repository.get_by_id(user_id, record["id"])
++            if current is not None:
++                return _to_status_response(current)
+         raise
+     return _to_status_response(record)
+ 
+@@ -628,6 +723,13 @@
+     if not record:
+         return
+     if record.get("status") in ("ready", "failed"):
++        record = _retire_terminal_content(
++            repository,
++            content_store,
++            user_id,
++            record,
++            learner_profile_fingerprint,
++        )
+         status = "success" if record.get("status") == "ready" else "failed"
+         record_terminal_activity(
+             admin_activity_repository,
+@@ -664,7 +766,10 @@
+             reservation_enabled=False,
+             provider_mode=billing_provider_mode,
+         )
+-    if operation_id:
++    reservation_operation_id = operation_id if record.get("reservation_enabled") else ""
++    if not record.get("reservation_enabled") and "reservation_enabled" not in record:
++        reservation_operation_id = operation_id if not isinstance(shadow_context, dict) else ""
++    if reservation_operation_id:
+         rate = ModelRate(
+             model=str(record.get("model") or ""),
+             input_micro_usd_per_million=int(record.get("input_micro_usd_per_million") or 0),
+@@ -679,10 +784,11 @@
+             reservation_enabled=True,
+             provider_mode=billing_provider_mode,
+         )
+-        operation = meter.get_operation(operation_id)
++        operation = meter.get_operation(reservation_operation_id)
+         if operation is None:
+             raise RuntimeError(
+-                f"Usage operation {operation_id} is missing; refusing provider dispatch."
++                "Usage operation "
++                f"{reservation_operation_id} is missing; refusing provider dispatch."
+             )
+         if operation.state == "released":
+             if record.get("status") not in ("ready", "failed"):
+@@ -745,6 +851,13 @@
+                     kind="preload",
+                     outcome="ready",
+                 )
++                _retire_terminal_content(
++                    repository,
++                    content_store,
++                    user_id,
++                    repaired,
++                    learner_profile_fingerprint,
++                )
+             elif record.get("status") == "failed_pending_usage":
+                 repaired = dict(record)
+                 repaired["status"] = "failed"
+@@ -764,6 +877,13 @@
+                     kind="preload",
+                     outcome="failed",
+                 )
++                _retire_terminal_content(
++                    repository,
++                    content_store,
++                    user_id,
++                    repaired,
++                    learner_profile_fingerprint,
++                )
+             return
+         if operation.state == "released" and record.get("status") == "failed_pending_usage":
+             repaired = dict(record)
+@@ -783,6 +903,13 @@
+                 operation_id=operation_id,
+                 kind="preload",
+                 outcome="released",
++            )
++            _retire_terminal_content(
++                repository,
++                content_store,
++                user_id,
++                repaired,
++                learner_profile_fingerprint,
+             )
+             return
+         if (
+@@ -814,10 +941,13 @@
+                 kind="preload",
+                 outcome="finalized",
+             )
+-            try:
+-                content_store.delete(user_id, preload_id)
+-            except Exception:
+-                logger.warning("preload repair cleanup failed user=%s", user_id)
++            _retire_terminal_content(
++                repository,
++                content_store,
++                user_id,
++                repaired,
++                learner_profile_fingerprint,
++            )
+             return
+         if operation.state == "reserved" and record.get("status") == "failed_pending_usage":
+             if record.get("failure_settlement") == "finalize_conservative":
+@@ -852,22 +982,16 @@
+                 kind="preload",
+                 outcome="settled_failure",
+             )
++            _retire_terminal_content(
++                repository,
++                content_store,
++                user_id,
++                repaired,
++                learner_profile_fingerprint,
++            )
+             return
+ 
+     latest = repository.get_by_page_url(user_id, page_url)
+-    if latest and latest.get("id") != preload_id and record.get("status") == "processing":
+-        superseded = dict(record)
+-        superseded["status"] = "failed"
+-        superseded["error"] = "This preload was superseded by a newer request."
+-        if meter and operation and operation.state == "reserved":
+-            meter.release(operation_id, "preload_superseded")
+-            superseded["usage_state"] = "released"
+-        repository.save(user_id, superseded, make_latest=False)
+-        try:
+-            content_store.delete(user_id, preload_id)
+-        except Exception:
+-            logger.warning("superseded preload cleanup failed user=%s", user_id)
+-        return
+ 
+     lease_id = generate_uuid7()
+     lease_now = datetime.now(UTC)
+@@ -895,6 +1019,45 @@
+             operation_id=operation_id or preload_id,
+             kind="preload",
+         )
++    if latest and latest.get("id") != preload_id:
++        superseded = dict(record)
++        superseded["status"] = "failed_pending_usage" if meter else "failed"
++        superseded["content_retirement_pending"] = True
++        superseded["error"] = "This preload was superseded by a newer request."
++        if meter:
++            superseded["failure_settlement"] = "release"
++            superseded["failure_reason"] = "preload_superseded"
++            superseded["usage_state"] = "reserved"
++        completed = repository.finish_processing(
++            user_id,
++            preload_id,
++            learner_profile_fingerprint,
++            superseded,
++            lease_id=lease_id,
++        )
++        if not completed:
++            return
++        if meter:
++            meter.release(operation_id, "preload_superseded")
++            superseded["status"] = "failed"
++            superseded["usage_state"] = "released"
++            settled = repository.finish_processing(
++                user_id,
++                preload_id,
++                learner_profile_fingerprint,
++                superseded,
++                lease_id=lease_id,
++                expected_status="failed_pending_usage",
++            )
++            _require_published_transition(repository, user_id, preload_id, settled)
++        _retire_terminal_content(
++            repository,
++            content_store,
++            user_id,
++            superseded,
++            learner_profile_fingerprint,
++        )
++        return
+     if meter:
+         execution_status = meter.claim_execution(
+             operation_id,
+@@ -985,7 +1148,7 @@
+             meter.release_execution(operation_id, lease_id)
+             raise
+ 
+-    # The raw text lives in the transient content store, keyed by (user, URL).
++    # The raw text lives in the transient content store, keyed by (user, operation).
+     # Fall back to an inline "content" field only for legacy in-flight records
+     # written by the old code (which stored it on the record). If neither has
+     # it, the payload was lost or expired: mark the record failed rather than
+@@ -994,6 +1157,7 @@
+     if not content:
+         failed = dict(record)
+         failed["status"] = "failed_pending_usage" if meter else "failed"
++        failed["content_retirement_pending"] = True
+         failed["error"] = (
+             "The article text is no longer available. Please reload the page to try again."
+         )
+@@ -1008,19 +1172,27 @@
+             failed,
+             lease_id=lease_id,
+         )
+-        if completed and meter:
+-            meter.release(operation_id, "content_missing")
+-            failed["status"] = "failed"
+-            failed["usage_state"] = "released"
+-            settled = repository.finish_processing(
++        if completed:
++            if meter:
++                meter.release(operation_id, "content_missing")
++                failed["status"] = "failed"
++                failed["usage_state"] = "released"
++                settled = repository.finish_processing(
++                    user_id,
++                    preload_id,
++                    learner_profile_fingerprint,
++                    failed,
++                    lease_id=lease_id,
++                    expected_status="failed_pending_usage",
++                )
++                _require_published_transition(repository, user_id, preload_id, settled)
++            _retire_terminal_content(
++                repository,
++                content_store,
+                 user_id,
+-                preload_id,
+-                learner_profile_fingerprint,
+                 failed,
+-                lease_id=lease_id,
+-                expected_status="failed_pending_usage",
++                learner_profile_fingerprint,
+             )
+-            _require_published_transition(repository, user_id, preload_id, settled)
+         if meter:
+             meter.release_execution(operation_id, lease_id)
+         logger.warning(
+@@ -1122,6 +1294,7 @@
+         exc = provider_error
+         failed = dict(record)
+         failed["status"] = "failed_pending_usage" if meter else "failed"
++        failed["content_retirement_pending"] = True
+         failed["error"] = str(exc) or "Article analysis failed. Please try again."
+         if meter:
+             if _dispatch_was_attempted(tally, exc):
+@@ -1174,6 +1347,13 @@
+                 ),
+             )
+         if completed:
++            failed = _retire_terminal_content(
++                repository,
++                content_store,
++                user_id,
++                failed,
++                learner_profile_fingerprint,
++            )
+             record_terminal_activity(
+                 admin_activity_repository,
+                 TerminalActivityOutcome.for_preload(
+@@ -1213,6 +1393,7 @@
+             "created_at": datetime.now(UTC).isoformat(),
+             "status": "ready_pending_usage" if meter else "ready",
+             "error": None,
++            "content_retirement_pending": True,
+         }
+     )
+     if meter:
+@@ -1230,6 +1411,7 @@
+         failed = dict(record)
+         failed["status"] = "failed_pending_usage" if meter else "failed"
+         failed["error"] = str(exc)
++        failed["content_retirement_pending"] = True
+         if meter:
+             failed["failure_settlement"] = "finalize_conservative"
+             failed["failure_usage"] = {
+@@ -1261,6 +1443,13 @@
+             )
+             _require_published_transition(repository, user_id, preload_id, settled)
+         if published:
++            failed = _retire_terminal_content(
++                repository,
++                content_store,
++                user_id,
++                failed,
++                learner_profile_fingerprint,
++            )
+             record_terminal_activity(
+                 admin_activity_repository,
+                 TerminalActivityOutcome.for_preload(
+@@ -1314,14 +1503,10 @@
+         ),
+     )
+ 
+-    # The handoff payload has served its purpose; drop it so orphaned content
+-    # does not linger. Best-effort: a failed delete must not fail the job (the
+-    # S3 lifecycle rule expires stragglers anyway).
+-    try:
+-        content_store.delete(user_id, preload_id)
+-    except Exception:  # noqa: BLE001 - transient store cleanup is non-critical
+-        logger.warning(
+-            "preload job: content cleanup failed user=%s url=%s",
+-            user_id,
+-            normalize_page_url(page_url),
+-        )
++    _retire_terminal_content(
++        repository,
++        content_store,
++        user_id,
++        ready,
++        learner_profile_fingerprint,
++    )
+--- before/backend/storage/preload_content_store.py
++++ after/backend/storage/preload_content_store.py
+@@ -5,8 +5,8 @@
+ submit -> worker handoff payload, not durable data: nothing reads it after
+ the analysis completes, and keeping it inside the DynamoDB preload record
+ would be dead weight that (with sentences + analysis) risks the 400 KB item
+-limit. So it lives here instead, outside the record, and is deleted once the
+-worker consumes it.
++limit. So it lives here instead, outside the record, and is retired to a
++nonprivate tombstone once the worker consumes it.
+ 
+ The store is chosen by DI, mirroring the auth/billing/job-runner pattern: a
+ filesystem implementation for local development and an S3 implementation in
+@@ -31,6 +31,8 @@
+ 
+     def put_if_absent(self, user_id: str, preload_id: str, content: str) -> bool: ...
+ 
++    def retire(self, user_id: str, preload_id: str) -> bool: ...
++
+     def get(self, user_id: str, preload_id: str) -> str | None: ...
+ 
+     def delete(self, user_id: str, preload_id: str) -> None: ...
+@@ -76,11 +78,34 @@
+             if temporary_path is not None:
+                 temporary_path.unlink(missing_ok=True)
+ 
++    def retire(self, user_id: str, preload_id: str) -> bool:
++        """Replace private content with an empty tombstone that blocks late writers."""
++        path = self._path(user_id, preload_id)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        temporary_path: Path | None = None
++        try:
++            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
++                temporary_path = Path(handle.name)
++                handle.flush()
++                os.fsync(handle.fileno())
++            os.replace(temporary_path, path)
++            temporary_path = None
++            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
++            try:
++                os.fsync(directory_fd)
++            finally:
++                os.close(directory_fd)
++            return True
++        finally:
++            if temporary_path is not None:
++                temporary_path.unlink(missing_ok=True)
++
+     def get(self, user_id: str, preload_id: str) -> str | None:
+         path = self._path(user_id, preload_id)
+         if not path.exists():
+             return None
+-        return path.read_text(encoding="utf-8")
++        content = path.read_text(encoding="utf-8")
++        return content or None
+ 
+     def delete(self, user_id: str, preload_id: str) -> None:
+         self._path(user_id, preload_id).unlink(missing_ok=True)
+@@ -140,6 +165,15 @@
+             raise
+         return True
+ 
++    def retire(self, user_id: str, preload_id: str) -> bool:
++        self._get_client().put_object(
++            Bucket=self._bucket,
++            Key=self._key(user_id, preload_id),
++            Body=b"",
++            ContentType="text/plain; charset=utf-8",
++        )
++        return True
++
+     def get(self, user_id: str, preload_id: str) -> str | None:
+         from botocore.exceptions import ClientError
+ 
+@@ -151,7 +185,8 @@
+             if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                 return None
+             raise
+-        return response["Body"].read().decode("utf-8")
++        content = response["Body"].read().decode("utf-8")
++        return content or None
+ 
+     def delete(self, user_id: str, preload_id: str) -> None:
+         # delete_object is idempotent: deleting a missing key is not an error.
+--- before/backend/repositories/page_preload_repository.py
++++ after/backend/repositories/page_preload_repository.py
+@@ -235,7 +235,7 @@
+         self, user_id: str, preload_id: str, handoff_token: str, error: str
+     ) -> bool:
+         return self._transition_content_handoff(
+-            user_id, preload_id, handoff_token, status="failed", error=error
++            user_id, preload_id, handoff_token, status="failed_pending_release", error=error
+         )
+ 
+     def _transition_content_handoff(
+@@ -244,9 +244,14 @@
+         with _PRELOAD_RECORD_LOCK, json_list_lock(self._path):
+             records = read_json_list(self._path)
+             current = self._find(records, user_id, preload_id)
++            is_pending = current is not None and current.get("status") == "content_pending"
++            is_unclaimed_processing = (
++                current is not None
++                and current.get("status") == "processing"
++                and not current.get("lease_id")
++            )
+             if (
+-                current is None
+-                or current.get("status") != "content_pending"
++                not (is_pending or (error is not None and is_unclaimed_processing))
+                 or current.get("content_handoff_token") != handoff_token
+                 or not _handoff_is_current(current, datetime.now(UTC))
+             ):
+--- before/backend/repositories/dynamodb_page_preload_repository.py
++++ after/backend/repositories/dynamodb_page_preload_repository.py
+@@ -165,7 +165,9 @@
+     def fail_content_handoff(
+         self, user_id: str, preload_id: str, handoff_token: str, error: str
+     ) -> bool:
+-        return self._transition_content_handoff(user_id, preload_id, handoff_token, "failed", error)
++        return self._transition_content_handoff(
++            user_id, preload_id, handoff_token, "failed_pending_release", error
++        )
+ 
+     def claim_content_handoff(
+         self, user_id: str, record: dict[str, Any], *, now: datetime | None = None
+@@ -202,9 +204,14 @@
+         self, user_id: str, preload_id: str, handoff_token: str, status: str, error: str | None
+     ) -> bool:
+         current = self.get_by_id(user_id, preload_id)
++        is_pending = current is not None and current.get("status") == "content_pending"
++        is_unclaimed_processing = (
++            current is not None
++            and current.get("status") == "processing"
++            and not current.get("lease_id")
++        )
+         if (
+-            current is None
+-            or current.get("status") != "content_pending"
++            not (is_pending or (error is not None and is_unclaimed_processing))
+             or current.get("content_handoff_token") != handoff_token
+             or not _handoff_is_current(current, datetime.now(UTC))
+         ):
+--- before/backend/test_preload_submission_repository.py
++++ after/backend/test_preload_submission_repository.py
+@@ -415,6 +415,9 @@
+ 
+             self.assertEqual(sum(outcomes), 1)
+             self.assertIn(store.get("u1", "op-1"), {"first", "second"})
++            self.assertTrue(store.retire("u1", "op-1"))
++            self.assertIsNone(store.get("u1", "op-1"))
++            self.assertFalse(store.put_if_absent("u1", "op-1", "late private content"))
+ 
+     def test_s3_conditional_create_maps_only_412_to_existing_content(self) -> None:
+         client = mock.Mock()
+@@ -441,3 +444,19 @@
+ 
+         with self.assertRaises(ClientError):
+             store.put_if_absent("u1", "op-1", "content")
++
++    def test_s3_retirement_uses_a_tombstone_until_lifecycle_expiry(self) -> None:
++        client = mock.Mock()
++        store = S3PreloadContentStore("bucket")
++        store._client = client
++
++        self.assertTrue(store.retire("u1", "op-1"))
++        self.assertEqual(client.put_object.call_args.kwargs["Body"], b"")
++
++        client.get_object.side_effect = ClientError(
++            {"Error": {"Code": "NoSuchKey"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
++            "GetObject",
++        )
++        self.assertIsNone(store.get("u1", "op-1"))
++        client.put_object.reset_mock()
++        self.assertTrue(store.put_if_absent("u1", "op-1", "late after lifecycle expiry"))
+--- before/backend/test_preload_handoff_workflow.py
++++ after/backend/test_preload_handoff_workflow.py
+@@ -0,0 +1,499 @@
++"""Adversarial public-workflow regressions for preload content handoffs."""
++
++from __future__ import annotations
++
++import os
++import tempfile
++import threading
++import unittest
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from unittest import mock
++
++import core.pipeline as pipeline
++from accounts.storage import JsonSubscriptionRepository
++from repositories.page_preload_repository import JsonPagePreloadRepository
++from repositories.usage_repository import JsonUsageRepository
++from schemas import PagePreloadRequest
++from services import preloading
++from services.entitlements import EntitlementError
++from services.usage_meter import UsageMeter
++from storage.preload_content_store import FilesystemPreloadContentStore
++
++_PAGE_HTML = (
++    "<html><body>"
++    "<p>Readers use this complete article paragraph to exercise a durable handoff between "
++    "submission and deferred analysis without relying on a provider response.</p>"
++    "<p>A second paragraph gives extraction enough realistic text while describing leases, "
++    "content ownership, and retryable retirement after terminal publication.</p>"
++    "</body></html>"
++)
++_CONFLICTING_PAGE_HTML = (
++    "<html><body>"
++    "<p>This different article body has its own immutable meaning and must not replace the "
++    "already accepted payload for a matching operation identifier.</p>"
++    "<p>The extra paragraph keeps this fixture above the article extraction threshold and makes "
++    "the canonical payload hash intentionally different.</p>"
++    "</body></html>"
++)
++_PAGE_URL = "https://example.com/handoff"
++_USER_ID = "handoff-user"
++_OPERATION_ID = "019b63f8-f600-7000-8000-000000000101"
++
++
++def _rate_environment():
++    return mock.patch.dict(
++        os.environ,
++        {
++            "OPENAI_MODEL": pipeline.OPENAI_MODEL,
++            "OPENAI_RATE_CARD_VERSION": "test",
++            "OPENAI_MODEL_INPUT_MICRO_USD_PER_MILLION": "1",
++            "OPENAI_MODEL_OUTPUT_MICRO_USD_PER_MILLION": "1",
++        },
++    )
++
++
++class RecordingRunner:
++    def __init__(self) -> None:
++        self.calls: list[tuple] = []
++
++    def enqueue(
++        self,
++        user_id,
++        page_url,
++        preload_id,
++        learner_profile_fingerprint,
++        usage_context=None,
++    ) -> None:
++        self.calls.append(
++            (user_id, page_url, preload_id, learner_profile_fingerprint, usage_context)
++        )
++
++
++class PausingCreateJsonRepository(JsonPagePreloadRepository):
++    def __init__(
++        self,
++        path: Path,
++        create_seen: threading.Event,
++        continue_create: threading.Event,
++    ) -> None:
++        super().__init__(path)
++        self._create_seen = create_seen
++        self._continue_create = continue_create
++        self._pause_once = True
++
++    def create_if_absent(self, user_id: str, record: dict, *, now=None):
++        if self._pause_once:
++            self._pause_once = False
++            self._create_seen.set()
++            if not self._continue_create.wait(timeout=2):
++                raise TimeoutError("Test did not release the delayed submitter")
++        return super().create_if_absent(user_id, record, now=now)
++
++
++class PausingLatestJsonRepository(JsonPagePreloadRepository):
++    def __init__(
++        self,
++        path: Path,
++        latest_lookup_seen: threading.Event,
++        continue_latest_lookup: threading.Event,
++    ) -> None:
++        super().__init__(path)
++        self._latest_lookup_seen = latest_lookup_seen
++        self._continue_latest_lookup = continue_latest_lookup
++        self._pause_once = True
++
++    def get_by_page_url(self, user_id: str, page_url: str):
++        if self._pause_once:
++            self._pause_once = False
++            self._latest_lookup_seen.set()
++            if not self._continue_latest_lookup.wait(timeout=2):
++                raise TimeoutError("Test did not release the stale worker")
++        return super().get_by_page_url(user_id, page_url)
++
++
++class CrashBeforePublicationContentStore(FilesystemPreloadContentStore):
++    def __init__(self, base_dir: Path) -> None:
++        super().__init__(base_dir)
++        self._crash_once = True
++
++    def put_if_absent(self, user_id: str, preload_id: str, content: str) -> bool:
++        if self._crash_once:
++            self._crash_once = False
++            raise KeyboardInterrupt("simulated handoff crash")
++        return super().put_if_absent(user_id, preload_id, content)
++
++
++class PausingPublicationContentStore(FilesystemPreloadContentStore):
++    def __init__(self, base_dir: Path) -> None:
++        super().__init__(base_dir)
++        self.publication_started = threading.Event()
++        self.continue_publication = threading.Event()
++        self._pause_once = True
++
++    def put_if_absent(self, user_id: str, preload_id: str, content: str) -> bool:
++        if self._pause_once and (user_id, preload_id) == (_USER_ID, _OPERATION_ID):
++            self._pause_once = False
++            self.publication_started.set()
++            if not self.continue_publication.wait(timeout=2):
++                raise TimeoutError("Test did not release the stale publisher")
++        return super().put_if_absent(user_id, preload_id, content)
++
++
++class FailOnceRetirementContentStore(FilesystemPreloadContentStore):
++    def __init__(self, base_dir: Path) -> None:
++        super().__init__(base_dir)
++        self.retirement_calls = 0
++
++    def retire(self, user_id: str, preload_id: str) -> bool:
++        self.retirement_calls += 1
++        if self.retirement_calls == 1:
++            raise OSError("simulated retirement failure")
++        return super().retire(user_id, preload_id)
++
++
++class PreloadHandoffWorkflowTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._rate_environment = _rate_environment()
++        self._rate_environment.start()
++        self.addCleanup(self._rate_environment.stop)
++        self._tempdir = tempfile.TemporaryDirectory()
++        directory = Path(self._tempdir.name)
++        self.preload_path = directory / "preloads.json"
++        self.usage = JsonUsageRepository(directory / "usage.json")
++        self.subscriptions = JsonSubscriptionRepository(directory / "subscriptions.json")
++        self.content_dir = directory / "content"
++
++    def tearDown(self) -> None:
++        self._tempdir.cleanup()
++
++    def _request(self) -> PagePreloadRequest:
++        return PagePreloadRequest(
++            page_url=_PAGE_URL,
++            page_title="Handoff article",
++            html=_PAGE_HTML,
++            operation_id=_OPERATION_ID,
++        )
++
++    def _meter(self) -> UsageMeter:
++        return UsageMeter(
++            self.subscriptions,
++            self.usage,
++            _USER_ID,
++            reservation_enabled=True,
++        )
++
++    def _submit(self, repository, runner, content_store):
++        return preloading.submit_preload(
++            repository,
++            runner,
++            content_store,
++            _USER_ID,
++            self._request(),
++            usage_meter=self._meter(),
++        )
++
++    def _run_job(self, repository, runner, content_store) -> None:
++        with (
++            mock.patch.object(preloading, "_split_sentences", return_value=["Handoff sentence."]),
++            mock.patch.object(preloading, "_analyze_sentences", return_value=("summary", [], [])),
++            mock.patch.object(preloading, "_extract_study_items", return_value=([], {})),
++        ):
++            preloading.run_preload_job(
++                repository,
++                self.subscriptions,
++                self.usage,
++                content_store,
++                *runner.calls[0],
++            )
++
++    def _expire_handoff(self, repository) -> None:
++        record = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertIsNotNone(record)
++        expired = dict(record)
++        expired["content_handoff_expires_at"] = (
++            datetime.now(UTC) - timedelta(minutes=1)
++        ).isoformat()
++        repository.save(_USER_ID, expired, make_latest=False)
++
++    def test_delayed_same_operation_loser_cannot_reset_a_running_winner(self) -> None:
++        winner_repository = JsonPagePreloadRepository(self.preload_path)
++        create_seen = threading.Event()
++        continue_create = threading.Event()
++        loser_repository = PausingCreateJsonRepository(
++            self.preload_path,
++            create_seen,
++            continue_create,
++        )
++        content = FilesystemPreloadContentStore(self.content_dir)
++        winner_runner = RecordingRunner()
++        loser_runner = RecordingRunner()
++        loser_errors: list[BaseException] = []
++
++        def delayed_submit() -> None:
++            try:
++                self._submit(loser_repository, loser_runner, content)
++            except BaseException as exc:
++                loser_errors.append(exc)
++
++        loser_thread = threading.Thread(target=delayed_submit)
++        loser_thread.start()
++        try:
++            self.assertTrue(create_seen.wait(timeout=2))
++            self._submit(winner_repository, winner_runner, content)
++            winner = winner_repository.get_by_id(_USER_ID, _OPERATION_ID)
++            claimed = winner_repository.claim_processing(
++                _USER_ID,
++                _OPERATION_ID,
++                winner["learner_profile_fingerprint"],
++                lease_id="winner-lease",
++                now=datetime.now(UTC),
++                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
++            )
++            self.assertIsNotNone(claimed)
++            winning_content = content.get(_USER_ID, _OPERATION_ID)
++        finally:
++            continue_create.set()
++            loser_thread.join(timeout=2)
++
++        self.assertFalse(loser_thread.is_alive())
++        self.assertEqual(loser_errors, [])
++        current = winner_repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(current["status"], "running")
++        self.assertEqual(current["lease_id"], "winner-lease")
++        self.assertEqual(content.get(_USER_ID, _OPERATION_ID), winning_content)
++        self.assertEqual(len(winner_runner.calls), 1)
++        self.assertEqual(loser_runner.calls, [])
++        self.assertEqual(self._meter().get_operation(_OPERATION_ID).state, "reserved")
++
++    def test_delayed_same_operation_loser_cannot_replace_a_finished_winner(self) -> None:
++        winner_repository = JsonPagePreloadRepository(self.preload_path)
++        create_seen = threading.Event()
++        continue_create = threading.Event()
++        loser_repository = PausingCreateJsonRepository(
++            self.preload_path,
++            create_seen,
++            continue_create,
++        )
++        content = FilesystemPreloadContentStore(self.content_dir)
++        winner_runner = RecordingRunner()
++        loser_runner = RecordingRunner()
++        loser_errors: list[BaseException] = []
++
++        def delayed_submit() -> None:
++            try:
++                self._submit(loser_repository, loser_runner, content)
++            except BaseException as exc:
++                loser_errors.append(exc)
++
++        loser_thread = threading.Thread(target=delayed_submit)
++        loser_thread.start()
++        try:
++            self.assertTrue(create_seen.wait(timeout=2))
++            self._submit(winner_repository, winner_runner, content)
++            self._run_job(winner_repository, winner_runner, content)
++            finished = winner_repository.get_by_id(_USER_ID, _OPERATION_ID)
++        finally:
++            continue_create.set()
++            loser_thread.join(timeout=2)
++
++        self.assertFalse(loser_thread.is_alive())
++        self.assertEqual(loser_errors, [])
++        current = winner_repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(current["status"], "ready")
++        self.assertEqual(current["summary"], finished["summary"])
++        self.assertIsNone(content.get(_USER_ID, _OPERATION_ID))
++        self.assertEqual(len(winner_runner.calls), 1)
++        self.assertEqual(loser_runner.calls, [])
++        self.assertEqual(self._meter().get_operation(_OPERATION_ID).state, "finalized")
++
++    def test_expired_pending_handoff_is_recovered_by_the_same_operation(self) -> None:
++        repository = JsonPagePreloadRepository(self.preload_path)
++        content = CrashBeforePublicationContentStore(self.content_dir)
++        runner = RecordingRunner()
++
++        with self.assertRaisesRegex(KeyboardInterrupt, "handoff crash"):
++            self._submit(repository, runner, content)
++
++        pending = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(pending["status"], "content_pending")
++        self._expire_handoff(repository)
++        replay = self._submit(repository, runner, content)
++
++        self.assertEqual(replay.status, "processing")
++        self.assertEqual(len(runner.calls), 1)
++        self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
++        self.assertEqual(self._meter().get_operation(_OPERATION_ID).state, "reserved")
++
++    def test_conflicting_same_operation_does_not_mutate_or_enqueue_the_winner(self) -> None:
++        repository = JsonPagePreloadRepository(self.preload_path)
++        content = FilesystemPreloadContentStore(self.content_dir)
++        runner = RecordingRunner()
++        self._submit(repository, runner, content)
++        winner = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        conflicting_request = self._request().model_copy(
++            update={
++                "html": _CONFLICTING_PAGE_HTML,
++            }
++        )
++
++        with self.assertRaises(EntitlementError) as raised:
++            preloading.submit_preload(
++                repository,
++                runner,
++                content,
++                _USER_ID,
++                conflicting_request,
++                usage_meter=self._meter(),
++            )
++
++        self.assertEqual(raised.exception.status_code, 409)
++        current = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(current["payload_hash"], winner["payload_hash"])
++        self.assertEqual(len(runner.calls), 1)
++        self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
++
++    def test_stale_publication_cannot_recreate_content_after_winner_retires(self) -> None:
++        first_repository = JsonPagePreloadRepository(self.preload_path)
++        winner_repository = JsonPagePreloadRepository(self.preload_path)
++        content = PausingPublicationContentStore(self.content_dir)
++        self.assertTrue(content.put_if_absent("unrelated-user", "other-op", "other private body"))
++        stale_runner = RecordingRunner()
++        winner_runner = RecordingRunner()
++        stale_errors: list[BaseException] = []
++
++        def stale_submit() -> None:
++            try:
++                self._submit(first_repository, stale_runner, content)
++            except BaseException as exc:
++                stale_errors.append(exc)
++
++        stale_thread = threading.Thread(target=stale_submit)
++        stale_thread.start()
++        try:
++            self.assertTrue(content.publication_started.wait(timeout=2))
++            self._expire_handoff(winner_repository)
++            self._submit(winner_repository, winner_runner, content)
++            self._run_job(winner_repository, winner_runner, content)
++        finally:
++            content.continue_publication.set()
++            stale_thread.join(timeout=2)
++
++        self.assertFalse(stale_thread.is_alive())
++        self.assertEqual(stale_errors, [])
++        self.assertEqual(len(stale_runner.calls), 0)
++        self.assertEqual(len(winner_runner.calls), 1)
++        self.assertEqual(
++            winner_repository.get_by_id(_USER_ID, _OPERATION_ID)["status"],
++            "ready",
++        )
++        self.assertIsNone(content.get(_USER_ID, _OPERATION_ID))
++        self.assertFalse(content.put_if_absent(_USER_ID, _OPERATION_ID, "stale private body"))
++        self.assertEqual(content.get("unrelated-user", "other-op"), "other private body")
++        self.assertEqual(self._meter().get_operation(_OPERATION_ID).state, "finalized")
++
++    def test_stale_superseded_worker_cannot_release_or_clean_up_a_newer_lease(self) -> None:
++        source_repository = JsonPagePreloadRepository(self.preload_path)
++        latest_lookup_seen = threading.Event()
++        continue_latest_lookup = threading.Event()
++        stale_repository = PausingLatestJsonRepository(
++            self.preload_path,
++            latest_lookup_seen,
++            continue_latest_lookup,
++        )
++        content = FilesystemPreloadContentStore(self.content_dir)
++        old_runner = RecordingRunner()
++        newest_runner = RecordingRunner()
++        stale_errors: list[BaseException] = []
++        self._submit(source_repository, old_runner, content)
++        old = source_repository.get_by_id(_USER_ID, _OPERATION_ID)
++
++        def stale_worker() -> None:
++            try:
++                preloading.run_preload_job(
++                    stale_repository,
++                    self.subscriptions,
++                    self.usage,
++                    content,
++                    *old_runner.calls[0],
++                )
++            except BaseException as exc:
++                stale_errors.append(exc)
++
++        stale_thread = threading.Thread(target=stale_worker)
++        stale_thread.start()
++        try:
++            self.assertTrue(latest_lookup_seen.wait(timeout=2))
++            newest_request = self._request().model_copy(
++                update={
++                    "operation_id": "019b63f8-f600-7000-8000-000000000102",
++                    "learner_level": "Changed learner profile",
++                }
++            )
++            preloading.submit_preload(
++                source_repository,
++                newest_runner,
++                content,
++                _USER_ID,
++                newest_request,
++                usage_meter=self._meter(),
++            )
++            claimed = source_repository.claim_processing(
++                _USER_ID,
++                _OPERATION_ID,
++                old["learner_profile_fingerprint"],
++                lease_id="concurrent-worker-lease",
++                now=datetime.now(UTC),
++                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
++            )
++            self.assertIsNotNone(claimed)
++        finally:
++            continue_latest_lookup.set()
++            stale_thread.join(timeout=2)
++
++        self.assertFalse(stale_thread.is_alive())
++        self.assertEqual(stale_errors, [])
++        current_old = source_repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(current_old["status"], "running")
++        self.assertEqual(current_old["lease_id"], "concurrent-worker-lease")
++        self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
++        self.assertEqual(self._meter().get_operation(_OPERATION_ID).state, "reserved")
++        self.assertEqual(
++            source_repository.get_by_page_url(_USER_ID, _PAGE_URL)["id"],
++            newest_request.operation_id,
++        )
++
++    def test_retirement_failure_remains_retryable_without_provider_replay(self) -> None:
++        repository = JsonPagePreloadRepository(self.preload_path)
++        content = FailOnceRetirementContentStore(self.content_dir)
++        runner = RecordingRunner()
++        self._submit(repository, runner, content)
++        self._run_job(repository, runner, content)
++
++        first = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(first["status"], "ready")
++        self.assertTrue(first["content_retirement_pending"])
++        self.assertIsNotNone(content.get(_USER_ID, _OPERATION_ID))
++
++        with mock.patch.object(
++            preloading,
++            "_split_sentences",
++            side_effect=AssertionError("provider work must not replay"),
++        ):
++            preloading.run_preload_job(
++                repository,
++                self.subscriptions,
++                self.usage,
++                content,
++                *runner.calls[0],
++            )
++
++        recovered = repository.get_by_id(_USER_ID, _OPERATION_ID)
++        self.assertEqual(recovered["status"], "ready")
++        self.assertFalse(recovered.get("content_retirement_pending"))
++        self.assertIsNone(content.get(_USER_ID, _OPERATION_ID))
++        self.assertEqual(content.retirement_calls, 2)
++
++
++if __name__ == "__main__":
++    unittest.main()

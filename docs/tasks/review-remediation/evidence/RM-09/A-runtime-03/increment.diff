@@ -1,0 +1,111 @@
+--- docs/tasks/review-remediation/evidence/RM-09/A-runtime-02/source/backend/accounts/services/billing_flow.py	2026-09-14 20:05:22
++++ backend/accounts/services/billing_flow.py	2026-09-14 20:08:57
+@@ -155,11 +155,11 @@
+             raise _safe_checkout_conflict(
+                 "The saved checkout session is not discoverable; reconciliation is required."
+             )
+-        relevant = matching_sessions
+ 
+     reusable: list[HistoricalCheckout] = []
+-    if operation_id is not None and not any(
+-        checkout.operation_id == operation_id for checkout in relevant
++    if operation_id is not None and (
++        not any(checkout.operation_id == operation_id for checkout in relevant)
++        or (checkout_session_id is not None and matching_sessions[0].operation_id != operation_id)
+     ):
+         raise _safe_checkout_conflict(
+             "The saved checkout operation is not discoverable; reconciliation is required."
+--- docs/tasks/review-remediation/evidence/RM-09/A-runtime-02/source/backend/test_billing.py	2026-09-14 20:05:22
++++ backend/test_billing.py	2026-09-14 20:08:12
+@@ -995,6 +995,83 @@
+                     **{
+                         **historical.__dict__,
+                         "stripe_checkout_session_id": "cs_replaced",
++                    }
++                ),
++            ),
++            complete=True,
++        )
++
++        with self.assertRaises(BillingError) as context:
++            self._start(repository, provider)
++        self.assertEqual(context.exception.status_code, 409)
++
++    def test_adopted_checkout_does_not_ignore_another_open_session(self):
++        historical = HistoricalCheckout(
++            stripe_checkout_session_id="cs_saved",
++            url="https://checkout.example/saved",
++            state="open",
++            user_id=self.user.id,
++            requested_plan="pro",
++            price_id="price_pro",
++            success_url="https://app.example/billing/done?state=success",
++            cancel_url="https://app.example/billing/done?state=cancel",
++        )
++        provider = _PendingCheckoutProvider(
++            discovery=CheckoutDiscovery(sessions=(historical,), complete=True)
++        )
++        repository = JsonSubscriptionRepository(self.path)
++        self._start(repository, provider)
++        provider.discovery_factory = lambda _user, _customer: CheckoutDiscovery(
++            sessions=(
++                historical,
++                HistoricalCheckout(
++                    **{
++                        **historical.__dict__,
++                        "stripe_checkout_session_id": "cs_other_open",
++                        "url": "https://checkout.example/other",
++                    }
++                ),
++            ),
++            complete=True,
++        )
++
++        with self.assertRaises(BillingError) as context:
++            self._start(repository, provider)
++        self.assertEqual(context.exception.status_code, 409)
++
++    def test_terminal_adopted_session_cannot_replace_while_another_subscription_is_active(self):
++        historical = HistoricalCheckout(
++            stripe_checkout_session_id="cs_saved",
++            url="https://checkout.example/saved",
++            state="open",
++            user_id=self.user.id,
++            requested_plan="pro",
++            price_id="price_pro",
++            success_url="https://app.example/billing/done?state=success",
++            cancel_url="https://app.example/billing/done?state=cancel",
++        )
++        provider = _PendingCheckoutProvider(
++            discovery=CheckoutDiscovery(sessions=(historical,), complete=True)
++        )
++        repository = JsonSubscriptionRepository(self.path)
++        self._start(repository, provider)
++        provider.discovery_factory = lambda _user, _customer: CheckoutDiscovery(
++            sessions=(
++                HistoricalCheckout(
++                    **{
++                        **historical.__dict__,
++                        "state": "expired",
++                        "url": None,
++                    }
++                ),
++                HistoricalCheckout(
++                    **{
++                        **historical.__dict__,
++                        "stripe_checkout_session_id": "cs_other_complete",
++                        "state": "complete",
++                        "url": None,
++                        "stripe_subscription_id": "sub_active",
++                        "subscription_status": "active",
+                     }
+                 ),
+             ),
+@@ -1004,6 +1081,7 @@
+         with self.assertRaises(BillingError) as context:
+             self._start(repository, provider)
+         self.assertEqual(context.exception.status_code, 409)
++        self.assertEqual(provider.calls, [])
+ 
+     def test_concurrent_adapters_share_one_operation_and_provider_idempotency_key(self):
+         provider = _PendingCheckoutProvider()

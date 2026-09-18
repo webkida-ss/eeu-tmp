@@ -1,0 +1,1741 @@
+diff --git a/.github/workflows/deploy-reading-assistant.yml b/.github/workflows/deploy-reading-assistant.yml
+index 5d4e2d7..9d57e62 100644
+--- a/.github/workflows/deploy-reading-assistant.yml
++++ b/.github/workflows/deploy-reading-assistant.yml
+@@ -62,6 +62,10 @@ jobs:
+       replacement_path_count: ${{ steps.record.outputs.replacement_path_count }}
+       sensitive_path_count: ${{ steps.record.outputs.sensitive_path_count }}
+       sensitive_output_count: ${{ steps.record.outputs.sensitive_output_count }}
++      package_key: ${{ steps.record.outputs.package_key }}
++      package_digest: ${{ steps.record.outputs.package_digest }}
++      package_version_id: ${{ steps.record.outputs.package_version_id }}
++      package_destination: ${{ steps.record.outputs.package_destination }}
+     env:
+       TF_IN_AUTOMATION: "true"
+       TF_INPUT: "false"
+@@ -99,20 +103,31 @@ jobs:
+           AWS_APPLY_ROLE_ARN: ${{ vars.AWS_APPLY_ROLE_ARN_DEV }}
+           TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+           TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
++          POLICY_ACTOR_ID: ${{ github.actor_id }}
++          POLICY_REPOSITORY: ${{ github.repository }}
++          POLICY_GIT_REF: ${{ github.ref }}
++          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
++          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
++          POLICY_RUN_ID: ${{ github.run_id }}
++          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
++          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
++          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
++          DEPLOY_OPERATION: ${{ inputs.operation }}
++          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+         run: |
+           python scripts/exact_plan_policy.py gate-deploy \
+             --trusted-actor-ids "${TRUSTED_DEPLOY_ACTOR_IDS}" \
+-            --actor-id "${{ github.actor_id }}" \
+-            --repository "${{ github.repository }}" \
+-            --git-ref "${{ github.ref }}" \
+-            --workflow-ref "${{ github.workflow_ref }}" \
+-            --checked-out-sha "${{ steps.checkout.outputs.sha }}" \
+-            --run-id "${{ github.run_id }}" \
+-            --run-attempt "${{ github.run_attempt }}" \
+-            --ref-protected "${{ github.ref_protected }}" \
+-            --environment "${{ inputs.environment }}" \
+-            --operation "${{ inputs.operation }}" \
+-            --production-confirmation "${{ inputs.production_confirmation }}" \
++            --actor-id "${POLICY_ACTOR_ID}" \
++            --repository "${POLICY_REPOSITORY}" \
++            --git-ref "${POLICY_GIT_REF}" \
++            --workflow-ref "${POLICY_WORKFLOW_REF}" \
++            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
++            --run-id "${POLICY_RUN_ID}" \
++            --run-attempt "${POLICY_RUN_ATTEMPT}" \
++            --ref-protected "${POLICY_REF_PROTECTED}" \
++            --environment "${DEPLOY_ENVIRONMENT}" \
++            --operation "${DEPLOY_OPERATION}" \
++            --production-confirmation "${PRODUCTION_CONFIRMATION}" \
+             --plan-role-arn "${AWS_PLAN_ROLE_ARN}" \
+             --apply-role-arn "${AWS_APPLY_ROLE_ARN}" \
+             --bucket "${TERRAFORM_PLAN_BUCKET}" \
+@@ -130,20 +145,31 @@ jobs:
+           AWS_APPLY_ROLE_ARN: ${{ vars.AWS_APPLY_ROLE_ARN_PROD }}
+           TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
+           TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
++          POLICY_ACTOR_ID: ${{ github.actor_id }}
++          POLICY_REPOSITORY: ${{ github.repository }}
++          POLICY_GIT_REF: ${{ github.ref }}
++          POLICY_WORKFLOW_REF: ${{ github.workflow_ref }}
++          POLICY_CHECKED_OUT_SHA: ${{ steps.checkout.outputs.sha }}
++          POLICY_RUN_ID: ${{ github.run_id }}
++          POLICY_RUN_ATTEMPT: ${{ github.run_attempt }}
++          POLICY_REF_PROTECTED: ${{ github.ref_protected }}
++          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
++          DEPLOY_OPERATION: ${{ inputs.operation }}
++          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+         run: |
+           python scripts/exact_plan_policy.py gate-deploy \
+             --trusted-actor-ids "${TRUSTED_DEPLOY_ACTOR_IDS}" \
+-            --actor-id "${{ github.actor_id }}" \
+-            --repository "${{ github.repository }}" \
+-            --git-ref "${{ github.ref }}" \
+-            --workflow-ref "${{ github.workflow_ref }}" \
+-            --checked-out-sha "${{ steps.checkout.outputs.sha }}" \
+-            --run-id "${{ github.run_id }}" \
+-            --run-attempt "${{ github.run_attempt }}" \
+-            --ref-protected "${{ github.ref_protected }}" \
+-            --environment "${{ inputs.environment }}" \
+-            --operation "${{ inputs.operation }}" \
+-            --production-confirmation "${{ inputs.production_confirmation }}" \
++            --actor-id "${POLICY_ACTOR_ID}" \
++            --repository "${POLICY_REPOSITORY}" \
++            --git-ref "${POLICY_GIT_REF}" \
++            --workflow-ref "${POLICY_WORKFLOW_REF}" \
++            --checked-out-sha "${POLICY_CHECKED_OUT_SHA}" \
++            --run-id "${POLICY_RUN_ID}" \
++            --run-attempt "${POLICY_RUN_ATTEMPT}" \
++            --ref-protected "${POLICY_REF_PROTECTED}" \
++            --environment "${DEPLOY_ENVIRONMENT}" \
++            --operation "${DEPLOY_OPERATION}" \
++            --production-confirmation "${PRODUCTION_CONFIRMATION}" \
+             --plan-role-arn "${AWS_PLAN_ROLE_ARN}" \
+             --apply-role-arn "${AWS_APPLY_ROLE_ARN}" \
+             --bucket "${TERRAFORM_PLAN_BUCKET}" \
+@@ -260,10 +286,26 @@ jobs:
+             --kms-key-arn "${TERRAFORM_PLAN_KMS_KEY_ARN}" \
+             --apply-role-arn "${{ steps.gate-dev.outputs.apply_role_arn || steps.gate-prod.outputs.apply_role_arn }}" \
+             --plan-file tfplan \
++            --package-file ../../../backend/dist/reading-assistant-lambda.zip \
+             --classification "${RUNNER_TEMP}/terraform-plan-classification.json" \
+             --output "${RUNNER_TEMP}/plan-descriptor.json" \
+             --github-output "${GITHUB_OUTPUT}"
+ 
++      - name: Store exact encrypted versioned Lambda package
++        working-directory: infra/envs/${{ inputs.environment }}
++        env:
++          TERRAFORM_PLAN_BUCKET: ${{ vars.TERRAFORM_PLAN_BUCKET }}
++          TERRAFORM_PLAN_KMS_KEY_ARN: ${{ vars.TERRAFORM_PLAN_KMS_KEY_ARN }}
++        run: |
++          aws s3api put-object \
++            --bucket "${TERRAFORM_PLAN_BUCKET}" \
++            --key "${{ steps.descriptor.outputs.package_key }}" \
++            --body ../../../backend/dist/reading-assistant-lambda.zip \
++            --server-side-encryption aws:kms \
++            --ssekms-key-id "${TERRAFORM_PLAN_KMS_KEY_ARN}" \
++            --metadata "commit-sha=${{ steps.gate-dev.outputs.commit_sha || steps.gate-prod.outputs.commit_sha }},environment=${{ inputs.environment }},run-id=${{ github.run_id }},run-attempt=${{ github.run_attempt }},plan-sha256=${{ steps.descriptor.outputs.plan_digest }},apply-role-sha256=${{ steps.descriptor.outputs.apply_role_digest }},workflow-ref-sha256=${{ steps.descriptor.outputs.workflow_ref_digest }},classification-sha256=${{ steps.summary.outputs.classification_sha256 }},presentation-limits-sha256=${{ steps.summary.outputs.presentation_limits_sha256 }},review-summary-sha256=${{ steps.summary.outputs.review_summary_sha256 }},resource-count=${{ steps.summary.outputs.resource_count }},drift-count=${{ steps.summary.outputs.drift_count }},output-count=${{ steps.summary.outputs.output_count }},high-risk-resource-count=${{ steps.summary.outputs.high_risk_resource_count }},high-risk-drift-count=${{ steps.summary.outputs.high_risk_drift_count }},replacement-path-count=${{ steps.summary.outputs.replacement_path_count }},sensitive-path-count=${{ steps.summary.outputs.sensitive_path_count }},sensitive-output-count=${{ steps.summary.outputs.sensitive_output_count }},package-sha256=${{ steps.descriptor.outputs.package_digest }}" \
++            > "${RUNNER_TEMP}/put-package.json"
++
+       - name: Store exact encrypted versioned plan
+         working-directory: infra/envs/${{ inputs.environment }}
+         env:
+@@ -285,6 +327,7 @@ jobs:
+           python scripts/exact_plan_policy.py record-version \
+             --descriptor "${RUNNER_TEMP}/plan-descriptor.json" \
+             --upload-response "${RUNNER_TEMP}/put-object.json" \
++            --package-upload-response "${RUNNER_TEMP}/put-package.json" \
+             --output "${RUNNER_TEMP}/plan-record.json" \
+             --github-output "${GITHUB_OUTPUT}"
+ 
+@@ -383,6 +426,11 @@ jobs:
+             --digest "${{ needs.plan.outputs.plan_digest }}" \
+             --apply-role-digest "${{ needs.plan.outputs.apply_role_digest }}" \
+             --record-digest "${{ needs.plan.outputs.plan_record_digest }}" \
++            --require-package \
++            --package-key "${{ needs.plan.outputs.package_key }}" \
++            --package-version-id "${{ needs.plan.outputs.package_version_id }}" \
++            --package-digest "${{ needs.plan.outputs.package_digest }}" \
++            --package-destination "${{ needs.plan.outputs.package_destination }}" \
+             --classification-sha256 "${{ needs.plan.outputs.classification_sha256 }}" \
+             --presentation-limits-sha256 "${{ needs.plan.outputs.presentation_limits_sha256 }}" \
+             --review-summary-sha256 "${{ needs.plan.outputs.review_summary_sha256 }}" \
+@@ -414,12 +462,24 @@ jobs:
+             --key "${{ needs.plan.outputs.plan_key }}" \
+             --version-id "${{ needs.plan.outputs.plan_version_id }}" \
+             > "${RUNNER_TEMP}/head-object.json"
++          aws s3api head-object \
++            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
++            --key "${{ needs.plan.outputs.package_key }}" \
++            --version-id "${{ needs.plan.outputs.package_version_id }}" \
++            > "${RUNNER_TEMP}/head-package.json"
++          mkdir -p backend/dist
+           aws s3api get-object \
+             --bucket "${{ needs.plan.outputs.plan_bucket }}" \
+             --key "${{ needs.plan.outputs.plan_key }}" \
+             --version-id "${{ needs.plan.outputs.plan_version_id }}" \
+             "infra/envs/${{ inputs.environment }}/tfplan" \
+             > "${RUNNER_TEMP}/get-object.json"
++          aws s3api get-object \
++            --bucket "${{ needs.plan.outputs.plan_bucket }}" \
++            --key "${{ needs.plan.outputs.package_key }}" \
++            --version-id "${{ needs.plan.outputs.package_version_id }}" \
++            "backend/dist/reading-assistant-lambda.zip" \
++            > "${RUNNER_TEMP}/get-package.json"
+ 
+       - name: Verify exact version metadata environment commit and digest
+         run: |
+@@ -438,6 +498,11 @@ jobs:
+             --digest "${{ needs.plan.outputs.plan_digest }}" \
+             --apply-role-digest "${{ needs.plan.outputs.apply_role_digest }}" \
+             --record-digest "${{ needs.plan.outputs.plan_record_digest }}" \
++            --require-package \
++            --package-key "${{ needs.plan.outputs.package_key }}" \
++            --package-version-id "${{ needs.plan.outputs.package_version_id }}" \
++            --package-digest "${{ needs.plan.outputs.package_digest }}" \
++            --package-destination "${{ needs.plan.outputs.package_destination }}" \
+             --classification-sha256 "${{ needs.plan.outputs.classification_sha256 }}" \
+             --presentation-limits-sha256 "${{ needs.plan.outputs.presentation_limits_sha256 }}" \
+             --review-summary-sha256 "${{ needs.plan.outputs.review_summary_sha256 }}" \
+@@ -451,7 +516,10 @@ jobs:
+             --sensitive-output-count "${{ needs.plan.outputs.sensitive_output_count }}" \
+             --head-response "${RUNNER_TEMP}/head-object.json" \
+             --get-response "${RUNNER_TEMP}/get-object.json" \
+-            --plan-file "infra/envs/${{ inputs.environment }}/tfplan"
++            --plan-file "infra/envs/${{ inputs.environment }}/tfplan" \
++            --package-head-response "${RUNNER_TEMP}/head-package.json" \
++            --package-get-response "${RUNNER_TEMP}/get-package.json" \
++            --package-file "backend/dist/reading-assistant-lambda.zip"
+ 
+       - name: Terraform init
+         working-directory: infra/envs/${{ inputs.environment }}
+@@ -506,6 +574,10 @@ jobs:
+               "${RUNNER_TEMP}/terraform-apply-show.stderr"
+             exit 1
+           fi
++          python ../../../scripts/exact_plan_policy.py verify-lambda-package \
++            --plan "${RUNNER_TEMP}/terraform-apply-plan.json" \
++            --package-file ../../../backend/dist/reading-assistant-lambda.zip \
++            --package-digest "${{ needs.plan.outputs.package_digest }}"
+           rm -f "${RUNNER_TEMP}/terraform-apply-plan.json" \
+             "${RUNNER_TEMP}/terraform-apply-show.stderr"
+ 
+diff --git a/backend/test_exact_plan_cli.py b/backend/test_exact_plan_cli.py
+index 01c4632..73b189b 100644
+--- a/backend/test_exact_plan_cli.py
++++ b/backend/test_exact_plan_cli.py
+@@ -1,9 +1,11 @@
+ from __future__ import annotations
+ 
++import base64
+ import hashlib
+ import json
+ import os
+ import re
++import shlex
+ import subprocess
+ import sys
+ import threading
+@@ -29,6 +31,7 @@ CLASSIFICATION_COUNT_KEYS = (
+     "sensitive_output_count",
+     "sensitive_path_count",
+ )
++PACKAGE_DESTINATION = "backend/dist/reading-assistant-lambda.zip"
+ 
+ 
+ class GitHubHandler(BaseHTTPRequestHandler):
+@@ -75,7 +78,9 @@ def github_api() -> str:
+         server.server_close()
+ 
+ 
+-def run_cli(args: list[str], *, api_url: str | None = None) -> subprocess.CompletedProcess[str]:
++def run_cli(
++    args: list[str], *, api_url: str | None = None, cwd: Path = ROOT
++) -> subprocess.CompletedProcess[str]:
+     environment = {
+         **os.environ,
+         "PYTHONPATH": str(ROOT),
+@@ -85,7 +90,7 @@ def run_cli(args: list[str], *, api_url: str | None = None) -> subprocess.Comple
+         environment["GITHUB_API_URL"] = api_url
+     return subprocess.run(
+         [sys.executable, str(CLI), *args],
+-        cwd=ROOT,
++        cwd=cwd,
+         env=environment,
+         text=True,
+         capture_output=True,
+@@ -211,12 +216,172 @@ def expected_record_digest(values: dict[str, str]) -> str:
+         "presentation_limits_sha256": values["presentation_limits_sha256"],
+         "review_summary_sha256": values["review_summary_sha256"],
+     }
++    package_keys = {
++        "package_key",
++        "package_version_id",
++        "package_digest",
++        "package_destination",
++    }
++    if package_keys.intersection(values):
++        assert package_keys.issubset(values)
++        binding["package"] = {
++            "destination": values["package_destination"],
++            "digest": values["package_digest"],
++            "key": values["package_key"],
++            "version_id": values["package_version_id"],
++        }
+     binding.update({key: int(values[key]) for key in CLASSIFICATION_COUNT_KEYS})
+     return hashlib.sha256(
+         json.dumps(binding, separators=(",", ":"), sort_keys=True).encode()
+     ).hexdigest()
+ 
+ 
++class FakeVersionedS3:
++    """A version-aware, local stand-in for the apply job's S3 API calls."""
++
++    def __init__(self) -> None:
++        self.objects: dict[str, dict[str, object]] = {}
++
++    def add_object(
++        self,
++        *,
++        bucket: str,
++        key: str,
++        version_id: str,
++        body: bytes,
++        metadata: dict[str, str],
++        destination: str,
++        get_response: dict[str, object] | None = None,
++        head_response: dict[str, object] | None = None,
++    ) -> None:
++        response = {
++            "VersionId": version_id,
++            "ServerSideEncryption": "aws:kms",
++            "SSEKMSKeyId": KMS_ARN,
++            "Metadata": metadata,
++        }
++        self.objects["\0".join((bucket, key, version_id))] = {
++            "body": base64.b64encode(body).decode("ascii"),
++            "destination": destination,
++            "get_response": get_response or response,
++            "head_response": head_response or response,
++        }
++
++    def install_cli(self, tmp_path: Path) -> Path:
++        store = tmp_path / "fake-versioned-s3.json"
++        store.write_text(json.dumps(self.objects), encoding="utf-8")
++        executable = tmp_path / "bin" / "aws"
++        executable.parent.mkdir(parents=True)
++        executable.write_text(
++            """#!/usr/bin/env python3
++import base64
++import json
++import os
++import sys
++from pathlib import Path
++
++
++def option(arguments, name):
++    try:
++        return arguments[arguments.index(name) + 1]
++    except (ValueError, IndexError) as error:
++        raise SystemExit(f"missing {name}") from error
++
++
++arguments = sys.argv[1:]
++if len(arguments) < 2 or arguments[0] != "s3api" or arguments[1] not in {
++    "head-object", "get-object"
++}:
++    raise SystemExit("unexpected fake AWS operation")
++operation = arguments[1]
++bucket = option(arguments, "--bucket")
++key = option(arguments, "--key")
++version_id = option(arguments, "--version-id")
++store = json.loads(Path(os.environ["FAKE_VERSIONED_S3"]).read_text(encoding="utf-8"))
++item = store.get("\\0".join((bucket, key, version_id)))
++if item is None:
++    raise SystemExit("requested object version is absent from fake S3")
++if operation == "get-object":
++    destination = Path(arguments[-1])
++    if destination.as_posix() != item["destination"]:
++        raise SystemExit("fake S3 rejected a non-workflow download destination")
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    destination.write_bytes(base64.b64decode(item["body"]))
++    response = item["get_response"]
++else:
++    response = item["head_response"]
++print(json.dumps(response))
++""",
++            encoding="utf-8",
++        )
++        executable.chmod(0o755)
++        return executable.parent
++
++
++def package_metadata(values: dict[str, str]) -> dict[str, str]:
++    metadata = {
++        "apply-role-sha256": values["apply_role_digest"],
++        "commit-sha": COMMIT,
++        "environment": "prod",
++        "plan-sha256": values["plan_digest"],
++        "run-attempt": "2",
++        "run-id": "100",
++        "workflow-ref-sha256": hashlib.sha256(WORKFLOW_REF.encode()).hexdigest(),
++        "classification-sha256": values["classification_sha256"],
++        "presentation-limits-sha256": values["presentation_limits_sha256"],
++        "review-summary-sha256": values["review_summary_sha256"],
++    }
++    metadata.update({key.replace("_", "-"): values[key] for key in CLASSIFICATION_COUNT_KEYS})
++    return metadata
++
++
++def remove_option_and_value(command: list[str], option: str) -> list[str]:
++    position = command.index(option)
++    return command[:position] + command[position + 2 :]
++
++
++def test_fake_versioned_s3_rejects_unknown_operations_and_object_versions(tmp_path: Path) -> None:
++    storage = FakeVersionedS3()
++    storage.add_object(
++        bucket="private-plan-bucket",
++        key="terraform-plans/100/2/prod/exact/tfplan",
++        version_id="exact-version",
++        body=b"exact plan",
++        metadata={},
++        destination="infra/envs/prod/tfplan",
++    )
++    aws_bin = storage.install_cli(tmp_path)
++    environment = {**os.environ, "FAKE_VERSIONED_S3": str(tmp_path / "fake-versioned-s3.json")}
++    unexpected = subprocess.run(
++        [str(aws_bin / "aws"), "s3api", "put-object"],
++        env=environment,
++        text=True,
++        capture_output=True,
++        check=False,
++    )
++    assert unexpected.returncode != 0
++    assert "unexpected fake AWS operation" in unexpected.stderr
++    missing_version = subprocess.run(
++        [
++            str(aws_bin / "aws"),
++            "s3api",
++            "head-object",
++            "--bucket",
++            "private-plan-bucket",
++            "--key",
++            "terraform-plans/100/2/prod/exact/tfplan",
++            "--version-id",
++            "other-version",
++        ],
++        env=environment,
++        text=True,
++        capture_output=True,
++        check=False,
++    )
++    assert missing_version.returncode != 0
++    assert "requested object version is absent" in missing_version.stderr
++
++
+ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, github_api: str) -> None:
+     gate_output = tmp_path / "gate-output"
+     gate = run_cli(gate_args(gate_output), api_url=github_api)
+@@ -262,6 +427,9 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+ 
+     plan = tmp_path / "tfplan"
+     plan.write_bytes(b"opaque exact plan")
++    package = tmp_path / PACKAGE_DESTINATION
++    package.parent.mkdir(parents=True)
++    package.write_bytes(b"approved Lambda package")
+     plan_json = tmp_path / "tfplan.json"
+     plan_json.write_text(
+         json.dumps({"resource_changes": [minimal_change(0)]}),
+@@ -289,6 +457,8 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+             *identity_args(),
+             "--plan-file",
+             str(plan),
++            "--package-file",
++            str(package),
+             "--classification",
+             str(classification),
+             "--output",
+@@ -302,6 +472,8 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+ 
+     upload = tmp_path / "put-object.json"
+     upload.write_text('{"VersionId":"version-1"}', encoding="utf-8")
++    package_upload = tmp_path / "put-package.json"
++    package_upload.write_text('{"VersionId":"package-version-1"}', encoding="utf-8")
+     record = tmp_path / "record.json"
+     record_output = tmp_path / "record-output"
+     recorded = run_cli(
+@@ -311,6 +483,8 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+             str(descriptor),
+             "--upload-response",
+             str(upload),
++            "--package-upload-response",
++            str(package_upload),
+             "--output",
+             str(record),
+             "--github-output",
+@@ -334,6 +508,15 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+             values["apply_role_digest"],
+             "--record-digest",
+             values["plan_record_digest"],
++            "--require-package",
++            "--package-key",
++            values["package_key"],
++            "--package-version-id",
++            values["package_version_id"],
++            "--package-digest",
++            values["package_digest"],
++            "--package-destination",
++            values["package_destination"],
+             *classification_args(values),
+         ]
+     )
+@@ -352,7 +535,47 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+         ),
+         encoding="utf-8",
+     )
+-    get.write_text('{"VersionId":"version-1"}', encoding="utf-8")
++    get.write_text(
++        json.dumps(
++            {
++                "VersionId": "version-1",
++                "ServerSideEncryption": "aws:kms",
++                "SSEKMSKeyId": KMS_ARN,
++                "Metadata": descriptor_data["metadata"],
++            }
++        ),
++        encoding="utf-8",
++    )
++    package_head = tmp_path / "package-head.json"
++    package_get = tmp_path / "package-get.json"
++    package_head.write_text(
++        json.dumps(
++            {
++                "VersionId": values["package_version_id"],
++                "ServerSideEncryption": "aws:kms",
++                "SSEKMSKeyId": KMS_ARN,
++                "Metadata": {
++                    **descriptor_data["metadata"],
++                    "package-sha256": values["package_digest"],
++                },
++            }
++        ),
++        encoding="utf-8",
++    )
++    package_get.write_text(
++        json.dumps(
++            {
++                "VersionId": values["package_version_id"],
++                "ServerSideEncryption": "aws:kms",
++                "SSEKMSKeyId": KMS_ARN,
++                "Metadata": {
++                    **descriptor_data["metadata"],
++                    "package-sha256": values["package_digest"],
++                },
++            }
++        ),
++        encoding="utf-8",
++    )
+     verified = run_cli(
+         [
+             "verify-download",
+@@ -367,6 +590,15 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+             values["apply_role_digest"],
+             "--record-digest",
+             values["plan_record_digest"],
++            "--require-package",
++            "--package-key",
++            values["package_key"],
++            "--package-version-id",
++            values["package_version_id"],
++            "--package-digest",
++            values["package_digest"],
++            "--package-destination",
++            values["package_destination"],
+             *classification_args(values),
+             "--head-response",
+             str(head),
+@@ -374,7 +606,14 @@ def test_workflow_exact_plan_cli_chain_succeeds_end_to_end(tmp_path: Path, githu
+             str(get),
+             "--plan-file",
+             str(plan),
+-        ]
++            "--package-head-response",
++            str(package_head),
++            "--package-get-response",
++            str(package_get),
++            "--package-file",
++            PACKAGE_DESTINATION,
++        ],
++        cwd=tmp_path,
+     )
+     assert verified.returncode == 0, verified.stderr
+     classification_verified = run_cli(
+@@ -466,6 +705,9 @@ def test_apply_cli_rejects_conflicting_record_values(
+         "kms-key",
+         "metadata",
+         "download-version",
++        "get-encryption",
++        "get-kms-key",
++        "get-metadata",
+         "plan-body",
+     ],
+ )
+@@ -502,7 +744,12 @@ def test_verify_download_cli_rejects_s3_kms_and_toctou_failures(
+         "SSEKMSKeyId": KMS_ARN,
+         "Metadata": metadata,
+     }
+-    get_data = {"VersionId": values["plan_version_id"]}
++    get_data = {
++        "VersionId": values["plan_version_id"],
++        "ServerSideEncryption": "aws:kms",
++        "SSEKMSKeyId": KMS_ARN,
++        "Metadata": metadata,
++    }
+     if tamper == "head-version":
+         head_data["VersionId"] = "version-2"
+     elif tamper == "encryption":
+@@ -513,6 +760,12 @@ def test_verify_download_cli_rejects_s3_kms_and_toctou_failures(
+         metadata["commit-sha"] = "b" * 40
+     elif tamper == "download-version":
+         get_data["VersionId"] = "version-2"
++    elif tamper == "get-encryption":
++        get_data["ServerSideEncryption"] = "AES256"
++    elif tamper == "get-kms-key":
++        get_data["SSEKMSKeyId"] = "arn:aws:kms:ap-northeast-1:123456789012:key/other"
++    elif tamper == "get-metadata":
++        get_data["Metadata"] = {"commit-sha": "b" * 40}
+     elif tamper == "plan-body":
+         plan.write_bytes(b"replaced after download")
+ 
+@@ -603,6 +856,473 @@ def test_apply_workflow_uses_only_plan_role_output() -> None:
+     assert "vars.AWS_APPLY_ROLE_ARN" not in apply
+ 
+ 
++def apply_binding_values(
++    tmp_path: Path, terraform_plan: dict[str, object]
++) -> tuple[dict[str, str], bytes, bytes, Path]:
++    plan_bytes = b"opaque exact plan"
++    package_bytes = b"approved Lambda package"
++    plan_json = tmp_path / "terraform-plan.json"
++    classification = tmp_path / "classification.json"
++    plan_json.write_text(json.dumps(terraform_plan), encoding="utf-8")
++    summarized = run_cli(
++        [
++            "summarize-plan",
++            "--input",
++            str(plan_json),
++            "--output",
++            str(tmp_path / "summary.json"),
++            "--classification-output",
++            str(classification),
++        ]
++    )
++    assert summarized.returncode == 0, summarized.stderr
++    classification_data = json.loads(classification.read_text(encoding="utf-8"))
++    values = {
++        "plan_key": f"terraform-plans/100/2/prod/{COMMIT}/tfplan",
++        "plan_version_id": "plan-version-1",
++        "plan_digest": hashlib.sha256(plan_bytes).hexdigest(),
++        "apply_role_arn": APPLY_ROLE,
++        "apply_role_digest": hashlib.sha256(APPLY_ROLE.encode()).hexdigest(),
++        "package_key": f"terraform-plans/100/2/prod/{COMMIT}/reading-assistant-lambda.zip",
++        "package_version_id": "package-version-1",
++        "package_digest": hashlib.sha256(package_bytes).hexdigest(),
++        "package_destination": PACKAGE_DESTINATION,
++        **{
++            key: str(classification_data[key])
++            for key in (
++                "classification_sha256",
++                "presentation_limits_sha256",
++                "review_summary_sha256",
++                *CLASSIFICATION_COUNT_KEYS,
++            )
++        },
++    }
++    values["plan_record_digest"] = expected_record_digest(values)
++    return values, plan_bytes, package_bytes, plan_json
++
++
++def install_fake_terraform(tmp_path: Path) -> Path:
++    executable = tmp_path / "bin" / "terraform"
++    executable.parent.mkdir(parents=True)
++    executable.write_text(
++        """#!/usr/bin/env python3
++import os
++import sys
++from pathlib import Path
++
++arguments = sys.argv[1:]
++if arguments == ["init", "-input=false"]:
++    raise SystemExit(0)
++if arguments == ["show", "-json", "tfplan"]:
++    sys.stdout.write(Path(os.environ["FAKE_TERRAFORM_PLAN"]).read_text(encoding="utf-8"))
++    raise SystemExit(0)
++if arguments == ["apply", "-input=false", "tfplan"]:
++    Path(os.environ["APPLY_SENTINEL"]).touch()
++    raise SystemExit(0)
++raise SystemExit("unexpected fake Terraform operation")
++""",
++        encoding="utf-8",
++    )
++    executable.chmod(0o755)
++    return executable.parent
++
++
++def run_apply_restoration(
++    *,
++    tmp_path: Path,
++    values: dict[str, str],
++    storage: FakeVersionedS3,
++    terraform_plan: Path,
++) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
++    apply_workspace = tmp_path / "empty-apply-workspace"
++    runner_temp = tmp_path / "runner-temp"
++    sentinel = tmp_path / "apply-sentinel"
++    apply_workspace.mkdir()
++    runner_temp.mkdir()
++    assert not any(apply_workspace.iterdir())
++    aws_bin = storage.install_cli(tmp_path / "fake-aws")
++    terraform_bin = install_fake_terraform(tmp_path / "fake-terraform")
++    verify_download = [
++        sys.executable,
++        str(CLI),
++        "verify-download",
++        *identity_args(apply_role=values["apply_role_arn"]),
++        "--key",
++        values["plan_key"],
++        "--version-id",
++        values["plan_version_id"],
++        "--digest",
++        values["plan_digest"],
++        "--apply-role-digest",
++        values["apply_role_digest"],
++        "--record-digest",
++        values["plan_record_digest"],
++        "--require-package",
++        "--package-key",
++        values["package_key"],
++        "--package-version-id",
++        values["package_version_id"],
++        "--package-digest",
++        values["package_digest"],
++        "--package-destination",
++        values["package_destination"],
++        *classification_args(values),
++        "--head-response",
++        str(runner_temp / "head-object.json"),
++        "--get-response",
++        str(runner_temp / "get-object.json"),
++        "--plan-file",
++        "infra/envs/prod/tfplan",
++        "--package-head-response",
++        str(runner_temp / "head-package.json"),
++        "--package-get-response",
++        str(runner_temp / "get-package.json"),
++        "--package-file",
++        PACKAGE_DESTINATION,
++    ]
++    verify_classification = [
++        sys.executable,
++        str(CLI),
++        "verify-classification",
++        "--input",
++        str(runner_temp / "terraform-apply-plan.json"),
++        *classification_args(values),
++    ]
++    verify_package = [
++        sys.executable,
++        str(CLI),
++        "verify-lambda-package",
++        "--plan",
++        str(runner_temp / "terraform-apply-plan.json"),
++        "--package-file",
++        PACKAGE_DESTINATION,
++        "--package-digest",
++        values["package_digest"],
++    ]
++    workflow_restore = f"""
++set -euo pipefail
++aws s3api head-object --bucket private-plan-bucket --key {shlex.quote(values["plan_key"])} --version-id {shlex.quote(values["plan_version_id"])} > {shlex.quote(str(runner_temp / "head-object.json"))}
++aws s3api head-object --bucket private-plan-bucket --key {shlex.quote(values["package_key"])} --version-id {shlex.quote(values["package_version_id"])} > {shlex.quote(str(runner_temp / "head-package.json"))}
++mkdir -p backend/dist
++aws s3api get-object --bucket private-plan-bucket --key {shlex.quote(values["plan_key"])} --version-id {shlex.quote(values["plan_version_id"])} infra/envs/prod/tfplan > {shlex.quote(str(runner_temp / "get-object.json"))}
++aws s3api get-object --bucket private-plan-bucket --key {shlex.quote(values["package_key"])} --version-id {shlex.quote(values["package_version_id"])} {PACKAGE_DESTINATION} > {shlex.quote(str(runner_temp / "get-package.json"))}
++{shlex.join(verify_download)}
++mkdir -p infra/envs/prod
++(
++  cd infra/envs/prod
++  terraform init -input=false
++  terraform show -json tfplan > {shlex.quote(str(runner_temp / "terraform-apply-plan.json"))}
++)
++{shlex.join(verify_classification)}
++{shlex.join(verify_package)}
++(
++  cd infra/envs/prod
++  terraform apply -input=false tfplan
++)
++"""
++    completed = subprocess.run(
++        ["bash", "-c", workflow_restore],
++        cwd=apply_workspace,
++        env={
++            **os.environ,
++            "APPLY_SENTINEL": str(sentinel),
++            "FAKE_TERRAFORM_PLAN": str(terraform_plan),
++            "FAKE_VERSIONED_S3": str(tmp_path / "fake-aws" / "fake-versioned-s3.json"),
++            "PATH": f"{aws_bin}{os.pathsep}{terraform_bin}{os.pathsep}{os.environ['PATH']}",
++            "PYTHONPATH": str(ROOT),
++        },
++        text=True,
++        capture_output=True,
++        check=False,
++    )
++    return completed, apply_workspace, sentinel
++
++
++@pytest.mark.parametrize(
++    "tamper",
++    [
++        "none",
++        "missing-package",
++        "corrupt-package",
++        "package-head-metadata",
++        "package-get-version",
++        "package-get-encryption",
++        "package-get-kms-key",
++        "package-get-metadata",
++        "first-lambda-hash",
++        "second-lambda-hash",
++    ],
++)
++def test_apply_job_restores_only_the_verified_plan_bound_package(
++    tmp_path: Path, tamper: str
++) -> None:
++    package_bytes = b"approved Lambda package"
++    package_digest = hashlib.sha256(package_bytes).hexdigest()
++    source_hash = base64.b64encode(bytes.fromhex(package_digest)).decode("ascii")
++    lambda_hashes = [source_hash, source_hash]
++    if tamper == "first-lambda-hash":
++        lambda_hashes[0] = base64.b64encode(bytes.fromhex("0" * 64)).decode("ascii")
++    elif tamper == "second-lambda-hash":
++        lambda_hashes[1] = base64.b64encode(bytes.fromhex("0" * 64)).decode("ascii")
++    terraform_plan = {
++        "resource_changes": [
++            {
++                "address": f"aws_lambda_function.test[{index}]",
++                "type": "aws_lambda_function",
++                "change": {
++                    "actions": ["update"],
++                    "after": {"source_code_hash": value},
++                },
++            }
++            for index, value in enumerate(lambda_hashes)
++        ]
++    }
++    values, plan_bytes, package_bytes, terraform_plan_path = apply_binding_values(
++        tmp_path, terraform_plan
++    )
++    storage = FakeVersionedS3()
++    plan_metadata = package_metadata(values)
++    package_object_metadata = {
++        **plan_metadata,
++        "package-sha256": values["package_digest"],
++    }
++    storage.add_object(
++        bucket="private-plan-bucket",
++        key=values["plan_key"],
++        version_id=values["plan_version_id"],
++        body=plan_bytes,
++        metadata=plan_metadata,
++        destination="infra/envs/prod/tfplan",
++    )
++    if tamper != "missing-package":
++        package_head = {
++            "VersionId": values["package_version_id"],
++            "ServerSideEncryption": "aws:kms",
++            "SSEKMSKeyId": KMS_ARN,
++            "Metadata": package_object_metadata,
++        }
++        package_get = dict(package_head)
++        if tamper == "package-head-metadata":
++            package_head["Metadata"] = {"commit-sha": COMMIT}
++        elif tamper == "package-get-version":
++            package_get["VersionId"] = "other-package-version"
++        elif tamper == "package-get-encryption":
++            package_get["ServerSideEncryption"] = "AES256"
++        elif tamper == "package-get-kms-key":
++            package_get["SSEKMSKeyId"] = (
++                "arn:aws:kms:ap-northeast-1:123456789012:key/other"
++            )
++        elif tamper == "package-get-metadata":
++            package_get["Metadata"] = {"commit-sha": COMMIT}
++        storage.add_object(
++            bucket="private-plan-bucket",
++            key=values["package_key"],
++            version_id=values["package_version_id"],
++            body=(
++                b"corrupted Lambda package"
++                if tamper == "corrupt-package"
++                else package_bytes
++            ),
++            metadata=package_object_metadata,
++            destination=PACKAGE_DESTINATION,
++            head_response=package_head,
++            get_response=package_get,
++        )
++
++    completed, apply_workspace, sentinel = run_apply_restoration(
++        tmp_path=tmp_path,
++        values=values,
++        storage=storage,
++        terraform_plan=terraform_plan_path,
++    )
++    package_path = apply_workspace / PACKAGE_DESTINATION
++    if tamper == "none":
++        assert completed.returncode == 0, completed.stderr
++        assert package_path.read_bytes() == package_bytes
++        assert sentinel.exists()
++    else:
++        assert completed.returncode != 0
++        assert not sentinel.exists()
++
++
++def test_apply_restores_and_verifies_the_plan_bound_lambda_package() -> None:
++    workflow = (ROOT / ".github/workflows/deploy-reading-assistant.yml").read_text(encoding="utf-8")
++    assert "Store exact encrypted versioned Lambda package" in workflow
++    assert "steps.record.outputs.package_version_id" in workflow
++    assert "Download exact object version and metadata" in workflow
++    assert "--require-package" in workflow
++    assert "--package-head-response" in workflow
++    assert "mkdir -p backend/dist" in workflow
++    assert "test -s backend/dist/reading-assistant-lambda.zip" not in workflow
++    assert "verify-lambda-package" in workflow
++    apply = workflow.split("\n  apply:", 1)[1]
++    assert apply.index("--package-head-response") < apply.index("Terraform init")
++    assert apply.count("--require-package") == 2
++    assert workflow.index("verify-lambda-package") < workflow.index(
++        "Apply exact previously reviewed plan"
++    )
++
++
++@pytest.mark.parametrize(
++    ("field", "bad_value"),
++    [
++        ("package_key", "terraform-plans/100/2/prod/" + COMMIT + "/swapped.zip"),
++        ("package_version_id", "package-version-2"),
++        ("package_digest", "0" * 64),
++        ("package_destination", "arbitrary/package.zip"),
++        ("package_destination", ""),
++    ],
++)
++def test_strict_package_record_rejects_missing_or_swapped_binding(
++    tmp_path: Path, field: str, bad_value: str
++) -> None:
++    plan = tmp_path / "tfplan"
++    plan.write_bytes(b"opaque exact plan")
++    package = tmp_path / "reading-assistant-lambda.zip"
++    package.write_bytes(b"approved Lambda package")
++    values = {
++        "plan_key": f"terraform-plans/100/2/prod/{COMMIT}/tfplan",
++        "plan_version_id": "version-1",
++        "plan_digest": hashlib.sha256(plan.read_bytes()).hexdigest(),
++        "apply_role_arn": APPLY_ROLE,
++        "apply_role_digest": hashlib.sha256(APPLY_ROLE.encode()).hexdigest(),
++        "package_key": f"terraform-plans/100/2/prod/{COMMIT}/reading-assistant-lambda.zip",
++        "package_version_id": "package-version-1",
++        "package_digest": hashlib.sha256(package.read_bytes()).hexdigest(),
++        "package_destination": PACKAGE_DESTINATION,
++        **bounded_classification_values(),
++    }
++    values["plan_record_digest"] = expected_record_digest(values)
++    values[field] = bad_value
++    command = [
++        "assert-record",
++        *identity_args(),
++        "--key",
++        values["plan_key"],
++        "--version-id",
++        values["plan_version_id"],
++        "--digest",
++        values["plan_digest"],
++        "--apply-role-digest",
++        values["apply_role_digest"],
++        "--record-digest",
++        values["plan_record_digest"],
++        "--require-package",
++        "--package-key",
++        values["package_key"],
++        "--package-version-id",
++        values["package_version_id"],
++        "--package-digest",
++        values["package_digest"],
++        "--package-destination",
++        values["package_destination"],
++        *classification_args(values),
++    ]
++    rejected = run_cli(command)
++    assert rejected.returncode != 0
++
++    missing_complete = command[: command.index("--package-key")]
++    missing_complete.extend(classification_args(values))
++    complete_rejection = run_cli(missing_complete)
++    assert complete_rejection.returncode != 0
++    assert "Package record binding is required" in complete_rejection.stderr
++
++    missing_partial = remove_option_and_value(command, "--package-key")
++    partial_rejection = run_cli(missing_partial)
++    assert partial_rejection.returncode != 0
++    assert "Package record binding is incomplete" in partial_rejection.stderr
++
++
++def test_record_version_rejects_a_package_descriptor_without_upload_evidence(
++    tmp_path: Path,
++) -> None:
++    terraform_plan = {"resource_changes": [minimal_change(0)]}
++    values, plan_bytes, package_bytes, _ = apply_binding_values(tmp_path, terraform_plan)
++    plan = tmp_path / "tfplan"
++    package = tmp_path / "reading-assistant-lambda.zip"
++    descriptor = tmp_path / "descriptor.json"
++    plan.write_bytes(plan_bytes)
++    package.write_bytes(package_bytes)
++    classification = tmp_path / "classification.json"
++    summarized = run_cli(
++        [
++            "summarize-plan",
++            "--input",
++            str(tmp_path / "terraform-plan.json"),
++            "--output",
++            str(tmp_path / "summary-for-descriptor.json"),
++            "--classification-output",
++            str(classification),
++        ]
++    )
++    assert summarized.returncode == 0, summarized.stderr
++    described = run_cli(
++        [
++            "describe",
++            *identity_args(),
++            "--plan-file",
++            str(plan),
++            "--package-file",
++            str(package),
++            "--classification",
++            str(classification),
++            "--output",
++            str(descriptor),
++        ]
++    )
++    assert described.returncode == 0, described.stderr
++    upload = tmp_path / "plan-upload.json"
++    upload.write_text(json.dumps({"VersionId": values["plan_version_id"]}), encoding="utf-8")
++    rejected = run_cli(
++        [
++            "record-version",
++            "--descriptor",
++            str(descriptor),
++            "--upload-response",
++            str(upload),
++            "--output",
++            str(tmp_path / "record.json"),
++            "--github-output",
++            str(tmp_path / "record-output"),
++        ]
++    )
++    assert rejected.returncode != 0
++    assert "Package descriptor requires an upload response" in rejected.stderr
++
++
++def test_lambda_package_verification_requires_two_matching_plan_hashes(tmp_path: Path) -> None:
++    package = tmp_path / "reading-assistant-lambda.zip"
++    package.write_bytes(b"approved package")
++    digest = hashlib.sha256(package.read_bytes()).hexdigest()
++    source_hash = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
++    plan = tmp_path / "plan.json"
++    plan.write_text(
++        json.dumps(
++            {
++                "resource_changes": [
++                    {"type": "aws_lambda_function", "change": {"after": {"source_code_hash": source_hash}}},
++                    {"type": "aws_lambda_function", "change": {"after": {"source_code_hash": source_hash}}},
++                ]
++            }
++        ),
++        encoding="utf-8",
++    )
++    command = [
++        "verify-lambda-package",
++        "--plan",
++        str(plan),
++        "--package-file",
++        str(package),
++        "--package-digest",
++        digest,
++    ]
++    result = run_cli(command)
++    assert result.returncode == 0, result.stderr
++    plan.write_text(json.dumps({"resource_changes": []}), encoding="utf-8")
++    rejected = run_cli(command)
++    assert rejected.returncode != 0
++
++
+ def test_plan_summary_cli_is_private_bounded_and_operationally_useful(
+     tmp_path: Path,
+ ) -> None:
+diff --git a/backend/test_online_agent_policy_helpers.py b/backend/test_online_agent_policy_helpers.py
+index 68e7377..bfae0a8 100644
+--- a/backend/test_online_agent_policy_helpers.py
++++ b/backend/test_online_agent_policy_helpers.py
+@@ -573,9 +573,23 @@ def test_environment_plan_policies_are_structurally_least_privilege() -> None:
+             f"{state_key}.*",
+         ]
+         plan_resource = resources_for_action(policy, "s3:PutObject")
+-        assert plan_resource == [
+-            (f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan")
++        expected_plan_objects = [
++            f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++                f"*/*/{environment}/*/reading-assistant-lambda.zip"
++            ),
+         ]
++        assert plan_resource == expected_plan_objects
++        plan_kms = next(
++            statement
++            for statement in statements
++            if statement["Sid"] == f"EncryptOnlyRunDerived{environment.title()}PlanObject"
++        )
++        assert (
++            plan_kms["Condition"]["StringLike"]["kms:EncryptionContext:aws:s3:arn"]
++            == expected_plan_objects
++        )
+         kms = next(
+             statement
+             for statement in statements
+@@ -630,15 +644,42 @@ def test_plan_policy_validation_script_accepts_only_split_templates() -> None:
+             ).read_text(encoding="utf-8")
+         )
+         resources = resources_for_action(apply_policy, "s3:GetObjectVersion")
+-        assert resources == [
+-            (f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan")
++        expected_objects = [
++            f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++                f"*/*/{environment}/*/reading-assistant-lambda.zip"
++            ),
+         ]
++        assert resources == expected_objects
++        decrypt = next(
++            statement
++            for statement in apply_policy["Statement"]
++            if statement["Sid"] == f"DecryptOnly{environment.title()}PlanObjects"
++        )
++        assert decrypt["Condition"]["StringLike"]["kms:EncryptionContext:aws:s3:arn"] == expected_objects
+         other = "prod" if environment == "dev" else "dev"
+         assert not policy_resource_matches(
+             apply_policy,
+             "s3:GetObjectVersion",
+             (f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/100/1/{other}/{'a' * 40}/tfplan"),
+         )
++        assert policy_resource_matches(
++            apply_policy,
++            "s3:GetObjectVersion",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/100/1/"
++                f"{environment}/{'a' * 40}/reading-assistant-lambda.zip"
++            ),
++        )
++        assert not policy_resource_matches(
++            apply_policy,
++            "s3:GetObjectVersion",
++            (
++                "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/100/1/"
++                f"{other}/{'a' * 40}/reading-assistant-lambda.zip"
++            ),
++        )
+     result = subprocess.run(
+         [
+             sys.executable,
+diff --git a/docs/GITHUB_SETUP.md b/docs/GITHUB_SETUP.md
+index 193e510..0ff1140 100644
+--- a/docs/GITHUB_SETUP.md
++++ b/docs/GITHUB_SETUP.md
+@@ -142,11 +142,13 @@ matching protected Environment.
+ 
+ - each plan role can read only its exact state object/version and stack
+   resources, cannot lock or write Terraform state, cannot mutate
+-  infrastructure, and can only encrypt and write the run-derived
+-  `terraform-plans/<run>/<attempt>/<environment>/<commit>/tfplan` key shape;
+-  the workflow therefore plans with `-lock=false`;
+-- the apply role can read only a specified version beneath that plan prefix,
+-  decrypt with the plan key, and perform the reviewed Terraform apply;
++  infrastructure, and can only encrypt and write the two run-derived objects
++  `terraform-plans/<run>/<attempt>/<environment>/<commit>/tfplan` and its
++  sibling `reading-assistant-lambda.zip`; its KMS context must list exactly
++  those same two object patterns. The workflow therefore plans with `-lock=false`;
++- the apply role can read only a specified version of those same two objects,
++  decrypt with the matching two-object plan-key context, and perform the
++  reviewed Terraform apply;
+ - neither role can delete plan versions; private bucket lifecycle policy
+   expires current and noncurrent versions after 14 days; and
+ - the KMS key policy admits only the plan/apply roles and security audit role.
+diff --git a/docs/RELEASE_RUNBOOK.md b/docs/RELEASE_RUNBOOK.md
+index 1edf2a7..62fcd3c 100644
+--- a/docs/RELEASE_RUNBOOK.md
++++ b/docs/RELEASE_RUNBOOK.md
+@@ -52,7 +52,10 @@ neither can read the other environment, apply, mutate infrastructure, write
+ state, or delete plans. The validated apply-role ARN digest is included in
+ object metadata, and a record digest binds the role, bucket, key, version, plan
+ SHA, full-plan classification digest/counts, commit, environment, run, and KMS
+-key. GitHub receives metadata-only evidence, never the binary.
++key. The same immutable record also binds the Lambda ZIP's canonical object key,
++S3 VersionId, SHA-256, and fixed restore destination
++`backend/dist/reading-assistant-lambda.zip`. GitHub receives metadata-only
++evidence, never either binary.
+ 
+ ## 2. Gather evidence
+ 
+@@ -108,7 +111,9 @@ plan-bound apply-role ARN digest, then assumes only the ARN emitted by the plan
+ job, never a newly resolved variable. It downloads the recorded S3
+ `VersionId` and verifies version, KMS key, metadata, environment, commit,
+ workflow-ref hash, role binding, binary SHA-256, and classification
+-digest/counts. After Terraform initialization it independently classifies the
++digest/counts. It restores the separately recorded Lambda ZIP only to its fixed
++destination and verifies its VersionId, SSE-KMS metadata, plan association, and
++actual SHA-256 before Terraform initialization. After Terraform initialization it independently classifies the
+ downloaded exact plan and compares every bound classification field before
+ running `terraform apply` against that exact `tfplan`. It never runs a fresh
+ plan.
+diff --git a/docs/examples/aws-apply-plan-read-policy-dev.json b/docs/examples/aws-apply-plan-read-policy-dev.json
+index b073dfe..d2bf916 100644
+--- a/docs/examples/aws-apply-plan-read-policy-dev.json
++++ b/docs/examples/aws-apply-plan-read-policy-dev.json
+@@ -8,7 +8,10 @@
+         "s3:GetObjectVersion",
+         "s3:GetObjectVersionAttributes"
+       ],
+-      "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan"
++      "Resource": [
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
++      ]
+     },
+     {
+       "Sid": "DecryptOnlyDevPlanObjects",
+@@ -20,7 +23,10 @@
+           "kms:ViaService": "s3.REGION.amazonaws.com"
+         },
+         "StringLike": {
+-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan"
++          "kms:EncryptionContext:aws:s3:arn": [
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
++          ]
+         }
+       }
+     }
+diff --git a/docs/examples/aws-apply-plan-read-policy-prod.json b/docs/examples/aws-apply-plan-read-policy-prod.json
+index 5c16e1e..ffcf0cf 100644
+--- a/docs/examples/aws-apply-plan-read-policy-prod.json
++++ b/docs/examples/aws-apply-plan-read-policy-prod.json
+@@ -8,7 +8,10 @@
+         "s3:GetObjectVersion",
+         "s3:GetObjectVersionAttributes"
+       ],
+-      "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan"
++      "Resource": [
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/reading-assistant-lambda.zip"
++      ]
+     },
+     {
+       "Sid": "DecryptOnlyProdPlanObjects",
+@@ -20,7 +23,10 @@
+           "kms:ViaService": "s3.REGION.amazonaws.com"
+         },
+         "StringLike": {
+-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan"
++          "kms:EncryptionContext:aws:s3:arn": [
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/reading-assistant-lambda.zip"
++          ]
+         }
+       }
+     }
+diff --git a/docs/examples/aws-plan-role-policy-dev.json b/docs/examples/aws-plan-role-policy-dev.json
+index 78fd9e0..06f68ce 100644
+--- a/docs/examples/aws-plan-role-policy-dev.json
++++ b/docs/examples/aws-plan-role-policy-dev.json
+@@ -171,7 +171,10 @@
+       "Sid": "WriteOnlyRunDerivedEncryptedDevPlanObject",
+       "Effect": "Allow",
+       "Action": "s3:PutObject",
+-      "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++      "Resource": [
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
++      ],
+       "Condition": {
+         "StringEquals": {
+           "s3:x-amz-server-side-encryption": "aws:kms",
+@@ -195,7 +198,10 @@
+           "kms:ViaService": "s3.REGION.amazonaws.com"
+         },
+         "StringLike": {
+-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan"
++          "kms:EncryptionContext:aws:s3:arn": [
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/tfplan",
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/dev/*/reading-assistant-lambda.zip"
++          ]
+         }
+       }
+     },
+diff --git a/docs/examples/aws-plan-role-policy-prod.json b/docs/examples/aws-plan-role-policy-prod.json
+index 7d6a05f..e02a82f 100644
+--- a/docs/examples/aws-plan-role-policy-prod.json
++++ b/docs/examples/aws-plan-role-policy-prod.json
+@@ -171,7 +171,10 @@
+       "Sid": "WriteOnlyRunDerivedEncryptedProdPlanObject",
+       "Effect": "Allow",
+       "Action": "s3:PutObject",
+-      "Resource": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++      "Resource": [
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++        "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/reading-assistant-lambda.zip"
++      ],
+       "Condition": {
+         "StringEquals": {
+           "s3:x-amz-server-side-encryption": "aws:kms",
+@@ -195,7 +198,10 @@
+           "kms:ViaService": "s3.REGION.amazonaws.com"
+         },
+         "StringLike": {
+-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan"
++          "kms:EncryptionContext:aws:s3:arn": [
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/tfplan",
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/prod/*/reading-assistant-lambda.zip"
++          ]
+         }
+       }
+     },
+diff --git a/scripts/exact_plan_policy.py b/scripts/exact_plan_policy.py
+index 6527884..48b4b2d 100644
+--- a/scripts/exact_plan_policy.py
++++ b/scripts/exact_plan_policy.py
+@@ -4,6 +4,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import base64
+ import hashlib
+ import json
+ import os
+@@ -70,6 +71,7 @@ CLASSIFICATION_COUNT_KEYS = (
+     "sensitive_output_count",
+     "sensitive_path_count",
+ )
++CANONICAL_PACKAGE_DESTINATION = "backend/dist/reading-assistant-lambda.zip"
+ PRESENTATION_LIMITS_SHA256 = hashlib.sha256(
+     json.dumps(
+         {
+@@ -701,6 +703,81 @@ def deployment_metadata(
+     }
+ 
+ 
++def package_key(identity: PlanIdentity) -> str:
++    return f"{identity.key.rsplit('/', 1)[0]}/reading-assistant-lambda.zip"
++
++
++def package_metadata(
++    identity: PlanIdentity,
++    plan_digest: str,
++    package_digest: str,
++    classification: dict[str, Any],
++) -> dict[str, str]:
++    if not re.fullmatch(r"[0-9a-f]{64}", package_digest):
++        raise PolicyError("Lambda package digest is invalid")
++    return {
++        **deployment_metadata(identity, plan_digest, classification),
++        "package-sha256": package_digest,
++    }
++
++
++def validate_package_binding(value: Any, *, plan_key: str) -> dict[str, str]:
++    if not isinstance(value, dict) or set(value) != {
++        "destination",
++        "digest",
++        "key",
++        "version_id",
++    }:
++        raise PolicyError("Package record binding is invalid")
++    expected_key = f"{plan_key.rsplit('/', 1)[0]}/reading-assistant-lambda.zip"
++    if value["key"] != expected_key:
++        raise PolicyError("Package key is not the plan-derived exact key")
++    if value["destination"] != CANONICAL_PACKAGE_DESTINATION:
++        raise PolicyError("Package destination is not canonical")
++    if not isinstance(value["version_id"], str) or not VERSION_RE.fullmatch(value["version_id"]):
++        raise PolicyError("Package version is invalid")
++    if not isinstance(value["digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["digest"]):
++        raise PolicyError("Lambda package digest is invalid")
++    return dict(value)
++
++
++def package_binding_from_args(args: argparse.Namespace) -> dict[str, str] | None:
++    fields = {
++        "key": args.package_key,
++        "version_id": args.package_version_id,
++        "digest": args.package_digest,
++        "destination": args.package_destination,
++    }
++    supplied = [value is not None for value in fields.values()]
++    if any(supplied) and not all(supplied):
++        raise PolicyError("Package record binding is incomplete")
++    if not any(supplied):
++        if args.require_package:
++            raise PolicyError("Package record binding is required")
++        return None
++    return validate_package_binding(fields, plan_key=args.key)
++
++
++def verify_lambda_package(plan: Any, package_file: Path, package_digest: str) -> None:
++    if not re.fullmatch(r"[0-9a-f]{64}", package_digest):
++        raise PolicyError("Lambda package digest is invalid")
++    if not package_file.is_file():
++        raise PolicyError("Lambda package is missing from the canonical destination")
++    if hashlib.sha256(package_file.read_bytes()).hexdigest() != package_digest:
++        raise PolicyError("Lambda package digest does not match")
++    expected_hash = base64.b64encode(bytes.fromhex(package_digest)).decode("ascii")
++    resources = plan.get("resource_changes") if isinstance(plan, dict) else None
++    if not isinstance(resources, list):
++        raise PolicyError("Terraform plan resource changes are invalid")
++    lambda_hashes = [
++        item.get("change", {}).get("after", {}).get("source_code_hash")
++        for item in resources
++        if isinstance(item, dict) and item.get("type") == "aws_lambda_function"
++    ]
++    if len(lambda_hashes) != 2 or any(value != expected_hash for value in lambda_hashes):
++        raise PolicyError("Approved plan Lambda source hashes do not match the package")
++
++
+ def summarize_resource_change(
+     item: Any,
+     *,
+@@ -898,6 +975,7 @@ def plan_record_digest(
+     apply_role_arn: str,
+     apply_role_digest: str,
+     classification: dict[str, Any],
++    package: dict[str, str] | None = None,
+ ) -> str:
+     validated_classification = validate_classification(
+         classification, require_review_attestation=True
+@@ -918,6 +996,8 @@ def plan_record_digest(
+         "presentation_limits_sha256": validated_classification["presentation_limits_sha256"],
+         "review_summary_sha256": validated_classification["review_summary_sha256"],
+     }
++    if package is not None:
++        binding["package"] = validate_package_binding(package, plan_key=key)
+     binding.update({key: validated_classification[key] for key in CLASSIFICATION_COUNT_KEYS})
+     return hashlib.sha256(
+         json.dumps(binding, separators=(",", ":"), sort_keys=True).encode("utf-8")
+@@ -1030,6 +1110,14 @@ def add_classification_args(parser: argparse.ArgumentParser) -> None:
+         parser.add_argument(f"--{key.replace('_', '-')}", required=True)
+ 
+ 
++def add_package_binding_args(parser: argparse.ArgumentParser) -> None:
++    parser.add_argument("--require-package", action="store_true")
++    parser.add_argument("--package-key")
++    parser.add_argument("--package-version-id")
++    parser.add_argument("--package-digest")
++    parser.add_argument("--package-destination")
++
++
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser()
+     commands = parser.add_subparsers(dest="command", required=True)
+@@ -1085,6 +1173,7 @@ def parse_args() -> argparse.Namespace:
+     describe = commands.add_parser("describe")
+     add_identity_args(describe)
+     describe.add_argument("--plan-file", required=True, type=Path)
++    describe.add_argument("--package-file", type=Path)
+     describe.add_argument("--classification", required=True, type=Path)
+     describe.add_argument("--output", required=True, type=Path)
+     describe.add_argument("--github-output", type=Path)
+@@ -1092,6 +1181,7 @@ def parse_args() -> argparse.Namespace:
+     record = commands.add_parser("record-version")
+     record.add_argument("--descriptor", required=True, type=Path)
+     record.add_argument("--upload-response", required=True, type=Path)
++    record.add_argument("--package-upload-response", type=Path)
+     record.add_argument("--output", required=True, type=Path)
+     record.add_argument("--github-output", required=True, type=Path)
+ 
+@@ -1103,9 +1193,13 @@ def parse_args() -> argparse.Namespace:
+     verify.add_argument("--apply-role-digest", required=True)
+     verify.add_argument("--record-digest", required=True)
+     add_classification_args(verify)
++    add_package_binding_args(verify)
+     verify.add_argument("--head-response", required=True, type=Path)
+     verify.add_argument("--get-response", required=True, type=Path)
+     verify.add_argument("--plan-file", required=True, type=Path)
++    verify.add_argument("--package-head-response", type=Path)
++    verify.add_argument("--package-get-response", type=Path)
++    verify.add_argument("--package-file", type=Path)
+ 
+     assert_record = commands.add_parser("assert-record")
+     add_identity_args(assert_record)
+@@ -1115,11 +1209,17 @@ def parse_args() -> argparse.Namespace:
+     assert_record.add_argument("--apply-role-digest", required=True)
+     assert_record.add_argument("--record-digest", required=True)
+     add_classification_args(assert_record)
++    add_package_binding_args(assert_record)
+ 
+     verify_classification = commands.add_parser("verify-classification")
+     verify_classification.add_argument("--input", required=True, type=Path)
+     add_classification_args(verify_classification)
+ 
++    verify_package = commands.add_parser("verify-lambda-package")
++    verify_package.add_argument("--plan", required=True, type=Path)
++    verify_package.add_argument("--package-file", required=True, type=Path)
++    verify_package.add_argument("--package-digest", required=True)
++
+     storage = commands.add_parser("verify-storage")
+     storage.add_argument("--versioning-response", required=True, type=Path)
+     storage.add_argument("--encryption-response", required=True, type=Path)
+@@ -1221,6 +1321,13 @@ def main() -> int:
+                 "classification": classification,
+                 "metadata": deployment_metadata(identity, digest, classification),
+             }
++            if args.package_file:
++                package_digest = hashlib.sha256(args.package_file.read_bytes()).hexdigest()
++                descriptor["package"] = {
++                    "destination": CANONICAL_PACKAGE_DESTINATION,
++                    "digest": package_digest,
++                    "key": package_key(identity),
++                }
+             args.output.write_text(
+                 json.dumps(descriptor, indent=2, sort_keys=True) + "\n",
+                 encoding="utf-8",
+@@ -1238,6 +1345,14 @@ def main() -> int:
+                         "presentation_limits_sha256": classification["presentation_limits_sha256"],
+                         "review_summary_sha256": classification["review_summary_sha256"],
+                         **{key: str(classification[key]) for key in CLASSIFICATION_COUNT_KEYS},
++                        **(
++                            {
++                                "package_key": descriptor["package"]["key"],
++                                "package_digest": descriptor["package"]["digest"],
++                            }
++                            if args.package_file
++                            else {}
++                        ),
+                     },
+                 )
+         elif args.command == "record-version":
+@@ -1254,7 +1369,34 @@ def main() -> int:
+             classification = validate_classification(
+                 descriptor.get("classification"), require_review_attestation=True
+             )
++            package: dict[str, str] | None = None
++            raw_package = descriptor.get("package")
++            if raw_package is not None:
++                if not isinstance(raw_package, dict) or set(raw_package) != {
++                    "destination",
++                    "digest",
++                    "key",
++                }:
++                    raise PolicyError("Package descriptor binding is invalid")
++                if args.package_upload_response is None:
++                    raise PolicyError("Package descriptor requires an upload response")
++                package_upload = json.loads(
++                    args.package_upload_response.read_text(encoding="utf-8")
++                )
++                package_version_id = package_upload.get("VersionId")
++                if not isinstance(package_version_id, str) or not VERSION_RE.fullmatch(
++                    package_version_id
++                ):
++                    raise PolicyError("Package upload did not return a valid VersionId")
++                package = validate_package_binding(
++                    {**raw_package, "version_id": package_version_id},
++                    plan_key=descriptor["key"],
++                )
++            elif args.package_upload_response is not None:
++                raise PolicyError("Package upload response has no package descriptor")
+             record = {**descriptor, "version_id": version_id}
++            if package is not None:
++                record["package"] = package
+             record["record_digest"] = plan_record_digest(
+                 bucket=descriptor["bucket"],
+                 key=descriptor["key"],
+@@ -1268,6 +1410,7 @@ def main() -> int:
+                 apply_role_arn=descriptor["apply_role_arn"],
+                 apply_role_digest=descriptor["apply_role_digest"],
+                 classification=classification,
++                package=package,
+             )
+             args.output.write_text(
+                 json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+@@ -1287,11 +1430,22 @@ def main() -> int:
+                     "presentation_limits_sha256": classification["presentation_limits_sha256"],
+                     "review_summary_sha256": classification["review_summary_sha256"],
+                     **{key: str(classification[key]) for key in CLASSIFICATION_COUNT_KEYS},
++                    **(
++                        {
++                            "package_key": package["key"],
++                            "package_version_id": package["version_id"],
++                            "package_digest": package["digest"],
++                            "package_destination": package["destination"],
++                        }
++                        if package is not None
++                        else {}
++                    ),
+                 },
+             )
+         elif args.command == "verify-download":
+             identity = identity_from_args(args)
+             classification = classification_from_args(args)
++            package = package_binding_from_args(args)
+             record = PlanRecord(
+                 bucket=identity.bucket,
+                 key=args.key,
+@@ -1326,6 +1480,7 @@ def main() -> int:
+                 apply_role_arn=record.apply_role_arn,
+                 apply_role_digest=record.apply_role_digest,
+                 classification=classification,
++                package=package,
+             ):
+                 raise PolicyError("Plan record digest does not match")
+             if head.get("VersionId") != record.version_id:
+@@ -1339,11 +1494,56 @@ def main() -> int:
+                 raise PolicyError("Plan object metadata or encryption is invalid")
+             if downloaded.get("VersionId") != record.version_id:
+                 raise PolicyError("Downloaded object version does not match")
++            if (
++                downloaded.get("ServerSideEncryption") != "aws:kms"
++                or downloaded.get("SSEKMSKeyId") != identity.kms_key_arn
++                or downloaded.get("Metadata")
++                != deployment_metadata(identity, record.digest, classification)
++            ):
++                raise PolicyError("Downloaded plan metadata or encryption is invalid")
+             if hashlib.sha256(args.plan_file.read_bytes()).hexdigest() != record.digest:
+                 raise PolicyError("Downloaded plan digest does not match")
++            if package is not None:
++                if (
++                    args.package_head_response is None
++                    or args.package_get_response is None
++                    or args.package_file is None
++                ):
++                    raise PolicyError("Package verification evidence is incomplete")
++                if args.package_file.as_posix() != package["destination"]:
++                    raise PolicyError("Package destination is not canonical")
++                package_head = json.loads(
++                    args.package_head_response.read_text(encoding="utf-8")
++                )
++                package_download = json.loads(
++                    args.package_get_response.read_text(encoding="utf-8")
++                )
++                if package_head.get("VersionId") != package["version_id"]:
++                    raise PolicyError("S3 head returned a different package version")
++                if (
++                    package_head.get("ServerSideEncryption") != "aws:kms"
++                    or package_head.get("SSEKMSKeyId") != identity.kms_key_arn
++                    or package_head.get("Metadata")
++                    != package_metadata(identity, record.digest, package["digest"], classification)
++                ):
++                    raise PolicyError("Package object metadata or encryption is invalid")
++                if package_download.get("VersionId") != package["version_id"]:
++                    raise PolicyError("Downloaded package version does not match")
++                if (
++                    package_download.get("ServerSideEncryption") != "aws:kms"
++                    or package_download.get("SSEKMSKeyId") != identity.kms_key_arn
++                    or package_download.get("Metadata")
++                    != package_metadata(identity, record.digest, package["digest"], classification)
++                ):
++                    raise PolicyError("Downloaded package metadata or encryption is invalid")
++                if not args.package_file.is_file():
++                    raise PolicyError("Lambda package is missing from the canonical destination")
++                if hashlib.sha256(args.package_file.read_bytes()).hexdigest() != package["digest"]:
++                    raise PolicyError("Downloaded package digest does not match")
+         elif args.command == "assert-record":
+             identity = identity_from_args(args)
+             classification = classification_from_args(args)
++            package = package_binding_from_args(args)
+             if args.key != identity.key:
+                 raise PolicyError("Plan key is not the run-derived exact key")
+             if not VERSION_RE.fullmatch(args.version_id):
+@@ -1368,6 +1568,7 @@ def main() -> int:
+                 apply_role_arn=identity.apply_role_arn,
+                 apply_role_digest=args.apply_role_digest,
+                 classification=classification,
++                package=package,
+             ):
+                 raise PolicyError("Plan record digest does not match")
+         elif args.command == "verify-classification":
+@@ -1380,6 +1581,12 @@ def main() -> int:
+                 actual[key] != expected[key] for key in CLASSIFICATION_COUNT_KEYS
+             ):
+                 raise PolicyError("Downloaded plan classification does not match the record")
++        elif args.command == "verify-lambda-package":
++            verify_lambda_package(
++                json.loads(args.plan.read_text(encoding="utf-8")),
++                args.package_file,
++                args.package_digest,
++            )
+         elif args.command == "verify-storage":
+             versioning = json.loads(args.versioning_response.read_text(encoding="utf-8"))
+             encryption = json.loads(args.encryption_response.read_text(encoding="utf-8"))
+diff --git a/scripts/validate_aws_plan_policies.py b/scripts/validate_aws_plan_policies.py
+index 9040e15..8f3ad27 100644
+--- a/scripts/validate_aws_plan_policies.py
++++ b/scripts/validate_aws_plan_policies.py
+@@ -131,9 +131,32 @@ def validate_policy(environment: str) -> None:
+         policy,
+         f"WriteOnlyRunDerivedEncrypted{environment.title()}PlanObject",
+     )
+-    expected_plan = f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan"
+-    if write.get("Resource") != expected_plan:
+-        raise ValidationError("Plan write is not bound to the run-derived key shape")
++    expected_objects = [
++        f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++        (
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++            f"*/*/{environment}/*/reading-assistant-lambda.zip"
++        ),
++    ]
++    if as_strings(write.get("Resource"), "Plan write Resource") != expected_objects:
++        raise ValidationError("Plan write is not bound to the two exact run-derived objects")
++    if write.get("Condition", {}).get("StringEquals") != {
++        "s3:x-amz-server-side-encryption": "aws:kms",
++        "s3:x-amz-server-side-encryption-aws-kms-key-id": "PLAN_KMS_KEY_ARN",
++    }:
++        raise ValidationError("Plan write lacks exact SSE-KMS requirements")
++    plan_kms = statement_by_sid(
++        policy,
++        f"EncryptOnlyRunDerived{environment.title()}PlanObject",
++    )
++    if plan_kms.get("Resource") != "PLAN_KMS_KEY_ARN":
++        raise ValidationError("Plan encryption is not bound to PLAN_KMS_KEY_ARN")
++    if plan_kms.get("Condition", {}).get("StringEquals") != {
++        "kms:ViaService": "s3.REGION.amazonaws.com"
++    } or plan_kms.get("Condition", {}).get("StringLike", {}).get(
++        "kms:EncryptionContext:aws:s3:arn"
++    ) != expected_objects:
++        raise ValidationError("Plan encryption context is not bound to the two exact objects")
+ 
+     deny = statement_by_sid(policy, DENY_SID)
+     deny_actions = set(as_strings(deny.get("Action"), "Deny Action"))
+@@ -153,12 +176,18 @@ def validate_apply_plan_read_policy(environment: str) -> None:
+     path = EXAMPLES / f"aws-apply-plan-read-policy-{environment}.json"
+     raw = path.read_text(encoding="utf-8")
+     policy = json.loads(raw)
+-    expected_plan = f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan"
++    expected_objects = [
++        f"arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/*/*/{environment}/*/tfplan",
++        (
++            "arn:aws:s3:::PRIVATE_PLAN_BUCKET/terraform-plans/"
++            f"*/*/{environment}/*/reading-assistant-lambda.zip"
++        ),
++    ]
+     other = "prod" if environment == "dev" else "dev"
+     if f"/*/{other}/*/tfplan" in raw:
+         raise ValidationError(f"{path.name} contains a cross-environment marker")
+     read = statement_by_sid(policy, f"ReadOnlyVersioned{environment.title()}PlanObjects")
+-    if read.get("Resource") != expected_plan or set(
++    if as_strings(read.get("Resource"), "Apply plan read Resource") != expected_objects or set(
+         as_strings(read.get("Action"), "Apply plan read Action")
+     ) != {"s3:GetObjectVersion", "s3:GetObjectVersionAttributes"}:
+         raise ValidationError("Apply plan read is not versioned and environment-bound")
+@@ -168,7 +197,8 @@ def validate_apply_plan_read_policy(environment: str) -> None:
+     condition = decrypt.get("Condition", {})
+     if (
+         condition.get("StringEquals", {}).get("kms:ViaService") != ("s3.REGION.amazonaws.com")
+-        or condition.get("StringLike", {}).get("kms:EncryptionContext:aws:s3:arn") != expected_plan
++        or condition.get("StringLike", {}).get("kms:EncryptionContext:aws:s3:arn")
++        != expected_objects
+     ):
+         raise ValidationError("Apply plan decrypt lacks exact S3 context")
+ 

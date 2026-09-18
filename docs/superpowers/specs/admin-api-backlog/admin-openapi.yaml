@@ -1,0 +1,173 @@
+# Historical design proposal; not a supported runtime contract.
+openapi: 3.1.0
+info:
+  title: Untangle Admin API
+  version: 1.0.0
+  description: Contract for learner authentication and the local administration API.
+servers:
+  - url: http://localhost:18765
+    description: Local backend
+paths:
+  /auth/config:
+    $ref: ./paths/auth-config.yaml
+  /auth/login:
+    $ref: ./paths/auth-login.yaml
+  /auth/logout:
+    $ref: ./paths/auth-logout.yaml
+  /admin/v1/session:
+    $ref: ./paths/admin-session.yaml
+  /admin/v1/dashboard:
+    $ref: ./paths/admin-dashboard.yaml
+  /admin/v1/users:
+    $ref: ./paths/admin-users.yaml
+  /admin/v1/users/{id}:
+    $ref: ./paths/admin-user.yaml
+  /admin/v1/users/{id}/suspend:
+    $ref: ./paths/admin-user-suspend.yaml
+  /admin/v1/users/{id}/reactivate:
+    $ref: ./paths/admin-user-reactivate.yaml
+  /admin/v1/alerts:
+    $ref: ./paths/admin-alerts.yaml
+  /admin/v1/audit-events:
+    $ref: ./paths/admin-audit-events.yaml
+components:
+  schemas:
+    CorrelationError:
+      $ref: ./components/schemas/admin.yaml#/CorrelationError
+    AuthConfig:
+      $ref: ./components/schemas/admin.yaml#/AuthConfig
+    SsoLoginRequest:
+      $ref: ./components/schemas/admin.yaml#/SsoLoginRequest
+    AuthUser:
+      $ref: ./components/schemas/admin.yaml#/AuthUser
+    AuthSessionResponse:
+      $ref: ./components/schemas/admin.yaml#/AuthSessionResponse
+    LogoutResponse:
+      $ref: ./components/schemas/admin.yaml#/LogoutResponse
+    AdminSession:
+      $ref: ./components/schemas/admin.yaml#/AdminSession
+    SectionError:
+      $ref: ./components/schemas/admin.yaml#/SectionError
+    MetricTotals:
+      $ref: ./components/schemas/admin.yaml#/MetricTotals
+    DailyMetric:
+      $ref: ./components/schemas/admin.yaml#/DailyMetric
+    PlanCount:
+      $ref: ./components/schemas/admin.yaml#/PlanCount
+    TopUser:
+      $ref: ./components/schemas/admin.yaml#/TopUser
+    Alert:
+      $ref: ./components/schemas/admin.yaml#/Alert
+    MetricTotalsSection:
+      $ref: ./components/schemas/admin.yaml#/MetricTotalsSection
+    DailyMetricsSection:
+      $ref: ./components/schemas/admin.yaml#/DailyMetricsSection
+    PlanCountsSection:
+      $ref: ./components/schemas/admin.yaml#/PlanCountsSection
+    TopUsersSection:
+      $ref: ./components/schemas/admin.yaml#/TopUsersSection
+    AlertsSection:
+      $ref: ./components/schemas/admin.yaml#/AlertsSection
+    DashboardResponse:
+      $ref: ./components/schemas/admin.yaml#/DashboardResponse
+    AdminUserSummary:
+      $ref: ./components/schemas/admin.yaml#/AdminUserSummary
+    UserUsage:
+      $ref: ./components/schemas/admin.yaml#/UserUsage
+    ActivityEvent:
+      $ref: ./components/schemas/admin.yaml#/ActivityEvent
+    AdminAuditEvent:
+      $ref: ./components/schemas/admin.yaml#/AdminAuditEvent
+    AdminUserDetail:
+      $ref: ./components/schemas/admin.yaml#/AdminUserDetail
+    AccountTransitionRequest:
+      $ref: ./components/schemas/admin.yaml#/AccountTransitionRequest
+    AccountTransitionResponse:
+      $ref: ./components/schemas/admin.yaml#/AccountTransitionResponse
+    CursorPage:
+      $ref: ./components/schemas/admin.yaml#/CursorPage
+    AdminUserPage:
+      $ref: ./components/schemas/admin.yaml#/AdminUserPage
+    AlertPage:
+      $ref: ./components/schemas/admin.yaml#/AlertPage
+    AuditEventPage:
+      $ref: ./components/schemas/admin.yaml#/AuditEventPage
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  headers:
+    CorrelationId:
+      description: Correlates the response with sanitized operational logs.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+      example: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+  responses:
+    Unauthenticated:
+      description: The bearer token is missing, invalid, or expired.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/CorrelationId"
+      content:
+        application/json:
+          schema:
+            $ref: ./components/schemas/admin.yaml#/CorrelationError
+          example:
+            code: unauthenticated
+            message: Authentication is required.
+            correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+    AdminForbidden:
+      description: The authenticated user is not an authorized administrator.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/CorrelationId"
+      content:
+        application/json:
+          schema:
+            $ref: ./components/schemas/admin.yaml#/CorrelationError
+          example:
+            code: admin_forbidden
+            message: Administrator access is required.
+            correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+    UserNotFound:
+      description: The requested user does not exist.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/CorrelationId"
+      content:
+        application/json:
+          schema:
+            $ref: ./components/schemas/admin.yaml#/CorrelationError
+          example:
+            code: user_not_found
+            message: The requested user was not found.
+            correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+    ValidationError:
+      description: A parameter or request body failed validation.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/CorrelationId"
+      content:
+        application/json:
+          schema:
+            $ref: ./components/schemas/admin.yaml#/CorrelationError
+          example:
+            code: validation_error
+            message: The request is invalid.
+            correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M
+    InternalError:
+      description: The request could not be completed.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/CorrelationId"
+      content:
+        application/json:
+          schema:
+            $ref: ./components/schemas/admin.yaml#/CorrelationError
+          example:
+            code: internal_error
+            message: The request could not be completed.
+            correlation_id: request-01J2YQ2W7J8V7JX18Y4Q4Z6K3M

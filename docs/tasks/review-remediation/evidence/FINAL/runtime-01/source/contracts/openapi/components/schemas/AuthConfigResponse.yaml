@@ -1,0 +1,15 @@
+properties:
+  provider:
+    type: string
+    title: Provider
+  google_client_id:
+    anyOf:
+    - type: string
+    - type: 'null'
+    title: Google Client Id
+    description: Opaque compatibility identifier; examples use UUID v7.
+    x-id-compatibility: legacy-string-or-uuid
+type: object
+required:
+- provider
+title: AuthConfigResponse
